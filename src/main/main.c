@@ -169,6 +169,48 @@ static int run_capture(int frame_count) {
   return 0;
 }
 
+static int run_encode(int seconds) {
+  log_init_ex(LOG_LEVEL_INFO, LOG_DIR);
+  if (config_init(DEFAULT_CFG, USER_CFG) != 0) {
+    log_error("main", "config_init failed");
+    return 1;
+  }
+
+  char level_str[32];
+  char iq_dir[256];
+  char out_dir[256];
+  MediaEncodeConfig ecfg;
+  memset(&ecfg, 0, sizeof(ecfg));
+
+  config_get_string("log.level", level_str, (int)sizeof(level_str), "info");
+  log_set_level(parse_level(level_str));
+  config_get_string("video.iq_dir", iq_dir, (int)sizeof(iq_dir), "/oem/usr/share/iqfiles");
+  config_get_string("video.encode.out_dir", out_dir, (int)sizeof(out_dir), "/mnt/sdcard");
+  config_get_int("video.encode.main_w", &ecfg.main_w, 1920);
+  config_get_int("video.encode.main_h", &ecfg.main_h, 1080);
+  config_get_int("video.encode.main_fps", &ecfg.main_fps, 15);
+  config_get_int("video.encode.main_bitrate_kbps", &ecfg.main_bitrate_kbps, 2048);
+  config_get_int("video.encode.main_gop", &ecfg.main_gop, 30);
+  config_get_int("video.encode.sub_w", &ecfg.sub_w, 704);
+  config_get_int("video.encode.sub_h", &ecfg.sub_h, 576);
+  config_get_int("video.encode.sub_fps", &ecfg.sub_fps, 15);
+  config_get_int("video.encode.sub_bitrate_kbps", &ecfg.sub_bitrate_kbps, 1024);
+  config_get_int("video.encode.sub_gop", &ecfg.sub_gop, 30);
+  ecfg.iq_dir = iq_dir;
+
+  log_info("main", "encode %ds -> %s", seconds, out_dir);
+  int ret = media_encode_raw(&ecfg, out_dir, seconds);
+  config_deinit();
+  if (ret != 0) {
+    log_error("main", "encode failed %d", ret);
+    log_close();
+    return 4;
+  }
+  log_info("main", "encode ok");
+  log_close();
+  return 0;
+}
+
 static int run_normal(void) {
   log_init_ex(LOG_LEVEL_INFO, LOG_DIR);
 
@@ -225,6 +267,16 @@ int main(int argc, char **argv) {
       }
     }
     return run_capture(frames);
+  }
+  if (argc > 1 && strcmp(argv[1], "--encode") == 0) {
+    int seconds = 10;
+    if (argc > 2) {
+      seconds = atoi(argv[2]);
+      if (seconds <= 0) {
+        seconds = 10;
+      }
+    }
+    return run_encode(seconds);
   }
   return run_normal();
 }

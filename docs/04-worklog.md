@@ -44,3 +44,12 @@
 - 阻塞/待用户：当前抓帧 y_mean≈10（几乎全黑+噪点），请确认镜头保护盖已取下、环境有可见光；确认后回复“再抓”，我复测验图
 - 板上状态：已恢复 `rkipc`；产物在 `/mnt/sdcard/capture_0.yuv`
 - 下一步：光照确认后勾掉 T1.1 → T1.2 双码流 VENC
+
+## 2026-07-16 session 5
+- 完成：
+  - T1.1 复抓验图通过（y_mean≈106，可见场景；略虚焦）
+  - T1.2 双码流：VI0→VENC0 H265 + VI1→VENC1 H264；`--encode 30` 产出 main.h265(~4.6MB/802pkt) + sub.h264(~651KB/801pkt)；PC ffprobe 可解析；编码后 available mem≈159MB
+- 进行中：无
+- 阻塞/待用户：无（镜头虚焦可后续手动调焦）
+- 板上状态：已恢复 rkipc；码流在 `/mnt/sdcard/main.h265` `/mnt/sdcard/sub.h264`
+- 下一步：T1.3 编码参数动态调整；或进入 M2 录像

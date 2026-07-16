@@ -11,7 +11,20 @@
     "height": 1080,
     "vi_chn": 0,
     "iq_dir": "/oem/usr/share/iqfiles",
-    "capture_dir": "/mnt/sdcard"
+    "capture_dir": "/mnt/sdcard",
+    "encode": {
+      "main_w": 1920,
+      "main_h": 1080,
+      "main_fps": 15,
+      "main_bitrate_kbps": 2048,
+      "main_gop": 30,
+      "sub_w": 704,
+      "sub_h": 576,
+      "sub_fps": 15,
+      "sub_bitrate_kbps": 1024,
+      "sub_gop": 30,
+      "out_dir": "/mnt/sdcard"
+    }
   },
   "selftest": {
     "enabled": false,
