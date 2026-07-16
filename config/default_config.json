@@ -3,6 +3,11 @@
     "name": "rv1106-aov-ipc"
   },
   "log": {
-    "level": "info"
+    "level": "info",
+    "dir": "/userdata/log"
+  },
+  "selftest": {
+    "enabled": false,
+    "counter": 0
   }
 }

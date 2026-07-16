@@ -25,3 +25,12 @@
   - `ipc_app`：日志 + signal + 空事件总线；`scripts/build.sh` / `scripts/deploy.ps1`
   - WSL 编译通过：`build/ipc_app`（ARM uClibc ELF）
 - 下一步：板子重连 → `.\scripts\deploy.ps1` → 确认日志 → 勾掉 T0.2 → 进入 T0.3
+
+## 2026-07-16 session 3
+- 完成：
+  - T0.2 真机验收 — `/userdata/ipc_app` 输出 APP_START/exit
+  - T0.3 — cJSON 1.7.18；文件日志；配置中心 merge+原子保存；`--self-test` 两次 PASSED；用户配置与日志落盘确认
+- 进行中：无（M0 里程碑完成）
+- 阻塞/待用户：无
+- 板上状态：adb 正常；rkipc 运行中；`/userdata/ipc_app` `/userdata/default_config.json` `/userdata/ipc_config.json` `/userdata/log/ipc_app.log`
+- 下一步：M1 / T1.1 RKAIQ+VI 初始化（会与 rkipc 争用摄像头，部署前需 killall rkipc）

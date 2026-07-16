@@ -12,8 +12,16 @@ typedef enum {
   LOG_LEVEL_ERROR
 } LogLevel;
 
+/* Console-only init (backward compatible). */
 void log_init(LogLevel level);
+
+/* Also append to <log_dir>/ipc_app.log when log_dir is non-NULL. */
+int log_init_ex(LogLevel level, const char *log_dir);
+
 void log_set_level(LogLevel level);
+LogLevel log_get_level(void);
+void log_close(void);
+
 void log_printf(LogLevel level, const char *tag, const char *fmt, ...);
 
 #define log_debug(tag, fmt, ...) log_printf(LOG_LEVEL_DEBUG, tag, fmt, ##__VA_ARGS__)

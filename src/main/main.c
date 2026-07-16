@@ -1,11 +1,18 @@
 #include "common/event_bus.h"
 #include "common/log.h"
+#include "system/config_service.h"
 
 #include <signal.h>
 #include <stdio.h>
+#include <string.h>
 #include <unistd.h>
 
+#define LOG_DIR "/userdata/log"
+#define DEFAULT_CFG "/userdata/default_config.json"
+#define USER_CFG "/userdata/ipc_config.json"
+
 static volatile sig_atomic_t g_running = 1;
+static int g_got_start_event;
 
 static void on_signal(int sig) {
   (void)sig;
@@ -14,46 +21,145 @@ static void on_signal(int sig) {
 
 static void on_app_start(const Event *event, void *user) {
   (void)user;
+  g_got_start_event = 1;
   log_info("main", "event received: APP_START (type=%d)", (int)event->type);
 }
 
-int main(int argc, char **argv) {
-  (void)argc;
-  (void)argv;
+static LogLevel parse_level(const char *s) {
+  if (s && strcmp(s, "debug") == 0) {
+    return LOG_LEVEL_DEBUG;
+  }
+  if (s && strcmp(s, "warn") == 0) {
+    return LOG_LEVEL_WARN;
+  }
+  if (s && strcmp(s, "error") == 0) {
+    return LOG_LEVEL_ERROR;
+  }
+  return LOG_LEVEL_INFO;
+}
 
-  log_init(LOG_LEVEL_INFO);
-  log_info("main", "ipc_app hello starting (rv1106-aov-ipc T0.2)");
+static int file_exists(const char *path) {
+  return access(path, F_OK) == 0;
+}
+
+static int run_self_test(void) {
+  int failed = 0;
+
+  log_init_ex(LOG_LEVEL_INFO, LOG_DIR);
+  log_info("selftest", "T0.3 self-test begin");
+
+  if (config_init(DEFAULT_CFG, USER_CFG) != 0) {
+    log_error("selftest", "config_init failed");
+    return 1;
+  }
+
+  if (config_set_string("device.name", "selftest-device") != 0 ||
+      config_set_int("selftest.counter", 42) != 0 ||
+      config_set_bool("selftest.enabled", 1) != 0 || config_save() != 0) {
+    log_error("selftest", "config set/save failed");
+    failed = 1;
+  }
+
+  if (config_reload() != 0) {
+    log_error("selftest", "config_reload failed");
+    failed = 1;
+  }
+
+  char name[64];
+  int counter = 0;
+  int enabled = 0;
+  if (config_get_string("device.name", name, (int)sizeof(name), "") != 0 ||
+      strcmp(name, "selftest-device") != 0) {
+    log_error("selftest", "device.name mismatch: %s", name);
+    failed = 1;
+  }
+  if (config_get_int("selftest.counter", &counter, 0) != 0 || counter != 42) {
+    log_error("selftest", "counter mismatch: %d", counter);
+    failed = 1;
+  }
+  if (config_get_bool("selftest.enabled", &enabled, 0) != 0 || enabled != 1) {
+    log_error("selftest", "enabled mismatch: %d", enabled);
+    failed = 1;
+  }
+
+  if (!file_exists(USER_CFG)) {
+    log_error("selftest", "user config file missing");
+    failed = 1;
+  }
+
+  g_got_start_event = 0;
+  if (event_bus_init() != 0 ||
+      event_bus_subscribe(EVT_APP_START, on_app_start, NULL) != 0) {
+    log_error("selftest", "event_bus setup failed");
+    failed = 1;
+  } else {
+    Event ev = {.type = EVT_APP_START, .data = NULL, .data_len = 0};
+    event_bus_publish(&ev);
+    if (!g_got_start_event) {
+      log_error("selftest", "event not received");
+      failed = 1;
+    }
+    event_bus_deinit();
+  }
+
+  log_info("selftest", "file log marker");
+  if (!file_exists(LOG_DIR "/ipc_app.log")) {
+    log_error("selftest", "log file missing");
+    failed = 1;
+  }
+
+  config_deinit();
+  log_info("selftest", failed ? "FAILED" : "PASSED");
+  log_close();
+  return failed;
+}
+
+static int run_normal(void) {
+  log_init_ex(LOG_LEVEL_INFO, LOG_DIR);
+
+  if (config_init(DEFAULT_CFG, USER_CFG) != 0) {
+    log_error("main", "config_init failed");
+    return 1;
+  }
+
+  char level_str[32];
+  config_get_string("log.level", level_str, (int)sizeof(level_str), "info");
+  log_set_level(parse_level(level_str));
+
+  char name[64];
+  config_get_string("device.name", name, (int)sizeof(name), "rv1106-aov-ipc");
+  log_info("main", "ipc_app starting device=%s", name);
 
   signal(SIGINT, on_signal);
   signal(SIGTERM, on_signal);
 
   if (event_bus_init() != 0) {
     log_error("main", "event_bus_init failed");
+    config_deinit();
+    log_close();
     return 1;
   }
-
-  if (event_bus_subscribe(EVT_APP_START, on_app_start, NULL) != 0) {
-    log_error("main", "event_bus_subscribe failed");
-    event_bus_deinit();
-    return 1;
-  }
+  event_bus_subscribe(EVT_APP_START, on_app_start, NULL);
 
   Event start_evt = {.type = EVT_APP_START, .data = NULL, .data_len = 0};
   event_bus_publish(&start_evt);
 
-  log_info("main", "running; send SIGTERM/SIGINT to stop");
-
-  /* Keep alive briefly so adb can capture logs; exit after idle loop ticks. */
   int ticks = 0;
-  while (g_running && ticks < 10) {
+  while (g_running && ticks < 5) {
     sleep(1);
     ++ticks;
   }
 
-  Event stop_evt = {.type = EVT_APP_STOP, .data = NULL, .data_len = 0};
-  event_bus_publish(&stop_evt);
-
   event_bus_deinit();
+  config_deinit();
   log_info("main", "ipc_app exit");
+  log_close();
   return 0;
+}
+
+int main(int argc, char **argv) {
+  if (argc > 1 && strcmp(argv[1], "--self-test") == 0) {
+    return run_self_test();
+  }
+  return run_normal();
 }

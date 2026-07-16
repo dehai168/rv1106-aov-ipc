@@ -9,10 +9,10 @@
 - [x] T0.1 WSL 编译环境搭建 — 完成：SDK `824b817f8` + gcc8.3 工具链；`./build.sh media` 产出 `simple_vi_get_frame`；hello 板上打印成功；VI 例程识别 MIS5001（见 env.md）
   - 内容：WSL 内安装依赖，clone `LuckfoxTECH/luckfox-pico` SDK，完成 buildroot/工具链准备，编译通过官方任一 RKMPI 例程
   - 验收：交叉编译产物在板上可运行；`docs/env.md` 记录 SDK 路径、工具链版本、编译命令
-- [!] T0.2 仓库骨架与构建系统（依赖 T0.1）— 代码/交叉编译已完成，`build/ipc_app` 就绪；**阻塞：adb 掉线，待板子重连后 `scripts/deploy.ps1` 真机验收**
+- [x] T0.2 仓库骨架与构建系统 — 完成：`ipc_app` 板上输出 APP_START/exit 日志（commit 见 worklog）
   - 内容：按 `01-architecture.md` §5 建目录；CMake + `cmake/toolchain-rv1106.cmake`；`scripts/build.sh`、`scripts/deploy.ps1`（adb push + 运行）
   - 验收：`ipc_app` hello 版（打日志、装 signal handler、空事件总线）在板上跑起来，adb 能看到日志
-- [ ] T0.3 公共基础件（依赖 T0.2）
+- [x] T0.3 公共基础件 — 完成：`ipc_app --self-test` 板上 PASSED；配置落盘 `/userdata/ipc_config.json`，二次运行仍合并成功；日志 `/userdata/log/ipc_app.log`
   - 内容：日志模块（等级/文件输出到 /userdata/log）、配置中心（JSON 读写合并、原子写入，引入 cJSON 或等价轻量库）、事件总线（发布订阅）
   - 验收：单元级自测程序在板上通过；配置改写后重启保持
 
@@ -112,7 +112,7 @@
 
 | 里程碑 | 状态 |
 |---|---|
-| M0 环境与骨架 | T0.1 完成；T0.2 待板上验收（adb 掉线） |
+| M0 环境与骨架 | 完成（T0.1–T0.3） |
 | M1 视频链路 | 未开始 |
 | M2 录像与存储 | 未开始 |
 | M3 移动侦测 | 未开始 |

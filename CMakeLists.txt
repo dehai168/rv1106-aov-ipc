@@ -10,12 +10,16 @@ add_executable(ipc_app
   src/main/main.c
   src/common/log.c
   src/common/event_bus.c
+  src/system/config_service.c
+  third_party/cJSON/cJSON.c
 )
 
 target_include_directories(ipc_app PRIVATE
   ${CMAKE_CURRENT_SOURCE_DIR}/src
+  ${CMAKE_CURRENT_SOURCE_DIR}/third_party/cJSON
 )
 
 target_compile_options(ipc_app PRIVATE -Wall -Wextra -Werror)
+target_compile_definitions(ipc_app PRIVATE _GNU_SOURCE)
 
 install(TARGETS ipc_app RUNTIME DESTINATION bin)
