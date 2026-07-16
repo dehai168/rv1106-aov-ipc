@@ -1,9 +1,11 @@
 #include "common/event_bus.h"
 #include "common/log.h"
+#include "media/media_service.h"
 #include "system/config_service.h"
 
 #include <signal.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
 
@@ -114,6 +116,59 @@ static int run_self_test(void) {
   return failed;
 }
 
+static int run_capture(int frame_count) {
+  log_init_ex(LOG_LEVEL_INFO, LOG_DIR);
+  if (config_init(DEFAULT_CFG, USER_CFG) != 0) {
+    log_error("main", "config_init failed");
+    return 1;
+  }
+
+  char level_str[32];
+  char iq_dir[256];
+  char capture_dir[256];
+  int width = 1920;
+  int height = 1080;
+  int vi_chn = 0;
+
+  config_get_string("log.level", level_str, (int)sizeof(level_str), "info");
+  log_set_level(parse_level(level_str));
+  config_get_int("video.width", &width, 1920);
+  config_get_int("video.height", &height, 1080);
+  config_get_int("video.vi_chn", &vi_chn, 0);
+  config_get_string("video.iq_dir", iq_dir, (int)sizeof(iq_dir), "/oem/usr/share/iqfiles");
+  /* /userdata is only ~2MB; dump YUV to TF card by default. */
+  config_get_string("video.capture_dir", capture_dir, (int)sizeof(capture_dir), "/mnt/sdcard");
+
+  MediaConfig mcfg = {
+      .width = width,
+      .height = height,
+      .vi_chn = vi_chn,
+      .iq_dir = iq_dir,
+  };
+
+  log_info("main", "capture start %dx%d iq=%s dir=%s frames=%d", width, height, iq_dir,
+           capture_dir, frame_count);
+  if (media_init(&mcfg) != 0) {
+    log_error("main", "media_init failed");
+    config_deinit();
+    log_close();
+    return 2;
+  }
+
+  int ret = media_capture_nv12(capture_dir, "capture_0.yuv", frame_count);
+  media_deinit();
+  config_deinit();
+
+  if (ret != 0) {
+    log_error("main", "capture failed %d", ret);
+    log_close();
+    return 3;
+  }
+  log_info("main", "capture ok -> %s/capture_0.yuv", capture_dir);
+  log_close();
+  return 0;
+}
+
 static int run_normal(void) {
   log_init_ex(LOG_LEVEL_INFO, LOG_DIR);
 
@@ -160,6 +215,16 @@ static int run_normal(void) {
 int main(int argc, char **argv) {
   if (argc > 1 && strcmp(argv[1], "--self-test") == 0) {
     return run_self_test();
+  }
+  if (argc > 1 && strcmp(argv[1], "--capture") == 0) {
+    int frames = 8;
+    if (argc > 2) {
+      frames = atoi(argv[2]);
+      if (frames <= 0) {
+        frames = 8;
+      }
+    }
+    return run_capture(frames);
   }
   return run_normal();
 }

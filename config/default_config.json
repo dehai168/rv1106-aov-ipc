@@ -6,6 +6,13 @@
     "level": "info",
     "dir": "/userdata/log"
   },
+  "video": {
+    "width": 1920,
+    "height": 1080,
+    "vi_chn": 0,
+    "iq_dir": "/oem/usr/share/iqfiles",
+    "capture_dir": "/mnt/sdcard"
+  },
   "selftest": {
     "enabled": false,
     "counter": 0

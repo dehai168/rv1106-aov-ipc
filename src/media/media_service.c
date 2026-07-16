@@ -1,0 +1,287 @@
+#include "media/media_service.h"
+
+#include "common/log.h"
+
+#include <pthread.h>
+#include <signal.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <unistd.h>
+
+#include <rk_aiq_user_api2_sysctl.h>
+
+#include "rk_debug.h"
+#include "rk_defines.h"
+#include "rk_mpi_mb.h"
+#include "rk_mpi_sys.h"
+#include "rk_mpi_vi.h"
+
+typedef struct {
+  int inited;
+  int width;
+  int height;
+  int vi_chn;
+  char iq_dir[256];
+  rk_aiq_sys_ctx_t *aiq_ctx;
+} MediaCtx;
+
+static MediaCtx g_media;
+static volatile int g_quit;
+static int g_frame_target;
+static int g_frame_got;
+
+static XCamReturn media_aiq_err_cb(rk_aiq_err_msg_t *msg) {
+  if (msg && msg->err_code == XCAM_RETURN_BYPASS) {
+    log_warn("media", "aiq bypass err");
+  }
+  return XCAM_RETURN_NO_ERROR;
+}
+
+static XCamReturn media_aiq_sof_cb(rk_aiq_metas_t *meta) {
+  (void)meta;
+  return XCAM_RETURN_NO_ERROR;
+}
+
+static int media_aiq_start(const char *iq_dir) {
+  rk_aiq_static_info_t info;
+  memset(&info, 0, sizeof(info));
+  if (rk_aiq_uapi2_sysctl_enumStaticMetas(0, &info) != 0) {
+    log_error("media", "enumStaticMetas failed");
+    return -1;
+  }
+  log_info("media", "sensor=%s iq=%s", info.sensor_info.sensor_name, iq_dir);
+
+  setenv("HDR_MODE", "0", 1);
+  g_media.aiq_ctx = rk_aiq_uapi2_sysctl_init(info.sensor_info.sensor_name, iq_dir,
+                                              media_aiq_err_cb, media_aiq_sof_cb);
+  if (!g_media.aiq_ctx) {
+    log_error("media", "aiq init failed");
+    return -2;
+  }
+  if (rk_aiq_uapi2_sysctl_prepare(g_media.aiq_ctx, 0, 0, RK_AIQ_WORKING_MODE_NORMAL)) {
+    log_error("media", "aiq prepare failed");
+    rk_aiq_uapi2_sysctl_deinit(g_media.aiq_ctx);
+    g_media.aiq_ctx = NULL;
+    return -3;
+  }
+  if (rk_aiq_uapi2_sysctl_start(g_media.aiq_ctx)) {
+    log_error("media", "aiq start failed");
+    rk_aiq_uapi2_sysctl_deinit(g_media.aiq_ctx);
+    g_media.aiq_ctx = NULL;
+    return -4;
+  }
+  log_info("media", "aiq start ok");
+  return 0;
+}
+
+static void media_aiq_stop(void) {
+  if (!g_media.aiq_ctx) {
+    return;
+  }
+  rk_aiq_uapi2_sysctl_stop(g_media.aiq_ctx, false);
+  rk_aiq_uapi2_sysctl_deinit(g_media.aiq_ctx);
+  g_media.aiq_ctx = NULL;
+}
+
+static int media_vi_dev_init(void) {
+  int ret;
+  int dev_id = 0;
+  VI_DEV_ATTR_S attr;
+  VI_DEV_BIND_PIPE_S bind;
+  memset(&attr, 0, sizeof(attr));
+  memset(&bind, 0, sizeof(bind));
+
+  ret = RK_MPI_VI_GetDevAttr(dev_id, &attr);
+  if (ret == RK_ERR_VI_NOT_CONFIG) {
+    ret = RK_MPI_VI_SetDevAttr(dev_id, &attr);
+    if (ret != RK_SUCCESS) {
+      log_error("media", "SetDevAttr %x", ret);
+      return -1;
+    }
+  }
+
+  ret = RK_MPI_VI_GetDevIsEnable(dev_id);
+  if (ret != RK_SUCCESS) {
+    ret = RK_MPI_VI_EnableDev(dev_id);
+    if (ret != RK_SUCCESS) {
+      log_error("media", "EnableDev %x", ret);
+      return -2;
+    }
+    bind.u32Num = 1;
+    bind.PipeId[0] = dev_id;
+    ret = RK_MPI_VI_SetDevBindPipe(dev_id, &bind);
+    if (ret != RK_SUCCESS) {
+      log_error("media", "SetDevBindPipe %x", ret);
+      return -3;
+    }
+  }
+  return 0;
+}
+
+static int media_vi_chn_init(int chn, int width, int height) {
+  VI_CHN_ATTR_S attr;
+  memset(&attr, 0, sizeof(attr));
+  attr.stIspOpt.u32BufCount = 3;
+  attr.stIspOpt.enMemoryType = VI_V4L2_MEMORY_TYPE_DMABUF;
+  attr.stSize.u32Width = (RK_U32)width;
+  attr.stSize.u32Height = (RK_U32)height;
+  attr.enPixelFormat = RK_FMT_YUV420SP;
+  attr.enCompressMode = COMPRESS_MODE_NONE;
+  attr.u32Depth = 2;
+
+  int ret = RK_MPI_VI_SetChnAttr(0, chn, &attr);
+  ret |= RK_MPI_VI_EnableChn(0, chn);
+  if (ret) {
+    log_error("media", "VI chn init fail %x", ret);
+    return ret;
+  }
+  return 0;
+}
+
+static void *media_get_frame_thread(void *arg) {
+  int chn = *(int *)arg;
+  VIDEO_FRAME_INFO_S frame;
+  memset(&frame, 0, sizeof(frame));
+
+  while (!g_quit) {
+    int ret = RK_MPI_VI_GetChnFrame(0, chn, &frame, 1000);
+    if (ret == RK_SUCCESS) {
+      g_frame_got++;
+      if (g_frame_got <= 3 || (g_frame_got % 10) == 0) {
+        log_info("media", "got frame #%d %ux%u", g_frame_got,
+                 frame.stVFrame.u32Width, frame.stVFrame.u32Height);
+      }
+      RK_MPI_VI_ReleaseChnFrame(0, chn, &frame);
+      if (g_frame_target >= 0 && g_frame_got >= g_frame_target) {
+        g_quit = 1;
+        break;
+      }
+    } else {
+      log_warn("media", "GetChnFrame timeout/fail %x", ret);
+    }
+  }
+  return NULL;
+}
+
+int media_init(const MediaConfig *cfg) {
+  if (g_media.inited) {
+    return 0;
+  }
+  if (!cfg || cfg->width <= 0 || cfg->height <= 0) {
+    return -1;
+  }
+
+  memset(&g_media, 0, sizeof(g_media));
+  g_media.width = cfg->width;
+  g_media.height = cfg->height;
+  g_media.vi_chn = cfg->vi_chn;
+  snprintf(g_media.iq_dir, sizeof(g_media.iq_dir), "%s",
+           cfg->iq_dir && cfg->iq_dir[0] ? cfg->iq_dir : "/oem/usr/share/iqfiles");
+
+  if (media_aiq_start(g_media.iq_dir) != 0) {
+    return -2;
+  }
+
+  if (RK_MPI_SYS_Init() != RK_SUCCESS) {
+    log_error("media", "RK_MPI_SYS_Init fail");
+    media_aiq_stop();
+    return -3;
+  }
+
+  if (media_vi_dev_init() != 0 ||
+      media_vi_chn_init(g_media.vi_chn, g_media.width, g_media.height) != 0) {
+    RK_MPI_SYS_Exit();
+    media_aiq_stop();
+    return -4;
+  }
+
+  g_media.inited = 1;
+  log_info("media", "init ok %dx%d chn=%d", g_media.width, g_media.height, g_media.vi_chn);
+  return 0;
+}
+
+void media_deinit(void) {
+  if (!g_media.inited) {
+    media_aiq_stop();
+    return;
+  }
+
+  RK_MPI_VI_DisableChn(0, g_media.vi_chn);
+  RK_MPI_VI_DisableDev(0);
+  RK_MPI_SYS_Exit();
+  media_aiq_stop();
+  g_media.inited = 0;
+  log_info("media", "deinit ok");
+}
+
+int media_capture_nv12(const char *out_dir, const char *file_name, int frame_count) {
+  if (!g_media.inited) {
+    return -1;
+  }
+  if (frame_count <= 0) {
+    frame_count = 5;
+  }
+
+  /* Warm up AE/AWB: discard first frames before enabling file dump. */
+  const int skip = 15;
+  g_quit = 0;
+  g_frame_target = skip;
+  g_frame_got = 0;
+
+  pthread_t tid;
+  int chn = g_media.vi_chn;
+  if (pthread_create(&tid, NULL, media_get_frame_thread, &chn) != 0) {
+    log_error("media", "pthread_create failed");
+    return -2;
+  }
+  int wait_sec = skip + 10;
+  while (!g_quit && wait_sec-- > 0) {
+    sleep(1);
+  }
+  g_quit = 1;
+  pthread_join(tid, NULL);
+  log_info("media", "warmup done discarded=%d", g_frame_got);
+
+  VI_SAVE_FILE_INFO_S save;
+  memset(&save, 0, sizeof(save));
+  save.bCfg = RK_TRUE;
+  snprintf(save.aFilePath, sizeof(save.aFilePath), "%s",
+           out_dir && out_dir[0] ? out_dir : "/mnt/sdcard/");
+  size_t n = strlen(save.aFilePath);
+  if (n > 0 && save.aFilePath[n - 1] != '/') {
+    if (n + 1 < sizeof(save.aFilePath)) {
+      save.aFilePath[n] = '/';
+      save.aFilePath[n + 1] = '\0';
+    }
+  }
+  snprintf(save.aFileName, sizeof(save.aFileName), "%s",
+           file_name && file_name[0] ? file_name : "capture_0.yuv");
+  RK_MPI_VI_ChnSaveFile(0, g_media.vi_chn, &save);
+  log_info("media", "saving to %s%s count=%d", save.aFilePath, save.aFileName, frame_count);
+
+  g_quit = 0;
+  g_frame_target = frame_count;
+  g_frame_got = 0;
+  if (pthread_create(&tid, NULL, media_get_frame_thread, &chn) != 0) {
+    log_error("media", "pthread_create failed");
+    return -2;
+  }
+
+  wait_sec = frame_count + 10;
+  while (!g_quit && wait_sec-- > 0) {
+    sleep(1);
+  }
+  g_quit = 1;
+  pthread_join(tid, NULL);
+
+  save.bCfg = RK_FALSE;
+  RK_MPI_VI_ChnSaveFile(0, g_media.vi_chn, &save);
+
+  if (g_frame_got < 1) {
+    log_error("media", "no frame captured");
+    return -3;
+  }
+  log_info("media", "capture done frames=%d", g_frame_got);
+  return 0;
+}

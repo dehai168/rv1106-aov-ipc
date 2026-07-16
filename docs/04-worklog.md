@@ -34,3 +34,13 @@
 - 阻塞/待用户：无
 - 板上状态：adb 正常；rkipc 运行中；`/userdata/ipc_app` `/userdata/default_config.json` `/userdata/ipc_config.json` `/userdata/log/ipc_app.log`
 - 下一步：M1 / T1.1 RKAIQ+VI 初始化（会与 rkipc 争用摄像头，部署前需 killall rkipc）
+
+## 2026-07-16 session 4
+- 完成（部分）：T1.1 media_service
+  - 链接 SDK `media/out`（rockit/rkaiq/mpp/rga）
+  - `ipc_app --capture N`：AIQ init → VI → 预热丢弃 15 帧 → 写 NV12 到 `video.capture_dir`（默认 `/mnt/sdcard`）
+  - 真机：sensor=`m00_b_mis5001`，IQ=`mis5001_CMK-OT2115-PC1_30IRC-F16.json`，稳定拿到 1920x1080 帧
+  - 注意：`/userdata` 仅约 2MB，YUV 必须写 TF 卡；跑 capture 前 `killall rkipc`
+- 阻塞/待用户：当前抓帧 y_mean≈10（几乎全黑+噪点），请确认镜头保护盖已取下、环境有可见光；确认后回复“再抓”，我复测验图
+- 板上状态：已恢复 `rkipc`；产物在 `/mnt/sdcard/capture_0.yuv`
+- 下一步：光照确认后勾掉 T1.1 → T1.2 双码流 VENC
