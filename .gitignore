@@ -1,0 +1,26 @@
+# Build
+*.o
+*.a
+*.so
+*.elf
+*.bin
+*.img
+build/
+out/
+*.ko
+*.mod
+*.mod.c
+Module.symvers
+modules.order
+
+# IDE / OS
+.vscode/
+.idea/
+*.swp
+*~
+.DS_Store
+Thumbs.db
+
+# Local env
+.env
+.env.*
