@@ -1,0 +1,418 @@
+#include "system/network_service.h"
+
+#include "common/log.h"
+#include "system/config_service.h"
+
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <unistd.h>
+
+#define IFACE_DEFAULT "eth0"
+#define INTERFACES_PATH "/etc/network/interfaces"
+#define RESOLV_PATH "/etc/resolv.conf"
+
+static int is_ipv4(const char *s)
+{
+  int a, b, c, d;
+  char tail;
+  if (!s || !*s) {
+    return 0;
+  }
+  if (sscanf(s, "%d.%d.%d.%d%c", &a, &b, &c, &d, &tail) != 4) {
+    return 0;
+  }
+  if (a < 0 || a > 255 || b < 0 || b > 255 || c < 0 || c > 255 || d < 0 || d > 255) {
+    return 0;
+  }
+  return 1;
+}
+
+static int mask_to_prefix(const char *mask)
+{
+  unsigned a, b, c, d, v;
+  int i, n = 0;
+  if (sscanf(mask, "%u.%u.%u.%u", &a, &b, &c, &d) != 4) {
+    return -1;
+  }
+  v = (a << 24) | (b << 16) | (c << 8) | d;
+  for (i = 31; i >= 0; i--) {
+    if (v & (1u << i)) {
+      n++;
+    } else {
+      break;
+    }
+  }
+  for (; i >= 0; i--) {
+    if (v & (1u << i)) {
+      return -1;
+    }
+  }
+  return n;
+}
+
+static void trim_nl(char *s)
+{
+  size_t n;
+  if (!s) {
+    return;
+  }
+  n = strlen(s);
+  while (n > 0 && (s[n - 1] == '\n' || s[n - 1] == '\r' || s[n - 1] == ' ')) {
+    s[--n] = 0;
+  }
+}
+
+static int run_cmd(const char *cmd)
+{
+  int rc = system(cmd);
+  if (rc != 0) {
+    log_warn("network", "cmd failed rc=%d: %s", rc, cmd);
+  }
+  return rc;
+}
+
+static void read_iface_addr(const char *iface, char *ip, int ip_len, char *mask, int mask_len)
+{
+  char cmd[128];
+  FILE *fp;
+  char line[256];
+  if (ip_len > 0) {
+    ip[0] = 0;
+  }
+  if (mask_len > 0) {
+    mask[0] = 0;
+  }
+  snprintf(cmd, sizeof(cmd), "ip -4 -o addr show dev %s 2>/dev/null", iface);
+  fp = popen(cmd, "r");
+  if (!fp) {
+    return;
+  }
+  if (fgets(line, sizeof(line), fp)) {
+    /* ... inet 192.168.1.2/24 ... */
+    char *p = strstr(line, "inet ");
+    if (p) {
+      unsigned a, b, c, d, pref = 24;
+      if (sscanf(p + 5, "%u.%u.%u.%u/%u", &a, &b, &c, &d, &pref) >= 4) {
+        snprintf(ip, ip_len, "%u.%u.%u.%u", a, b, c, d);
+        if (pref <= 32 && mask_len > 0) {
+          unsigned m = pref == 0 ? 0 : (0xffffffffu << (32 - pref));
+          snprintf(mask, mask_len, "%u.%u.%u.%u", (m >> 24) & 0xff, (m >> 16) & 0xff,
+                   (m >> 8) & 0xff, m & 0xff);
+        }
+      }
+    }
+  }
+  pclose(fp);
+}
+
+static void read_default_gw(char *gw, int gw_len)
+{
+  FILE *fp;
+  char line[256];
+  if (gw_len > 0) {
+    gw[0] = 0;
+  }
+  fp = popen("ip route show default 2>/dev/null", "r");
+  if (!fp) {
+    return;
+  }
+  if (fgets(line, sizeof(line), fp)) {
+    char *p = strstr(line, "via ");
+    if (p) {
+      unsigned a, b, c, d;
+      if (sscanf(p + 4, "%u.%u.%u.%u", &a, &b, &c, &d) == 4) {
+        snprintf(gw, gw_len, "%u.%u.%u.%u", a, b, c, d);
+      }
+    }
+  }
+  pclose(fp);
+}
+
+static void set_link_str(char *link, int link_len, const char *v)
+{
+  if (!link || link_len <= 0) {
+    return;
+  }
+  if (!v) {
+    v = "unknown";
+  }
+  snprintf(link, link_len, "%s",
+           (strcmp(v, "up") == 0)       ? "up"
+           : (strcmp(v, "down") == 0)   ? "down"
+                                        : "unknown");
+}
+
+static void read_link(const char *iface, char *link, int link_len)
+{
+  char path[128];
+  FILE *fp;
+  char buf[32];
+  snprintf(path, sizeof(path), "/sys/class/net/%s/operstate", iface);
+  fp = fopen(path, "r");
+  if (!fp) {
+    set_link_str(link, link_len, "unknown");
+    return;
+  }
+  if (!fgets(buf, sizeof(buf), fp)) {
+    set_link_str(link, link_len, "unknown");
+    fclose(fp);
+    return;
+  }
+  fclose(fp);
+  trim_nl(buf);
+  if (strcmp(buf, "up") == 0 || strcmp(buf, "unknown") == 0) {
+    char carrier_path[128];
+    int carrier = -1;
+    FILE *cf;
+    snprintf(carrier_path, sizeof(carrier_path), "/sys/class/net/%s/carrier", iface);
+    cf = fopen(carrier_path, "r");
+    if (cf) {
+      if (fscanf(cf, "%d", &carrier) == 1) {
+        set_link_str(link, link_len, carrier ? "up" : "down");
+      } else {
+        set_link_str(link, link_len, buf);
+      }
+      fclose(cf);
+    } else {
+      set_link_str(link, link_len, buf);
+    }
+  } else {
+    set_link_str(link, link_len, buf[0] ? buf : "down");
+  }
+}
+
+static void read_dns(char *dns1, int d1, char *dns2, int d2)
+{
+  FILE *fp;
+  char line[128];
+  int n = 0;
+  if (d1 > 0) {
+    dns1[0] = 0;
+  }
+  if (d2 > 0) {
+    dns2[0] = 0;
+  }
+  fp = fopen(RESOLV_PATH, "r");
+  if (!fp) {
+    return;
+  }
+  while (fgets(line, sizeof(line), fp) && n < 2) {
+    char ip[64];
+    if (sscanf(line, "nameserver %63s", ip) == 1 && is_ipv4(ip)) {
+      if (n == 0) {
+        snprintf(dns1, d1, "%s", ip);
+      } else {
+        snprintf(dns2, d2, "%s", ip);
+      }
+      n++;
+    }
+  }
+  fclose(fp);
+}
+
+static int write_interfaces(const NetworkConfig *cfg)
+{
+  FILE *fp = fopen(INTERFACES_PATH, "w");
+  if (!fp) {
+    log_error("network", "open %s failed", INTERFACES_PATH);
+    return -1;
+  }
+  fprintf(fp, "# generated by ipc_app\n");
+  fprintf(fp, "auto lo\niface lo inet loopback\n\n");
+  fprintf(fp, "auto %s\n", cfg->iface);
+  if (strcmp(cfg->mode, "static") == 0) {
+    fprintf(fp, "iface %s inet static\n", cfg->iface);
+    fprintf(fp, "\taddress %s\n", cfg->ip);
+    fprintf(fp, "\tnetmask %s\n", cfg->netmask);
+    if (cfg->gateway[0]) {
+      fprintf(fp, "\tgateway %s\n", cfg->gateway);
+    }
+  } else {
+    fprintf(fp, "iface %s inet dhcp\n", cfg->iface);
+  }
+  fclose(fp);
+  return 0;
+}
+
+static int write_resolv(const NetworkConfig *cfg)
+{
+  FILE *fp;
+  if (!cfg->dns1[0] && !cfg->dns2[0]) {
+    return 0;
+  }
+  fp = fopen(RESOLV_PATH, "w");
+  if (!fp) {
+    log_error("network", "open %s failed", RESOLV_PATH);
+    return -1;
+  }
+  if (cfg->dns1[0]) {
+    fprintf(fp, "nameserver %s\n", cfg->dns1);
+  }
+  if (cfg->dns2[0]) {
+    fprintf(fp, "nameserver %s\n", cfg->dns2);
+  }
+  fclose(fp);
+  return 0;
+}
+
+static int persist_config(const NetworkConfig *cfg)
+{
+  if (config_set_string("network.iface", cfg->iface) != 0 ||
+      config_set_string("network.mode", cfg->mode) != 0 ||
+      config_set_string("network.ip", cfg->ip) != 0 ||
+      config_set_string("network.netmask", cfg->netmask) != 0 ||
+      config_set_string("network.gateway", cfg->gateway) != 0 ||
+      config_set_string("network.dns1", cfg->dns1) != 0 ||
+      config_set_string("network.dns2", cfg->dns2) != 0) {
+    return -1;
+  }
+  if (config_save() != 0) {
+    return -1;
+  }
+  if (write_interfaces(cfg) != 0) {
+    return -1;
+  }
+  if (write_resolv(cfg) != 0) {
+    return -1;
+  }
+  return 0;
+}
+
+static int validate(const NetworkConfig *cfg)
+{
+  if (!cfg || strcmp(cfg->iface, "eth0") != 0) {
+    return -1;
+  }
+  if (strcmp(cfg->mode, "dhcp") != 0 && strcmp(cfg->mode, "static") != 0) {
+    return -1;
+  }
+  if (strcmp(cfg->mode, "static") == 0) {
+    if (!is_ipv4(cfg->ip) || !is_ipv4(cfg->netmask)) {
+      return -1;
+    }
+    if (mask_to_prefix(cfg->netmask) < 0) {
+      return -1;
+    }
+    if (cfg->gateway[0] && !is_ipv4(cfg->gateway)) {
+      return -1;
+    }
+  }
+  if (cfg->dns1[0] && !is_ipv4(cfg->dns1)) {
+    return -1;
+  }
+  if (cfg->dns2[0] && !is_ipv4(cfg->dns2)) {
+    return -1;
+  }
+  return 0;
+}
+
+static int apply_cfg(const NetworkConfig *cfg)
+{
+  char cmd[256];
+  int pref;
+
+  snprintf(cmd, sizeof(cmd), "killall udhcpc 2>/dev/null");
+  run_cmd(cmd);
+
+  snprintf(cmd, sizeof(cmd), "ip link set %s up", cfg->iface);
+  run_cmd(cmd);
+
+  snprintf(cmd, sizeof(cmd), "ip addr flush dev %s", cfg->iface);
+  run_cmd(cmd);
+
+  if (strcmp(cfg->mode, "dhcp") == 0) {
+    snprintf(cmd, sizeof(cmd), "udhcpc -i %s -n -q -t 5 -A 1", cfg->iface);
+    if (run_cmd(cmd) != 0) {
+      log_warn("network", "udhcpc failed (link may be down)");
+      /* still ok to keep config; cable may be unplugged */
+    }
+  } else {
+    pref = mask_to_prefix(cfg->netmask);
+    if (pref < 0) {
+      return -1;
+    }
+    snprintf(cmd, sizeof(cmd), "ip addr add %s/%d dev %s", cfg->ip, pref, cfg->iface);
+    if (run_cmd(cmd) != 0) {
+      return -1;
+    }
+    if (cfg->gateway[0]) {
+      snprintf(cmd, sizeof(cmd), "ip route replace default via %s", cfg->gateway);
+      if (run_cmd(cmd) != 0) {
+        log_warn("network", "set default gateway failed");
+      }
+    }
+  }
+
+  write_resolv(cfg);
+  log_info("network", "applied iface=%s mode=%s", cfg->iface, cfg->mode);
+  return 0;
+}
+
+int network_get(NetworkConfig *out)
+{
+  if (!out) {
+    return -1;
+  }
+  memset(out, 0, sizeof(*out));
+  config_get_string("network.iface", out->iface, (int)sizeof(out->iface), IFACE_DEFAULT);
+  config_get_string("network.mode", out->mode, (int)sizeof(out->mode), "dhcp");
+  config_get_string("network.ip", out->ip, (int)sizeof(out->ip), "");
+  config_get_string("network.netmask", out->netmask, (int)sizeof(out->netmask),
+                    "255.255.255.0");
+  config_get_string("network.gateway", out->gateway, (int)sizeof(out->gateway), "");
+  config_get_string("network.dns1", out->dns1, (int)sizeof(out->dns1), "");
+  config_get_string("network.dns2", out->dns2, (int)sizeof(out->dns2), "");
+
+  if (!out->dns1[0] && !out->dns2[0]) {
+    read_dns(out->dns1, (int)sizeof(out->dns1), out->dns2, (int)sizeof(out->dns2));
+  }
+
+  read_link(out->iface, out->link, (int)sizeof(out->link));
+  read_iface_addr(out->iface, out->current_ip, (int)sizeof(out->current_ip), out->current_netmask,
+                  (int)sizeof(out->current_netmask));
+  read_default_gw(out->current_gateway, (int)sizeof(out->current_gateway));
+  read_iface_addr("usb0", out->usb0_ip, (int)sizeof(out->usb0_ip), NULL, 0);
+  return 0;
+}
+
+int network_set(const NetworkConfig *in, int apply)
+{
+  NetworkConfig cfg;
+  if (!in) {
+    return -1;
+  }
+  cfg = *in;
+  if (!cfg.iface[0]) {
+    snprintf(cfg.iface, sizeof(cfg.iface), "%s", IFACE_DEFAULT);
+  }
+  if (!cfg.mode[0]) {
+    snprintf(cfg.mode, sizeof(cfg.mode), "dhcp");
+  }
+  if (validate(&cfg) != 0) {
+    return -2; /* bad params */
+  }
+  if (persist_config(&cfg) != 0) {
+    return -1;
+  }
+  if (apply) {
+    if (apply_cfg(&cfg) != 0) {
+      return -3;
+    }
+  }
+  return 0;
+}
+
+int network_apply(void)
+{
+  NetworkConfig cfg;
+  if (network_get(&cfg) != 0) {
+    return -1;
+  }
+  if (validate(&cfg) != 0) {
+    /* defaults */
+    snprintf(cfg.iface, sizeof(cfg.iface), "%s", IFACE_DEFAULT);
+    snprintf(cfg.mode, sizeof(cfg.mode), "dhcp");
+  }
+  return apply_cfg(&cfg);
+}

@@ -1,0 +1,32 @@
+:root {
+  --bg: #0f1419;
+  --panel: #1a222c;
+  --text: #e7ecf1;
+  --muted: #8b98a5;
+  --accent: #3d8bfd;
+  --danger: #e35d6a;
+  --border: #2a3540;
+  font-family: "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif;
+}
+
+* { box-sizing: border-box; }
+html, body, #app { height: 100%; margin: 0; }
+body { background: var(--bg); color: var(--text); }
+
+a { color: inherit; text-decoration: none; }
+button, input {
+  font: inherit;
+  border-radius: 6px;
+  border: 1px solid var(--border);
+  background: var(--panel);
+  color: var(--text);
+  padding: 0.55rem 0.75rem;
+}
+button {
+  background: var(--accent);
+  border-color: transparent;
+  cursor: pointer;
+}
+button.secondary { background: transparent; border-color: var(--border); }
+.muted { color: var(--muted); }
+.error { color: var(--danger); }

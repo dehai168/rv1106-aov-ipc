@@ -1,0 +1,54 @@
+#!/bin/sh
+# Luckfox init.d script for ipc_app (T5.2).
+# Install: scripts/install_init.sh (requires root on board).
+
+DAEMON=/userdata/ipc_app
+WATCHDOG=/userdata/ipc_watchdog.sh
+LOG=/userdata/log/ipc_app.log
+
+wait_sdcard() {
+  i=0
+  while [ "$i" -lt 30 ]; do
+    if mountpoint -q /mnt/sdcard 2>/dev/null || [ -d /mnt/sdcard/records ]; then
+      return 0
+    fi
+    i=$((i + 1))
+    sleep 1
+  done
+  return 1
+}
+
+start() {
+  killall rkipc 2>/dev/null || true
+  mkdir -p /userdata/log
+  if pidof ipc_app >/dev/null 2>&1; then
+    echo "ipc_app already running"
+    return 0
+  fi
+  wait_sdcard || echo "WARN: sdcard not ready, starting anyway"
+  if [ -x "$WATCHDOG" ]; then
+    nohup "$WATCHDOG" >>"$LOG" 2>&1 &
+  elif [ -x "$DAEMON" ]; then
+    nohup "$DAEMON" --web >>"$LOG" 2>&1 &
+  else
+    echo "missing $DAEMON"
+    return 1
+  fi
+  echo "ipc_app started"
+}
+
+stop() {
+  killall ipc_app 2>/dev/null || true
+  pkill -f ipc_watchdog.sh 2>/dev/null || true
+  echo "ipc_app stopped"
+}
+
+case "$1" in
+  start) start ;;
+  stop) stop ;;
+  restart) stop; sleep 1; start ;;
+  *)
+    echo "Usage: $0 {start|stop|restart}"
+    exit 1
+    ;;
+esac

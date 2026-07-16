@@ -12,6 +12,13 @@
     "vi_chn": 0,
     "iq_dir": "/oem/usr/share/iqfiles",
     "capture_dir": "/mnt/sdcard",
+    "image": {
+      "brightness": 50,
+      "contrast": 50,
+      "saturation": 50,
+      "mirror": 0,
+      "flip": 0
+    },
     "encode": {
       "main_w": 1920,
       "main_h": 1080,
@@ -25,6 +32,49 @@
       "sub_gop": 30,
       "out_dir": "/mnt/sdcard"
     }
+  },
+  "storage": {
+    "mount": "/mnt/sdcard"
+  },
+  "record": {
+    "segment_sec": 30,
+    "recycle_free_percent": 10,
+    "pre_record_sec": 4,
+    "quiet_sec": 30
+  },
+  "detect": {
+    "enabled": true,
+    "width": 640,
+    "height": 360,
+    "sensitivity": 3,
+    "square_pct": 3,
+    "hit_frames": 2
+  },
+  "network": {
+    "iface": "eth0",
+    "mode": "dhcp",
+    "ip": "",
+    "netmask": "255.255.255.0",
+    "gateway": "",
+    "dns1": "",
+    "dns2": ""
+  },
+  "system": {
+    "timezone": "Asia/Shanghai",
+    "ntp": {
+      "enabled": false,
+      "server": "pool.ntp.org",
+      "interval_min": 60
+    }
+  },
+  "web": {
+    "port": 8080,
+    "www_root": "/userdata/www",
+    "token_ttl_sec": 86400
+  },
+  "auth": {
+    "username": "admin",
+    "must_change": true
   },
   "selftest": {
     "enabled": false,

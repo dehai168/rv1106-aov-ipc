@@ -18,14 +18,25 @@ add_executable(ipc_app
   src/main/main.c
   src/common/log.c
   src/common/event_bus.c
+  src/common/sha256.c
   src/system/config_service.c
+  src/system/storage_service.c
+  src/system/network_service.c
+  src/system/system_service.c
   src/media/media_service.c
+  src/record/record_service.c
+  src/detect/detect_service.c
+  src/web/web_service.c
+  src/web/fmp4_mux.c
   third_party/cJSON/cJSON.c
+  third_party/mongoose/mongoose.c
 )
 
 target_include_directories(ipc_app PRIVATE
   ${CMAKE_CURRENT_SOURCE_DIR}/src
   ${CMAKE_CURRENT_SOURCE_DIR}/third_party/cJSON
+  ${CMAKE_CURRENT_SOURCE_DIR}/third_party/rkmuxer
+  ${CMAKE_CURRENT_SOURCE_DIR}/third_party/mongoose
   ${RK_MEDIA_OUT}/include
   ${RK_MEDIA_OUT}/include/rkaiq
   ${RK_MEDIA_OUT}/include/rkaiq/uAPI2
@@ -54,6 +65,7 @@ target_link_libraries(ipc_app PRIVATE
   rockchip_mpp
   rga
   rkaiq
+  rkmuxer
   pthread
   m
   stdc++
