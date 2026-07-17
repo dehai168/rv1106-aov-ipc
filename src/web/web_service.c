@@ -17,6 +17,7 @@
 #include <ctype.h>
 #include <dirent.h>
 #include <pthread.h>
+#include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -91,6 +92,43 @@ static PreviewCtx g_prev = {
 
 /* Motion-detect/record automation started when preview becomes active. */
 static volatile int g_motion_automation_on = 0;
+static volatile int g_motion_defer_gen = 0;
+
+static int web_start_motion_automation_if_needed(void);
+static void web_stop_motion_automation(void);
+
+static void *motion_defer_worker(void *arg)
+{
+  int gen = (int)(intptr_t)arg;
+  int i;
+  /* Let preview/AE settle before stacking IVS+record (avoids prior cold-start crash). */
+  for (i = 0; i < 30 && gen == g_motion_defer_gen; i++) {
+    usleep(100 * 1000);
+  }
+  if (gen != g_motion_defer_gen) {
+    return NULL;
+  }
+  if (web_start_motion_automation_if_needed() != 0) {
+    log_warn("web", "deferred motion automation not started");
+  } else if (g_motion_automation_on) {
+    log_info("web", "deferred motion automation on");
+  }
+  return NULL;
+}
+
+static void schedule_motion_automation(void)
+{
+  pthread_t th;
+  int gen = ++g_motion_defer_gen;
+  if (pthread_create(&th, NULL, motion_defer_worker, (void *)(intptr_t)gen) == 0) {
+    pthread_detach(th);
+  }
+}
+
+static void cancel_motion_automation_schedule(void)
+{
+  g_motion_defer_gen++;
+}
 
 static void json_reply(struct mg_connection *c, int code, const char *msg, cJSON *data)
 {
@@ -1658,7 +1696,7 @@ static void preview_load_encode(MediaEncodeConfig *ecfg)
   config_get_int("video.encode.sub_fps", &ecfg->sub_fps, 15);
   config_get_int("video.encode.sub_bitrate_kbps", &ecfg->sub_bitrate_kbps, 1024);
   config_get_int("video.encode.sub_gop", &ecfg->sub_gop, 30);
-  /* Preview path: enable detect VI if motion-detect is enabled. */
+  /* Preview: enable detect VI when motion detect is on (automation starts deferred). */
   {
     int enabled = 1;
     config_get_bool("detect.enabled", &enabled, 1);
@@ -1725,13 +1763,11 @@ static int preview_ensure_pipeline(void)
       return -3;
     }
   }
-  /* Auto-start detect/record on first preview start. */
-  if (!g_motion_automation_on) {
-    int rc = web_start_motion_automation_if_needed();
-    if (rc != 0) {
-      log_warn("web", "motion automation start skipped rc=%d", rc);
-    }
-  }
+  /*
+   * Defer IVS+record ~3s after preview media is up so cold-start stays stable.
+   * Closing the last preview client cancels the schedule and stops automation.
+   */
+  schedule_motion_automation();
   media_stream_request_idr(1);
   return 0;
 }
@@ -1759,6 +1795,7 @@ static void preview_shutdown_pipeline(void)
   if (listening) {
     media_stream_remove_packet_listener(preview_on_packet, NULL);
   }
+  cancel_motion_automation_schedule();
   web_stop_motion_automation();
   if (media_owned) {
     media_stream_stop();

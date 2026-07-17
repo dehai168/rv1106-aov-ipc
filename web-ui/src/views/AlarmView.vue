@@ -1,11 +1,12 @@
 <script setup lang="ts">
-import { onMounted, ref } from 'vue'
+import { onMounted, onUnmounted, ref } from 'vue'
 import { getAlarmEvents, getAlarmMotion, setAlarmMotion, type AlarmEvent } from '../api'
 
 const loading = ref(true)
 const saving = ref(false)
 const error = ref('')
 const ok = ref('')
+let refreshTimer: number | undefined
 
 const motion = ref<{
   enabled: boolean
@@ -66,12 +67,37 @@ async function onSave() {
   }
 }
 
-onMounted(refresh)
+onMounted(() => {
+  refresh()
+  refreshTimer = window.setInterval(() => {
+    getAlarmEvents(eventsLimit.value).then((evs) => {
+      if (evs.code === 0) events.value = evs.data.events
+    }).catch(() => {
+      /* ignore poll errors */
+    })
+    getAlarmMotion().then((m) => {
+      if (m.code === 0 && motion.value) {
+        motion.value.running = m.data.running
+        motion.value.motion_count = m.data.motion_count
+        motion.value.last_event = m.data.last_event
+      }
+    }).catch(() => {
+      /* ignore */
+    })
+  }, 3000)
+})
+
+onUnmounted(() => {
+  if (refreshTimer) window.clearInterval(refreshTimer)
+})
 </script>
 
 <template>
   <section class="alarm">
     <h2>告警与智能分析</h2>
+    <p class="muted tip">
+      保持「实时预览」打开约 3 秒后自动启动移动侦测；本页每 3 秒刷新事件。走动后看下方列表。
+    </p>
     <p v-if="loading" class="muted">加载中…</p>
     <div v-else class="grid">
       <div class="panel">
@@ -148,6 +174,7 @@ input { padding: 0.35rem 0.5rem; }
 .events { max-height: 460px; overflow: auto; display: grid; gap: 0.5rem; }
 .event { border: 1px solid var(--border); border-radius: 8px; padding: 0.6rem; }
 .line { font-size: 0.9rem; }
+.tip { font-size: 0.85rem; margin: 0; }
 
 @media (max-width: 860px) {
   .grid { grid-template-columns: 1fr; }

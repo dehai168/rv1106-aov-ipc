@@ -5,6 +5,7 @@
 DAEMON=/userdata/ipc_app
 WATCHDOG=/userdata/ipc_watchdog.sh
 LOG=/userdata/log/ipc_app.log
+export LD_LIBRARY_PATH=/oem/usr/lib:/oem/lib:${LD_LIBRARY_PATH:-}
 
 wait_sdcard() {
   i=0
@@ -20,16 +21,16 @@ wait_sdcard() {
 
 start() {
   killall rkipc 2>/dev/null || true
-  mkdir -p /userdata/log
+  mkdir -p /userdata/log /var/run
   if pidof ipc_app >/dev/null 2>&1; then
     echo "ipc_app already running"
     return 0
   fi
   wait_sdcard || echo "WARN: sdcard not ready, starting anyway"
   if [ -x "$WATCHDOG" ]; then
-    nohup "$WATCHDOG" >>"$LOG" 2>&1 &
+    nohup "$WATCHDOG" >/dev/null 2>&1 &
   elif [ -x "$DAEMON" ]; then
-    nohup "$DAEMON" --web >>"$LOG" 2>&1 &
+    nohup "$DAEMON" --web >>"$LOG" 2>>/userdata/log/ipc_stderr.log &
   else
     echo "missing $DAEMON"
     return 1
@@ -39,7 +40,11 @@ start() {
 
 stop() {
   killall ipc_app 2>/dev/null || true
-  pkill -f ipc_watchdog.sh 2>/dev/null || true
+  for p in $(pidof sh 2>/dev/null); do
+    if tr '\0' ' ' <"/proc/$p/cmdline" 2>/dev/null | grep -q ipc_watchdog; then
+      kill "$p" 2>/dev/null || true
+    fi
+  done
   echo "ipc_app stopped"
 }
 

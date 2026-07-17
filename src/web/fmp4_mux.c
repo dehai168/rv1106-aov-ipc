@@ -555,8 +555,8 @@ static uint32_t build_frag(Fmp4Mux *m, uint8_t *o, uint32_t cap, const uint8_t *
   p += 4;
   memcpy(o + p, "trun", 4);
   p += 4;
-  /* data-offset, sample-duration, sample-size, sample-flags */
-  w32(o + p, 0x00000105);
+  /* data-offset | sample-duration | sample-size | sample-flags */
+  w32(o + p, 0x00000701);
   p += 4;
   w32(o + p, 1);
   p += 4;

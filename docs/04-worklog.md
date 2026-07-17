@@ -157,3 +157,40 @@
 - 当前登录：冒烟脚本首登改密为 **admin1**（`IPC_PASS=admin1`）
 - 待明天手测：浏览器预览/存储回放/告警 motion；断电重启验 RTC+自启；看 soak.csv RSS
 - 下一步：T5.3 结果入库 worklog → T5.4 README/review
+
+## 2026-07-17 session 17
+- 现象：浏览器预览无图后 Web 不可达
+- 根因：
+  1. 预览冷启拉起 1080p 主码流 + detect/record，进程退出
+  2. watchdog 重启缺 `LD_LIBRARY_PATH=/oem/usr/lib` → `can't load library librockit.so` 死循环
+  3. 曾出现双实例抢 8080（EADDRINUSE）
+- 修复：
+  - watchdog/S99：库路径 + flock 单实例；stderr 与 app log 分离
+  - 预览不再自动起 detect/record（告警页 apply 仍可拉）
+  - PreviewView 重连间隔 1s→2s
+- 验证：`repro_preview_crash.py` PASS（avc1 + ≥20 fMP4）；板上 Web 已恢复
+- 当前登录：`admin` / `admin1`；请硬刷新后再测预览页
+
+## 2026-07-17 session 18
+- 现象：WS 有推流、存储 MP4 可播，但预览黑屏
+- 根因：`fmp4_mux` fragment `trun` flags=`0x105`（first-sample-flags）与实际写入的 duration/size/flags 布局不匹配，Chrome MSE 解不出
+- 修复：`trun` flags → `0x701`（data-offset|duration|size|flags）；PreviewView 加强 MSE（Infinity duration、segments mode、调试行）
+- 验证：dump 后 `ffprobe` 识别 H.264 704x576@15；板上已部署，请 Ctrl+F5 硬刷新预览页
+
+## 2026-07-17 session 19
+- 手测结果：①预览出图 ②回放 MP4 OK ③告警无事件（因先前关闭预览自动侦测）④断电时间大致准
+- 修复告警：预览开启 detect VI；起流后延后 ~3s 再启 IVS+record；告警页 3s 自动刷新
+- 请：Ctrl+F5 → 开预览等 5s → 走动 → 看告警页「running」与事件列表
+
+## 2026-07-17 session 20
+- 手测确认：告警页已能看到移动侦测事件 → **M4 闭环**
+- 下一步：确认 T5.2 断电后 Web 是否自启；提交修复补丁；T5.3 正式长稳 / T5.4 README
+
+## 2026-07-17 session 21
+- 手测确认：断电上电后 Web **自动启动** → T5.2 完成
+- 下一步：提交预览/告警/watchdog 修复 commit；启动 T5.3 正式 24h soak；并行起草 T5.4 README
+
+
+
+
+

@@ -72,29 +72,29 @@
 - [x] T4.4 网络参数配置 — 完成：`network_service` + `GET/POST /api/v1/network/config` + `NetworkView`；`scripts/test_network.sh`；静态 IP 真机改址待用户同意
   - 内容：静态 IP/DHCP、网关、DNS 查看与修改 API + 页面；改 IP 前弹确认（防失联）
   - 验收：改静态 IP 后用新 IP 能访问（此项真机验证时先征求用户同意）
-- [x] T4.5 图像与视频参数页（依赖 T4.1, T1.3）— 板上 `test_video.sh` PASSED
+- [x] T4.5 图像与视频参数页（依赖 T4.1, T1.3）— 板上 API + 预览手测出图
   - 内容：亮度/对比度/饱和度、翻转镜像、码流参数（分辨率/码率/帧率/GOP）配置页
-  - 验收：API OK；预览可见变化待浏览器手测
-- [x] T4.6 存储与回放（依赖 T4.1, T2.4）— 板上 `test_storage.sh` PASSED（7 段 mp4，download 头为 ftyp）
+  - 验收：预览出图 OK
+- [x] T4.6 存储与回放（依赖 T4.1, T2.4）— 板上 API + 网页播放 MP4 OK
   - 内容：`GET /api/v1/storage/status|records|download`；网页播放走 HTTP Range
-  - 验收：列表+下载头 OK；网页播放待浏览器手测
-- [x] T4.7 告警与智能分析页（依赖 T4.1, T3.3）— 板上 `test_alarm.sh` PASSED
+  - 验收：回放可播
+- [x] T4.7 告警与智能分析页（依赖 T4.1, T3.3）— 预览延后启侦测后手测有事件
   - 内容：侦测开关/灵敏度/阈值；告警事件列表（`/alarms/alarms.log`）
-  - 验收：API OK；预览 motion→alarms.log 待手测；区域编辑待后续
-- [x] T4.8 系统管理页（依赖 T4.1）— 板上 `test_system.sh` PASSED
+  - 验收：开预览走动可见告警事件；区域编辑待后续
+- [x] T4.8 系统管理页（依赖 T4.1）— API OK；断电时间大致准确
   - 内容：设备信息、时间、用户管理、重启、恢复出厂、日志下载
-  - 验收：API OK；重启页待手测
+  - 验收：时间/RTC 大致准；重启页可选再测
 
 ## M5 时间与系统完善（里程碑：整机长稳）
 
-- [~] T5.1 RTC 校时（依赖 T0.3）— `hwclock -s` OK；BusyBox TZ→CST-8；断电过夜待测
-  - 内容：开机 `hwclock -s`；NTP 定时同步后 `hwclock -w`；时区支持
-  - 验收：`test_time.sh` PASSED；断电过夜待测
-- [~] T5.2 开机自启与守护（依赖 T0.2）— kill-9 12s 拉起 PASSED；`S99ipc_app` 已装；断电重启待测
-  - 内容：`S99ipc_app` + `ipc_watchdog.sh`
-  - 验收：断电重启后 Web 自启（待测）
-- [~] T5.3 长稳测试（依赖 M1–M4 全部）— `soak_monitor.sh` 过夜采样中
-  - 内容：连续运行 24h+；监控 RSS/存储/HTTP
+- [x] T5.1 RTC 校时（依赖 T0.3）— 开机 `hwclock -s`；断电上电时间大致准确
+  - 内容：开机 `hwclock -s`；NTP 定时同步后 `hwclock -w`；时区 CST-8
+  - 验收：断电上电时间大致准（手测）
+- [x] T5.2 开机自启与守护（依赖 T0.2）— kill-9 拉起 + 断电上电 Web 自启手测 OK
+  - 内容：`S99ipc_app` + `ipc_watchdog.sh`（含 `LD_LIBRARY_PATH`）
+  - 验收：断电上电后 Web 自动起来（手测）
+- [~] T5.3 长稳测试（依赖 M1–M4 全部）— 准备正式 24h soak
+  - 内容：连续运行 24h+；监控 RSS/存储/HTTP；可叠加预览/侦测
   - 验收：无重启、RSS 波动 < 10%；结果记 worklog
 - [ ] T5.4 整体代码 review 与文档终稿（依赖 T5.3）
   - 内容：对照 01/05 文档全量 review 代码；补齐 README（编译/部署/使用说明）
@@ -116,6 +116,6 @@
 | M1 视频链路 | 完成（T1.1–T1.3） |
 | M2 录像与存储 | 完成（T2.1–T2.4；PC 双击播放请用户抽查一段 mp4） |
 | M3 移动侦测 | T3.1–T3.3 完成；T3.4 延后；IVS 实触发阈值仍待光照场景调优 |
-| M4 Web 管理 | T4.1–T4.8 API 板上冒烟 PASSED；浏览器预览/播放/motion 手测待明天 |
-| M5 时间与系统完善 | T5.1 RTC OK；T5.2 kill-9 拉起 OK；T5.3 soak 过夜采样中；断电重启待测 |
+| M4 Web 管理 | **完成**（预览/回放/告警手测 OK） |
+| M5 时间与系统完善 | T5.1–T5.2 完成；进行中 T5.3 长稳 |
 | M6 AOV 低功耗（二期） | 未开始 |
