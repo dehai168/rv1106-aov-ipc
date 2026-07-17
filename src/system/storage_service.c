@@ -18,6 +18,7 @@ typedef struct {
 
 static char g_mount[128] = "/mnt/sdcard";
 static char g_records[160] = "/mnt/sdcard/records";
+static char g_snapshots[160] = "/mnt/sdcard/snapshots";
 static int g_ready = 0;
 
 static int ensure_dir(const char *path)
@@ -39,6 +40,7 @@ int storage_init(const char *mount_path)
     snprintf(g_mount, sizeof(g_mount), "%s", mount_path);
   }
   snprintf(g_records, sizeof(g_records), "%s/records", g_mount);
+  snprintf(g_snapshots, sizeof(g_snapshots), "%s/snapshots", g_mount);
   g_ready = 1;
   return storage_ensure_dirs();
 }
@@ -56,6 +58,11 @@ const char *storage_mount_path(void)
 const char *storage_records_path(void)
 {
   return g_records;
+}
+
+const char *storage_snapshots_path(void)
+{
+  return g_snapshots;
 }
 
 int storage_get_status(StorageStatus *st)
@@ -110,6 +117,7 @@ int storage_ensure_dirs(void)
   if (ensure_dir(snap) != 0) {
     return -1;
   }
+  snprintf(g_snapshots, sizeof(g_snapshots), "%s", snap);
   return 0;
 }
 
@@ -298,5 +306,52 @@ int storage_delete_oldest(int count)
     }
   }
   free(list);
+  return deleted;
+}
+
+static int wipe_tree_files(const char *dir, int *deleted)
+{
+  DIR *dp = opendir(dir);
+  struct dirent *de;
+  if (!dp) {
+    return -1;
+  }
+  while ((de = readdir(dp)) != NULL) {
+    char path[512];
+    struct stat st;
+    if (strcmp(de->d_name, ".") == 0 || strcmp(de->d_name, "..") == 0) {
+      continue;
+    }
+    snprintf(path, sizeof(path), "%s/%s", dir, de->d_name);
+    if (stat(path, &st) != 0) {
+      continue;
+    }
+    if (S_ISDIR(st.st_mode)) {
+      wipe_tree_files(path, deleted);
+      rmdir(path);
+    } else if (unlink(path) == 0) {
+      (*deleted)++;
+    }
+  }
+  closedir(dp);
+  return 0;
+}
+
+int storage_format_clear(void)
+{
+  char alarms[160];
+  int deleted = 0;
+  if (!g_ready) {
+    return -1;
+  }
+  wipe_tree_files(g_records, &deleted);
+  wipe_tree_files(g_snapshots, &deleted);
+  snprintf(alarms, sizeof(alarms), "%s/alarms", g_mount);
+  wipe_tree_files(alarms, &deleted);
+  if (storage_ensure_dirs() != 0) {
+    return -2;
+  }
+  ensure_dir(alarms);
+  log_warn("storage", "format_clear deleted %d files", deleted);
   return deleted;
 }

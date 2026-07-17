@@ -48,7 +48,20 @@
     "height": 360,
     "sensitivity": 3,
     "square_pct": 3,
-    "hit_frames": 2
+    "hit_frames": 2,
+    "region": {
+      "enabled": false,
+      "x": 0,
+      "y": 0,
+      "w": 0,
+      "h": 0
+    },
+    "schedule": {
+      "enabled": false,
+      "start_min": 0,
+      "end_min": 1440,
+      "days": 127
+    }
   },
   "network": {
     "iface": "eth0",

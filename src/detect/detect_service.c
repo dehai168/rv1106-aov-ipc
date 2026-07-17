@@ -3,6 +3,7 @@
 #include "common/event_bus.h"
 #include "common/log.h"
 #include "media/media_service.h"
+#include "system/config_service.h"
 #include "system/storage_service.h"
 
 #include <pthread.h>
@@ -10,6 +11,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
+#include <time.h>
 #include <unistd.h>
 
 #include "rk_comm_ivs.h"
@@ -68,9 +70,107 @@ static void append_alarm(const DetectEvent *ev)
     return;
   }
   fprintf(fp,
-          "{\"ts\":%ld,\"square\":%d,\"pct_x10\":%d,\"rect\":[%d,%d,%d,%d]}\n", (long)ev->ts,
-          ev->square, ev->square_pct_x10, ev->rect_x, ev->rect_y, ev->rect_w, ev->rect_h);
+          "{\"ts\":%ld,\"square\":%d,\"pct_x10\":%d,\"rect\":[%d,%d,%d,%d],\"snapshot\":\"%s\"}\n",
+          (long)ev->ts, ev->square, ev->square_pct_x10, ev->rect_x, ev->rect_y, ev->rect_w,
+          ev->rect_h, ev->snapshot[0] ? ev->snapshot : "");
   fclose(fp);
+}
+
+static int rect_intersect(int ax, int ay, int aw, int ah, int bx, int by, int bw, int bh)
+{
+  int ax2 = ax + aw, ay2 = ay + ah, bx2 = bx + bw, by2 = by + bh;
+  int ix1 = ax > bx ? ax : bx;
+  int iy1 = ay > by ? ay : by;
+  int ix2 = ax2 < bx2 ? ax2 : bx2;
+  int iy2 = ay2 < by2 ? ay2 : by2;
+  return (ix2 > ix1 && iy2 > iy1) ? 1 : 0;
+}
+
+static int schedule_allows_now(const DetectConfig *cfg)
+{
+  time_t now = time(NULL);
+  struct tm tm_now;
+  int min;
+  unsigned day_bit;
+  if (!cfg->schedule_enabled) {
+    return 1;
+  }
+  localtime_r(&now, &tm_now);
+  /* tm_wday: 0=Sun..6=Sat → bit0=Mon..bit6=Sun */
+  if (tm_now.tm_wday == 0) {
+    day_bit = 1u << 6;
+  } else {
+    day_bit = 1u << (tm_now.tm_wday - 1);
+  }
+  if ((cfg->schedule_days & day_bit) == 0) {
+    return 0;
+  }
+  min = tm_now.tm_hour * 60 + tm_now.tm_min;
+  if (cfg->schedule_start_min == cfg->schedule_end_min) {
+    return 1; /* 24h */
+  }
+  if (cfg->schedule_start_min < cfg->schedule_end_min) {
+    return min >= cfg->schedule_start_min && min < cfg->schedule_end_min;
+  }
+  /* overnight */
+  return min >= cfg->schedule_start_min || min < cfg->schedule_end_min;
+}
+
+static int region_allows(const DetectConfig *cfg, const DetectEvent *ev)
+{
+  if (!cfg->region_enabled || cfg->region_w <= 0 || cfg->region_h <= 0) {
+    return 1;
+  }
+  if (ev->rect_w <= 0 || ev->rect_h <= 0) {
+    /* no bbox from IVS: allow (area-based hit already passed) */
+    return 1;
+  }
+  return rect_intersect(ev->rect_x, ev->rect_y, ev->rect_w, ev->rect_h, cfg->region_x,
+                        cfg->region_y, cfg->region_w, cfg->region_h);
+}
+
+static void take_snapshot(DetectEvent *ev)
+{
+  char path[256];
+  char name[64];
+  struct tm tm_now;
+  localtime_r(&ev->ts, &tm_now);
+  strftime(name, sizeof(name), "%Y%m%d_%H%M%S.jpg", &tm_now);
+  (void)storage_ensure_dirs();
+  snprintf(path, sizeof(path), "%s/%s", storage_snapshots_path(), name);
+  ev->snapshot[0] = '\0';
+  if (media_snapshot_jpeg(path) == 0) {
+    snprintf(ev->snapshot, sizeof(ev->snapshot), "%s", name);
+  }
+}
+
+static void fire_motion(DetectEvent *ev)
+{
+  DetectMotionCb cb;
+  void *user;
+  Event e;
+
+  take_snapshot(ev);
+
+  pthread_mutex_lock(&g_det.lock);
+  g_det.last = *ev;
+  g_det.motion_count++;
+  cb = g_det.cb;
+  user = g_det.cb_user;
+  pthread_mutex_unlock(&g_det.lock);
+
+  append_alarm(ev);
+  e.type = EVT_MOTION_DETECT;
+  e.data = (void *)ev;
+  e.data_len = sizeof(*ev);
+  event_bus_publish(&e);
+
+  if (cb) {
+    cb(ev, user);
+  }
+  log_info("detect", "MOTION pct_x10=%d square=%d rect=%d,%d %dx%d snap=%s", ev->square_pct_x10,
+           ev->square, ev->rect_x, ev->rect_y, ev->rect_w, ev->rect_h,
+           ev->snapshot[0] ? ev->snapshot : "-");
 }
 
 static int create_ivs(int width, int height, int sensitivity)
@@ -168,32 +268,6 @@ static void unbind_vi_ivs(void)
   RK_MPI_SYS_UnBind(&src, &dst);
 }
 
-static void fire_motion(const DetectEvent *ev)
-{
-  DetectMotionCb cb;
-  void *user;
-  Event e;
-
-  pthread_mutex_lock(&g_det.lock);
-  g_det.last = *ev;
-  g_det.motion_count++;
-  cb = g_det.cb;
-  user = g_det.cb_user;
-  pthread_mutex_unlock(&g_det.lock);
-
-  append_alarm(ev);
-  e.type = EVT_MOTION_DETECT;
-  e.data = (void *)ev;
-  e.data_len = sizeof(*ev);
-  event_bus_publish(&e);
-
-  if (cb) {
-    cb(ev, user);
-  }
-  log_info("detect", "MOTION pct_x10=%d square=%d rect=%d,%d %dx%d", ev->square_pct_x10,
-           ev->square, ev->rect_x, ev->rect_y, ev->rect_w, ev->rect_h);
-}
-
 static void *detect_thread(void *arg)
 {
   (void)arg;
@@ -228,6 +302,11 @@ static void *detect_thread(void *arg)
                  md->u32Square, md->u32RectNum);
         last_stat = now;
       }
+      if (!schedule_allows_now(&g_det.cfg)) {
+        g_det.hit_streak = 0;
+        RK_MPI_IVS_ReleaseResults(IVS_CHN, &results);
+        continue;
+      }
       if (hit) {
         g_det.hit_streak++;
       } else {
@@ -245,8 +324,10 @@ static void *detect_thread(void *arg)
           ev.rect_w = (int)md->stRect[0].u32Width;
           ev.rect_h = (int)md->stRect[0].u32Height;
         }
-        fire_motion(&ev);
-        g_det.hit_streak = 0; /* debounce until next streak */
+        if (region_allows(&g_det.cfg, &ev)) {
+          fire_motion(&ev);
+        }
+        g_det.hit_streak = 0;
       }
     }
     RK_MPI_IVS_ReleaseResults(IVS_CHN, &results);
@@ -277,6 +358,31 @@ int detect_init(const DetectConfig *cfg)
   if (g_det.cfg.hit_frames <= 0) {
     g_det.cfg.hit_frames = 2;
   }
+  if (g_det.cfg.region_x < 0) {
+    g_det.cfg.region_x = 0;
+  }
+  if (g_det.cfg.region_y < 0) {
+    g_det.cfg.region_y = 0;
+  }
+  if (g_det.cfg.region_w < 0) {
+    g_det.cfg.region_w = 0;
+  }
+  if (g_det.cfg.region_h < 0) {
+    g_det.cfg.region_h = 0;
+  }
+  if (g_det.cfg.schedule_start_min < 0) {
+    g_det.cfg.schedule_start_min = 0;
+  }
+  if (g_det.cfg.schedule_start_min > 1439) {
+    g_det.cfg.schedule_start_min = 1439;
+  }
+  if (g_det.cfg.schedule_end_min < 0) {
+    g_det.cfg.schedule_end_min = 0;
+  }
+  if (g_det.cfg.schedule_end_min > 1440) {
+    g_det.cfg.schedule_end_min = 1440;
+  }
+  g_det.cfg.schedule_days &= 0x7fu;
   g_det.width = media_stream_detect_width();
   g_det.height = media_stream_detect_height();
   g_det.motion_count = 0;
@@ -365,5 +471,54 @@ int detect_last_event(DetectEvent *out)
   pthread_mutex_lock(&g_det.lock);
   *out = g_det.last;
   pthread_mutex_unlock(&g_det.lock);
+  return 0;
+}
+
+void detect_config_load(DetectConfig *out)
+{
+  if (!out) {
+    return;
+  }
+  memset(out, 0, sizeof(*out));
+  config_get_bool("detect.enabled", &out->enabled, 1);
+  config_get_int("detect.sensitivity", &out->sensitivity, 2);
+  config_get_int("detect.square_pct", &out->square_pct, 8);
+  config_get_int("detect.hit_frames", &out->hit_frames, 2);
+  config_get_bool("detect.region.enabled", &out->region_enabled, 0);
+  config_get_int("detect.region.x", &out->region_x, 0);
+  config_get_int("detect.region.y", &out->region_y, 0);
+  config_get_int("detect.region.w", &out->region_w, 0);
+  config_get_int("detect.region.h", &out->region_h, 0);
+  config_get_bool("detect.schedule.enabled", &out->schedule_enabled, 0);
+  config_get_int("detect.schedule.start_min", &out->schedule_start_min, 0);
+  config_get_int("detect.schedule.end_min", &out->schedule_end_min, 1440);
+  {
+    int days = 0x7f;
+    config_get_int("detect.schedule.days", &days, 0x7f);
+    out->schedule_days = (unsigned)days & 0x7fu;
+  }
+}
+
+int detect_config_save(const DetectConfig *cfg)
+{
+  if (!cfg) {
+    return -1;
+  }
+  if (config_set_bool("detect.enabled", cfg->enabled) != 0 ||
+      config_set_int("detect.sensitivity", cfg->sensitivity) != 0 ||
+      config_set_int("detect.square_pct", cfg->square_pct) != 0 ||
+      config_set_int("detect.hit_frames", cfg->hit_frames) != 0 ||
+      config_set_bool("detect.region.enabled", cfg->region_enabled) != 0 ||
+      config_set_int("detect.region.x", cfg->region_x) != 0 ||
+      config_set_int("detect.region.y", cfg->region_y) != 0 ||
+      config_set_int("detect.region.w", cfg->region_w) != 0 ||
+      config_set_int("detect.region.h", cfg->region_h) != 0 ||
+      config_set_bool("detect.schedule.enabled", cfg->schedule_enabled) != 0 ||
+      config_set_int("detect.schedule.start_min", cfg->schedule_start_min) != 0 ||
+      config_set_int("detect.schedule.end_min", cfg->schedule_end_min) != 0 ||
+      config_set_int("detect.schedule.days", (int)cfg->schedule_days) != 0 ||
+      config_save() != 0) {
+    return -1;
+  }
   return 0;
 }

@@ -1,5 +1,6 @@
 #include "media/media_service.h"
 
+#include "common/jpeg_writer.h"
 #include "common/log.h"
 #include "system/config_service.h"
 
@@ -289,7 +290,7 @@ static void stream_copy_cfg(const MediaEncodeConfig *cfg)
 static int stream_create_pipeline(const MediaEncodeConfig *cfg)
 {
   if (media_vi_chn_init(0, cfg->main_w, cfg->main_h, 0) != 0 ||
-      media_vi_chn_init(1, cfg->sub_w, cfg->sub_h, 0) != 0) {
+      media_vi_chn_init(1, cfg->sub_w, cfg->sub_h, 2) != 0) {
     return -1;
   }
   g_stream.vi2_up = 0;
@@ -789,7 +790,7 @@ int media_stream_apply(const MediaEncodeConfig *cfg)
 
   if (need_vi) {
     if (media_vi_chn_init(0, g_stream.cfg.main_w, g_stream.cfg.main_h, 0) != 0 ||
-        media_vi_chn_init(1, g_stream.cfg.sub_w, g_stream.cfg.sub_h, 0) != 0) {
+        media_vi_chn_init(1, g_stream.cfg.sub_w, g_stream.cfg.sub_h, 2) != 0) {
       return -2;
     }
     g_stream.vi2_up = 0;
@@ -991,5 +992,62 @@ int media_image_set(const MediaImageConfig *in, int apply)
       return -2;
     }
   }
+  return 0;
+}
+
+int media_snapshot_jpeg(const char *path)
+{
+  VIDEO_FRAME_INFO_S frame;
+  FILE *fp;
+  uint8_t *jpg = NULL;
+  size_t jpg_cap;
+  size_t jpg_len;
+  const uint8_t *y;
+  int w;
+  int h;
+  int ret;
+
+  if (!path || !path[0] || !g_stream.up) {
+    return -1;
+  }
+  memset(&frame, 0, sizeof(frame));
+  ret = RK_MPI_VI_GetChnFrame(0, 1, &frame, 500);
+  if (ret != RK_SUCCESS) {
+    log_warn("media", "snapshot GetChnFrame fail %x", ret);
+    return -2;
+  }
+  w = (int)frame.stVFrame.u32Width;
+  h = (int)frame.stVFrame.u32Height;
+  y = (const uint8_t *)RK_MPI_MB_Handle2VirAddr(frame.stVFrame.pMbBlk);
+  if (!y || w <= 0 || h <= 0) {
+    RK_MPI_VI_ReleaseChnFrame(0, 1, &frame);
+    return -3;
+  }
+  jpg_cap = (size_t)(w * h + 65536);
+  jpg = (uint8_t *)malloc(jpg_cap);
+  if (!jpg) {
+    RK_MPI_VI_ReleaseChnFrame(0, 1, &frame);
+    return -4;
+  }
+  jpg_len = jpeg_write_gray(y, w, h, (int)frame.stVFrame.u32VirWidth, jpg, jpg_cap, 75);
+  RK_MPI_VI_ReleaseChnFrame(0, 1, &frame);
+  if (jpg_len == 0) {
+    free(jpg);
+    return -5;
+  }
+  fp = fopen(path, "wb");
+  if (!fp) {
+    free(jpg);
+    return -6;
+  }
+  if (fwrite(jpg, 1, jpg_len, fp) != jpg_len) {
+    fclose(fp);
+    free(jpg);
+    unlink(path);
+    return -7;
+  }
+  fclose(fp);
+  free(jpg);
+  log_info("media", "snapshot %s (%ux%u %zu bytes)", path, (unsigned)w, (unsigned)h, jpg_len);
   return 0;
 }

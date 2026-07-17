@@ -75,6 +75,9 @@ typedef struct {
 int media_image_get(MediaImageConfig *out);
 int media_image_set(const MediaImageConfig *in, int apply);
 
+/* Capture one JPEG (grayscale from VI sub Y plane) while stream is up. */
+int media_snapshot_jpeg(const char *path);
+
 #ifdef __cplusplus
 }
 #endif

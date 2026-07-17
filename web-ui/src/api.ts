@@ -133,11 +133,34 @@ export function getStorageRecords(params?: { date?: string; limit?: number }) {
   )
 }
 
+export function formatStorage() {
+  return request<{ deleted: number; note: string }>('/api/v1/storage/format', {
+    method: 'POST',
+    body: JSON.stringify({ confirm: true }),
+  })
+}
+
 export type AlarmEvent = {
   ts: number
   square: number
   pct_x10: number
   rect: [number, number, number, number]
+  snapshot?: string
+}
+
+export type AlarmRegion = {
+  enabled: boolean
+  x: number
+  y: number
+  w: number
+  h: number
+}
+
+export type AlarmSchedule = {
+  enabled: boolean
+  start_min: number
+  end_min: number
+  days: number
 }
 
 export type AlarmMotion = {
@@ -145,6 +168,8 @@ export type AlarmMotion = {
   sensitivity: number
   square_pct: number
   hit_frames: number
+  region: AlarmRegion
+  schedule: AlarmSchedule
   running: boolean
   motion_count: number
   last_event: AlarmEvent
@@ -155,7 +180,9 @@ export function getAlarmMotion() {
 }
 
 export function setAlarmMotion(
-  body: Partial<Pick<AlarmMotion, 'enabled' | 'sensitivity' | 'square_pct' | 'hit_frames'>> & {
+  body: Partial<
+    Pick<AlarmMotion, 'enabled' | 'sensitivity' | 'square_pct' | 'hit_frames' | 'region' | 'schedule'>
+  > & {
     apply?: boolean
   },
 ) {
@@ -169,6 +196,10 @@ export function getAlarmEvents(limit: number = 50) {
   return request<{ count: number; events: AlarmEvent[] }>(
     `/api/v1/alarm/events?limit=${encodeURIComponent(String(limit))}`,
   )
+}
+
+export function alarmSnapshotUrl(file: string) {
+  return `/api/v1/alarm/snapshot?file=${encodeURIComponent(file)}`
 }
 
 export type SystemInfo = {

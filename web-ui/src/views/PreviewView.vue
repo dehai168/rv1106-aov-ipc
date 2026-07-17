@@ -207,35 +207,44 @@ onUnmounted(() => {
 </script>
 
 <template>
-  <div class="preview">
-    <header>
-      <h2>实时预览</h2>
-      <strong class="status">{{ status }}</strong>
-    </header>
-    <p v-if="error" class="error">{{ error }}</p>
-    <p class="muted tip">{{ debug || '等待调试信息…' }}</p>
-    <div class="stage">
+  <section class="page preview-page">
+    <div class="head">
+      <div>
+        <h2 class="page-title">实时预览</h2>
+        <p class="page-desc">子码流 H.264 → fMP4 / WebSocket / MSE，断线自动重连。</p>
+      </div>
+      <el-tag :type="error ? 'danger' : status.includes('播放') || status.includes('推流') ? 'success' : 'info'">
+        {{ status }}
+      </el-tag>
+    </div>
+    <el-alert v-if="error" :title="error" type="error" show-icon :closable="false" />
+    <div class="preview-stage">
       <video ref="videoEl" muted autoplay playsinline controls />
     </div>
-    <p class="muted tip">子码流 H.264 → fMP4 / WebSocket / MSE。断线自动重连。</p>
-  </div>
+    <el-text v-if="debug" type="info" size="small">{{ debug }}</el-text>
+  </section>
 </template>
 
 <style scoped>
-.preview { display: grid; gap: 0.75rem; height: 100%; }
-header { display: flex; align-items: baseline; gap: 1rem; }
-h2 { margin: 0; font-size: 1.25rem; }
-.status { font-size: 0.95rem; color: var(--accent, #3d8bfd); }
-.stage {
-  background: #111;
-  border: 1px solid var(--border);
-  border-radius: 8px;
-  min-height: 320px;
+.preview-page { max-width: none; }
+.head {
+  display: flex;
+  justify-content: space-between;
+  align-items: flex-start;
+  gap: 1rem;
+  flex-wrap: wrap;
+}
+.preview-stage {
+  min-height: 360px;
   display: flex;
   align-items: center;
   justify-content: center;
-  overflow: hidden;
 }
-video { width: 100%; max-height: calc(100vh - 180px); background: #222; min-height: 240px; }
-.tip { font-size: 0.85rem; }
+video {
+  width: 100%;
+  max-height: calc(100vh - 180px);
+  background: #0b0f14;
+  min-height: 280px;
+  display: block;
+}
 </style>

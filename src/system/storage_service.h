@@ -33,8 +33,12 @@ int storage_recycle_oldest(int target_free_percent);
 /* Delete up to `count` oldest mp4 files (for tests / forced cleanup). */
 int storage_delete_oldest(int count);
 
+/* Soft format: delete files under records/snapshots/alarms, recreate dirs. Not mkfs. */
+int storage_format_clear(void);
+
 const char *storage_mount_path(void);
 const char *storage_records_path(void);
+const char *storage_snapshots_path(void);
 
 #ifdef __cplusplus
 }

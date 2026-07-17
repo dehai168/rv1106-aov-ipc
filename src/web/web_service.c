@@ -1102,6 +1102,51 @@ static void handle_storage_download(struct mg_connection *c, struct mg_http_mess
   mg_http_serve_file(c, hm, full, &opts);
 }
 
+static void handle_storage_format(struct mg_connection *c, struct mg_http_message *hm)
+{
+  cJSON *root;
+  cJSON *item;
+  int confirm = 0;
+  int deleted;
+  cJSON *data;
+
+  if (!auth_ok(hm)) {
+    json_reply(c, 1001, "unauthorized", NULL);
+    return;
+  }
+
+  root = cJSON_ParseWithLength(hm->body.buf, hm->body.len);
+  if (!root) {
+    json_reply(c, 1002, "bad json", NULL);
+    return;
+  }
+  item = cJSON_GetObjectItem(root, "confirm");
+  if (cJSON_IsBool(item)) {
+    confirm = cJSON_IsTrue(item) ? 1 : 0;
+  } else if (cJSON_IsNumber(item)) {
+    confirm = item->valueint ? 1 : 0;
+  }
+  cJSON_Delete(root);
+
+  if (!confirm) {
+    json_reply(c, 1002, "confirm required", NULL);
+    return;
+  }
+
+  /* Stop motion automation so open files under records/alarms can be wiped. */
+  web_stop_motion_automation();
+  deleted = storage_format_clear();
+  if (deleted < 0) {
+    json_reply(c, 2403, "format failed", NULL);
+    return;
+  }
+
+  data = cJSON_CreateObject();
+  cJSON_AddNumberToObject(data, "deleted", (double)deleted);
+  cJSON_AddStringToObject(data, "note", "soft clear records/snapshots/alarms (not mkfs)");
+  json_reply(c, 0, "ok", data);
+}
+
 static void on_detect_motion_record_cb(const DetectEvent *ev, void *user)
 {
   (void)ev;
@@ -1147,11 +1192,8 @@ static int web_start_motion_automation_if_needed(void)
     return -2;
   }
 
-  memset(&dcfg, 0, sizeof(dcfg));
+  detect_config_load(&dcfg);
   dcfg.enabled = enabled;
-  config_get_int("detect.sensitivity", &dcfg.sensitivity, 2);
-  config_get_int("detect.square_pct", &dcfg.square_pct, 8);
-  config_get_int("detect.hit_frames", &dcfg.hit_frames, 2);
 
   detect_set_motion_cb(on_detect_motion_record_cb, NULL);
   if (detect_init(&dcfg) != 0 || detect_start() != 0) {
@@ -1188,6 +1230,7 @@ static cJSON *alarm_event_to_json(const DetectEvent *ev)
     cJSON_AddItemToArray(rect, cJSON_CreateNumber(0));
     cJSON_AddItemToArray(rect, cJSON_CreateNumber(0));
     cJSON_AddItemToObject(obj, "rect", rect);
+    cJSON_AddStringToObject(obj, "snapshot", "");
     return obj;
   }
 
@@ -1199,7 +1242,26 @@ static cJSON *alarm_event_to_json(const DetectEvent *ev)
   cJSON_AddItemToArray(rect, cJSON_CreateNumber(ev->rect_w));
   cJSON_AddItemToArray(rect, cJSON_CreateNumber(ev->rect_h));
   cJSON_AddItemToObject(obj, "rect", rect);
+  cJSON_AddStringToObject(obj, "snapshot", ev->snapshot[0] ? ev->snapshot : "");
   return obj;
+}
+
+static void alarm_add_region_schedule(cJSON *data, const DetectConfig *cfg)
+{
+  cJSON *region = cJSON_CreateObject();
+  cJSON *schedule = cJSON_CreateObject();
+  cJSON_AddBoolToObject(region, "enabled", cfg->region_enabled ? 1 : 0);
+  cJSON_AddNumberToObject(region, "x", cfg->region_x);
+  cJSON_AddNumberToObject(region, "y", cfg->region_y);
+  cJSON_AddNumberToObject(region, "w", cfg->region_w);
+  cJSON_AddNumberToObject(region, "h", cfg->region_h);
+  cJSON_AddItemToObject(data, "region", region);
+
+  cJSON_AddBoolToObject(schedule, "enabled", cfg->schedule_enabled ? 1 : 0);
+  cJSON_AddNumberToObject(schedule, "start_min", cfg->schedule_start_min);
+  cJSON_AddNumberToObject(schedule, "end_min", cfg->schedule_end_min);
+  cJSON_AddNumberToObject(schedule, "days", (double)cfg->schedule_days);
+  cJSON_AddItemToObject(data, "schedule", schedule);
 }
 
 static cJSON *alarm_motion_to_json(const DetectConfig *cfg)
@@ -1214,6 +1276,7 @@ static cJSON *alarm_motion_to_json(const DetectConfig *cfg)
     cJSON_AddNumberToObject(data, "sensitivity", cfg->sensitivity);
     cJSON_AddNumberToObject(data, "square_pct", cfg->square_pct);
     cJSON_AddNumberToObject(data, "hit_frames", cfg->hit_frames);
+    alarm_add_region_schedule(data, cfg);
   }
   cJSON_AddBoolToObject(data, "running", running);
   cJSON_AddNumberToObject(data, "motion_count", (double)count);
@@ -1226,6 +1289,19 @@ static cJSON *alarm_motion_to_json(const DetectConfig *cfg)
   return data;
 }
 
+static int json_read_bool(cJSON *item, int *out)
+{
+  if (cJSON_IsBool(item)) {
+    *out = cJSON_IsTrue(item) ? 1 : 0;
+    return 1;
+  }
+  if (cJSON_IsNumber(item)) {
+    *out = item->valueint ? 1 : 0;
+    return 1;
+  }
+  return 0;
+}
+
 static void handle_alarm_motion_get(struct mg_connection *c, struct mg_http_message *hm)
 {
   DetectConfig cfg;
@@ -1234,11 +1310,7 @@ static void handle_alarm_motion_get(struct mg_connection *c, struct mg_http_mess
     return;
   }
 
-  memset(&cfg, 0, sizeof(cfg));
-  config_get_bool("detect.enabled", &cfg.enabled, 1);
-  config_get_int("detect.sensitivity", &cfg.sensitivity, 2);
-  config_get_int("detect.square_pct", &cfg.square_pct, 8);
-  config_get_int("detect.hit_frames", &cfg.hit_frames, 2);
+  detect_config_load(&cfg);
   json_reply(c, 0, "ok", alarm_motion_to_json(&cfg));
 }
 
@@ -1247,6 +1319,8 @@ static void handle_alarm_motion_set(struct mg_connection *c, struct mg_http_mess
   DetectConfig cfg;
   cJSON *root;
   cJSON *item;
+  cJSON *region;
+  cJSON *schedule;
   int apply = 1;
 
   if (!auth_ok(hm)) {
@@ -1254,11 +1328,7 @@ static void handle_alarm_motion_set(struct mg_connection *c, struct mg_http_mess
     return;
   }
 
-  memset(&cfg, 0, sizeof(cfg));
-  config_get_bool("detect.enabled", &cfg.enabled, 1);
-  config_get_int("detect.sensitivity", &cfg.sensitivity, 2);
-  config_get_int("detect.square_pct", &cfg.square_pct, 8);
-  config_get_int("detect.hit_frames", &cfg.hit_frames, 2);
+  detect_config_load(&cfg);
 
   root = cJSON_ParseWithLength(hm->body.buf, hm->body.len);
   if (!root) {
@@ -1267,11 +1337,7 @@ static void handle_alarm_motion_set(struct mg_connection *c, struct mg_http_mess
   }
 
   item = cJSON_GetObjectItem(root, "enabled");
-  if (cJSON_IsBool(item)) {
-    cfg.enabled = cJSON_IsTrue(item) ? 1 : 0;
-  } else if (cJSON_IsNumber(item)) {
-    cfg.enabled = item->valueint ? 1 : 0;
-  }
+  (void)json_read_bool(item, &cfg.enabled);
   item = cJSON_GetObjectItem(root, "sensitivity");
   if (cJSON_IsNumber(item)) {
     cfg.sensitivity = item->valueint;
@@ -1285,11 +1351,47 @@ static void handle_alarm_motion_set(struct mg_connection *c, struct mg_http_mess
     cfg.hit_frames = item->valueint;
   }
 
+  region = cJSON_GetObjectItem(root, "region");
+  if (cJSON_IsObject(region)) {
+    (void)json_read_bool(cJSON_GetObjectItem(region, "enabled"), &cfg.region_enabled);
+    item = cJSON_GetObjectItem(region, "x");
+    if (cJSON_IsNumber(item)) {
+      cfg.region_x = item->valueint;
+    }
+    item = cJSON_GetObjectItem(region, "y");
+    if (cJSON_IsNumber(item)) {
+      cfg.region_y = item->valueint;
+    }
+    item = cJSON_GetObjectItem(region, "w");
+    if (cJSON_IsNumber(item)) {
+      cfg.region_w = item->valueint;
+    }
+    item = cJSON_GetObjectItem(region, "h");
+    if (cJSON_IsNumber(item)) {
+      cfg.region_h = item->valueint;
+    }
+  }
+
+  schedule = cJSON_GetObjectItem(root, "schedule");
+  if (cJSON_IsObject(schedule)) {
+    (void)json_read_bool(cJSON_GetObjectItem(schedule, "enabled"), &cfg.schedule_enabled);
+    item = cJSON_GetObjectItem(schedule, "start_min");
+    if (cJSON_IsNumber(item)) {
+      cfg.schedule_start_min = item->valueint;
+    }
+    item = cJSON_GetObjectItem(schedule, "end_min");
+    if (cJSON_IsNumber(item)) {
+      cfg.schedule_end_min = item->valueint;
+    }
+    item = cJSON_GetObjectItem(schedule, "days");
+    if (cJSON_IsNumber(item)) {
+      cfg.schedule_days = (unsigned)item->valueint & 0x7fu;
+    }
+  }
+
   item = cJSON_GetObjectItem(root, "apply");
-  if (cJSON_IsBool(item)) {
-    apply = cJSON_IsTrue(item) ? 1 : 0;
-  } else if (cJSON_IsNumber(item)) {
-    apply = item->valueint ? 1 : 0;
+  if (cJSON_IsBool(item) || cJSON_IsNumber(item)) {
+    (void)json_read_bool(item, &apply);
   }
   cJSON_Delete(root);
 
@@ -1305,10 +1407,32 @@ static void handle_alarm_motion_set(struct mg_connection *c, struct mg_http_mess
   if (cfg.hit_frames <= 0) {
     cfg.hit_frames = 2;
   }
+  if (cfg.region_x < 0) {
+    cfg.region_x = 0;
+  }
+  if (cfg.region_y < 0) {
+    cfg.region_y = 0;
+  }
+  if (cfg.region_w < 0) {
+    cfg.region_w = 0;
+  }
+  if (cfg.region_h < 0) {
+    cfg.region_h = 0;
+  }
+  if (cfg.schedule_start_min < 0) {
+    cfg.schedule_start_min = 0;
+  }
+  if (cfg.schedule_start_min > 1439) {
+    cfg.schedule_start_min = 1439;
+  }
+  if (cfg.schedule_end_min < 0) {
+    cfg.schedule_end_min = 0;
+  }
+  if (cfg.schedule_end_min > 1440) {
+    cfg.schedule_end_min = 1440;
+  }
 
-  if (config_set_bool("detect.enabled", cfg.enabled) != 0 || config_set_int("detect.sensitivity", cfg.sensitivity) != 0 ||
-      config_set_int("detect.square_pct", cfg.square_pct) != 0 || config_set_int("detect.hit_frames", cfg.hit_frames) != 0 ||
-      config_save() != 0) {
+  if (detect_config_save(&cfg) != 0) {
     json_reply(c, 2401, "save failed", NULL);
     return;
   }
@@ -1325,6 +1449,67 @@ static void handle_alarm_motion_set(struct mg_connection *c, struct mg_http_mess
   }
 
   json_reply(c, 0, "ok", alarm_motion_to_json(&cfg));
+}
+
+static int is_snapshot_name(const char *name)
+{
+  /* YYYYMMDD_HHMMSS.jpg */
+  size_t n;
+  size_t i;
+  if (!name) {
+    return 0;
+  }
+  n = strlen(name);
+  if (n != 19) {
+    return 0;
+  }
+  if (strcmp(name + 15, ".jpg") != 0) {
+    return 0;
+  }
+  if (name[8] != '_') {
+    return 0;
+  }
+  for (i = 0; i < 8; i++) {
+    if (!isdigit((unsigned char)name[i])) {
+      return 0;
+    }
+  }
+  for (i = 9; i < 15; i++) {
+    if (!isdigit((unsigned char)name[i])) {
+      return 0;
+    }
+  }
+  return 1;
+}
+
+static void handle_alarm_snapshot(struct mg_connection *c, struct mg_http_message *hm)
+{
+  char file[64];
+  char full[320];
+  struct stat st;
+  struct mg_http_serve_opts opts;
+
+  if (!auth_ok(hm)) {
+    json_reply(c, 1001, "unauthorized", NULL);
+    return;
+  }
+
+  memset(file, 0, sizeof(file));
+  if (mg_http_get_var(&hm->query, "file", file, sizeof(file)) <= 0 || !is_snapshot_name(file)) {
+    json_reply(c, 1002, "bad file", NULL);
+    return;
+  }
+
+  snprintf(full, sizeof(full), "%s/%s", storage_snapshots_path(), file);
+  if (stat(full, &st) != 0 || !S_ISREG(st.st_mode)) {
+    json_reply(c, 2402, "file not found", NULL);
+    return;
+  }
+
+  memset(&opts, 0, sizeof(opts));
+  opts.root_dir = "/";
+  opts.extra_headers = "Content-Type: image/jpeg\r\nCache-Control: no-store\r\n";
+  mg_http_serve_file(c, hm, full, &opts);
 }
 
 static void handle_alarm_events(struct mg_connection *c, struct mg_http_message *hm)
@@ -2002,6 +2187,11 @@ static void ev_handler(struct mg_connection *c, int ev, void *ev_data)
     handle_storage_download(c, hm);
     return;
   }
+  if (mg_match(hm->uri, mg_str("/api/v1/storage/format"), NULL) &&
+      mg_strcmp(hm->method, mg_str("POST")) == 0) {
+    handle_storage_format(c, hm);
+    return;
+  }
 
   if (mg_match(hm->uri, mg_str("/api/v1/alarm/motion"), NULL) &&
       mg_strcmp(hm->method, mg_str("GET")) == 0) {
@@ -2016,6 +2206,11 @@ static void ev_handler(struct mg_connection *c, int ev, void *ev_data)
   if (mg_match(hm->uri, mg_str("/api/v1/alarm/events"), NULL) &&
       mg_strcmp(hm->method, mg_str("GET")) == 0) {
     handle_alarm_events(c, hm);
+    return;
+  }
+  if (mg_match(hm->uri, mg_str("/api/v1/alarm/snapshot"), NULL) &&
+      mg_strcmp(hm->method, mg_str("GET")) == 0) {
+    handle_alarm_snapshot(c, hm);
     return;
   }
   if (mg_match(hm->uri, mg_str("/api/v1/system/info"), NULL) &&

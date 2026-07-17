@@ -190,7 +190,29 @@
 - 手测确认：断电上电后 Web **自动启动** → T5.2 完成
 - 下一步：提交预览/告警/watchdog 修复 commit；启动 T5.3 正式 24h soak；并行起草 T5.4 README
 
+## 2026-07-17 session 22
+- 补齐：存储软 format、告警灰度抓图、布防区域/时间表
+  - `POST /api/v1/storage/format`（confirm）清空 records/snapshots/alarms
+  - 运动触发 → `media_snapshot_jpeg` → `/mnt/sdcard/snapshots/YYYYMMDD_HHMMSS.jpg`，写入 alarms.log `snapshot`
+  - `detect.region.*` / `detect.schedule.*` + AlarmView 表单；软件过滤（非 IVS ROI）
+  - UI：StorageView 清空按钮；AlarmView 区域/时间/缩略图
+- 烤机（T5.3）延至下午/晚间挂机；UI 细节下午手测反馈后再调
 
+## 2026-07-17 session 23
+- 用户要求：Element Plus 优化 UI；功能对齐 VIGI 模拟器（除 PTZ）；先出差异表与新 todolist
+- 产出：
+  - `docs/design/ui-vigi-gap.md` — VIGI vs 本板功能点对照与做/不做边界
+  - `docs/06-todolist-ui.md` — M7 任务清单（T7.0–T7.8）
+- 下一步：用户确认边界后从 T7.0 工程基线开工
+
+## 2026-07-17 session 24
+- 开工 M7：T7.0 + T7.1 落地
+  - Element Plus 按需导入 + 中文 locale；浅色产品壳（青灰强调）
+  - `AppLayout`：顶栏 Preview/信息/设置 + 设置侧栏树；旧路由 redirect
+  - 登录/预览/图像码流/网络/存储/告警/系统 页面 Element 化（功能不回归）
+  - 新增信息：设备信息、系统日志下载
+  - 构建：www ≈746KB（gzip JS≈188KB）；已可部署硬刷验证
+- 下一步：T7.2 预览抓图/全屏；T7.5 画框+7×24；T7.6 录像计划；全部基本功能后再开 M6 AOV
 
 
 

@@ -19,6 +19,7 @@ add_executable(ipc_app
   src/common/log.c
   src/common/event_bus.c
   src/common/sha256.c
+  src/common/jpeg_writer.c
   src/system/config_service.c
   src/system/storage_service.c
   src/system/network_service.c

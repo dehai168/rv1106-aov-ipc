@@ -69,17 +69,23 @@
   - `GET /api/v1/storage/status`
   - `GET /api/v1/storage/records`（可选 `date=YYYYMMDD`，可选 `limit<=200`）
   - `GET /api/v1/storage/download?path=<YYYYMMDD>/<file>.mp4`（直接返回 MP4，可被浏览器 Range 读取）
-- 待实现：`POST /api/v1/storage/format`
+  - `POST /api/v1/storage/format`：body `{"confirm":true}`，软清空 `records/`、`snapshots/`、`alarms/`（非 mkfs）；会先停 motion 自动化
+- 错误：`2402` 状态/文件失败；`2403` format 失败
 
 - `/records` 返回：
   - `data.records[]`：`{ path, name, mtime, size }`
+- `/format` 返回：`data.deleted`（删除文件数）、`data.note`
 
 ### alarm（T4.7）
-- 已实现（简化版）：
-  - `GET /api/v1/alarm/motion`：返回 detect 配置 + `running/motion_count/last_event`
+- 已实现：
+  - `GET /api/v1/alarm/motion`：detect 配置（含 `region`/`schedule`）+ `running/motion_count/last_event`
   - `POST /api/v1/alarm/motion`：保存配置（可选 `apply` 立即重启 runtime）
-  - `GET /api/v1/alarm/events?limit<=200`：读取 `/alarms/alarms.log` 最近 N 条（JSONL）
-- 待实现：区域编辑（画框）、布防时间、告警抓图/结构化告警类型
+  - `GET /api/v1/alarm/events?limit<=200`：读取 `/alarms/alarms.log` 最近 N 条（JSONL，含 `snapshot`）
+  - `GET /api/v1/alarm/snapshot?file=YYYYMMDD_HHMMSS.jpg`：下载告警抓图（鉴权，白名单文件名）
+- `region`：`{ enabled, x, y, w, h }`，坐标系为侦测帧像素（约 640×360）；关闭或 w/h≤0 表示全画面
+- `schedule`：`{ enabled, start_min, end_min, days }`；`days` bit0=周一 … bit6=周日；`end_min` 可达 1440；结束&lt;开始表示跨夜
+- 抓图：触发时灰度 JPEG 写入 `/mnt/sdcard/snapshots/`，事件字段 `snapshot` 为文件名
+- 错误：`2401` 保存失败；`2402` apply/文件失败
 
 ### system（T4.8）
 - 已实现：

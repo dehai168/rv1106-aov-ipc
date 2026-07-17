@@ -1,41 +1,74 @@
 <script setup lang="ts">
 import { onMounted, onUnmounted, ref } from 'vue'
-import { getAlarmEvents, getAlarmMotion, setAlarmMotion, type AlarmEvent } from '../api'
+import { ElMessage } from 'element-plus'
+import {
+  alarmSnapshotUrl,
+  getAlarmEvents,
+  getAlarmMotion,
+  setAlarmMotion,
+  type AlarmEvent,
+  type AlarmMotion,
+} from '../api'
 
 const loading = ref(true)
 const saving = ref(false)
-const error = ref('')
-const ok = ref('')
 let refreshTimer: number | undefined
 
-const motion = ref<{
-  enabled: boolean
-  sensitivity: number
-  square_pct: number
-  hit_frames: number
-  running: boolean
-  motion_count: number
-  last_event: AlarmEvent
-} | null>(null)
+const DAY_LABELS = ['一', '二', '三', '四', '五', '六', '日'] as const
 
+const motion = ref<AlarmMotion | null>(null)
 const events = ref<AlarmEvent[]>([])
 const eventsLimit = ref(50)
+const startHm = ref('00:00')
+const endHm = ref('24:00')
+
+function ensureDefaults(m: AlarmMotion): AlarmMotion {
+  if (!m.region) m.region = { enabled: false, x: 0, y: 0, w: 0, h: 0 }
+  if (!m.schedule) m.schedule = { enabled: false, start_min: 0, end_min: 1440, days: 0x7f }
+  return m
+}
+
+function minToHm(min: number): string {
+  const m = Math.max(0, Math.min(1440, Math.floor(min)))
+  if (m >= 1440) return '24:00'
+  const h = Math.floor(m / 60)
+  const mm = m % 60
+  return `${String(h).padStart(2, '0')}:${String(mm).padStart(2, '0')}`
+}
+
+function hmToMin(hm: string): number {
+  const parts = hm.split(':')
+  if (parts.length < 2) return 0
+  const h = Number(parts[0])
+  const m = Number(parts[1])
+  if (!Number.isFinite(h) || !Number.isFinite(m)) return 0
+  if (h === 24 && m === 0) return 1440
+  return Math.max(0, Math.min(1439, h * 60 + m))
+}
+
+function dayOn(bit: number): boolean {
+  return !!motion.value && (motion.value.schedule.days & (1 << bit)) !== 0
+}
+
+function toggleDay(bit: number, on: boolean | string | number) {
+  if (!motion.value) return
+  const enabled = on === true || on === 'true' || on === 1
+  if (enabled) motion.value.schedule.days |= 1 << bit
+  else motion.value.schedule.days &= ~(1 << bit)
+}
 
 async function refresh() {
   loading.value = true
-  error.value = ''
-  ok.value = ''
   try {
-    const [m, evs] = await Promise.all([
-      getAlarmMotion(),
-      getAlarmEvents(eventsLimit.value),
-    ])
+    const [m, evs] = await Promise.all([getAlarmMotion(), getAlarmEvents(eventsLimit.value)])
     if (m.code !== 0) throw new Error(m.msg || '读取告警配置失败')
     if (evs.code !== 0) throw new Error(evs.msg || '读取告警事件失败')
-    motion.value = m.data
+    motion.value = ensureDefaults(m.data)
+    startHm.value = minToHm(motion.value.schedule.start_min)
+    endHm.value = minToHm(motion.value.schedule.end_min)
     events.value = evs.data.events
   } catch (e) {
-    error.value = String(e)
+    ElMessage.error(String(e))
   } finally {
     loading.value = false
   }
@@ -44,24 +77,26 @@ async function refresh() {
 async function onSave() {
   if (!motion.value) return
   saving.value = true
-  error.value = ''
-  ok.value = ''
   try {
+    motion.value.schedule.start_min = hmToMin(startHm.value)
+    motion.value.schedule.end_min = hmToMin(endHm.value)
     const r = await setAlarmMotion({
       enabled: motion.value.enabled,
       sensitivity: motion.value.sensitivity,
       square_pct: motion.value.square_pct,
       hit_frames: motion.value.hit_frames,
+      region: motion.value.region,
+      schedule: motion.value.schedule,
       apply: true,
     })
     if (r.code !== 0) {
-      error.value = r.msg || '保存失败'
+      ElMessage.error(r.msg || '保存失败')
       return
     }
-    ok.value = '已保存（如需立即生效，请保持实时预览页已打开）'
+    ElMessage.success('已保存（请保持实时预览打开以便立即生效）')
     await refresh()
   } catch (e) {
-    error.value = String(e)
+    ElMessage.error(String(e))
   } finally {
     saving.value = false
   }
@@ -70,20 +105,20 @@ async function onSave() {
 onMounted(() => {
   refresh()
   refreshTimer = window.setInterval(() => {
-    getAlarmEvents(eventsLimit.value).then((evs) => {
-      if (evs.code === 0) events.value = evs.data.events
-    }).catch(() => {
-      /* ignore poll errors */
-    })
-    getAlarmMotion().then((m) => {
-      if (m.code === 0 && motion.value) {
-        motion.value.running = m.data.running
-        motion.value.motion_count = m.data.motion_count
-        motion.value.last_event = m.data.last_event
-      }
-    }).catch(() => {
-      /* ignore */
-    })
+    getAlarmEvents(eventsLimit.value)
+      .then((evs) => {
+        if (evs.code === 0) events.value = evs.data.events
+      })
+      .catch(() => {})
+    getAlarmMotion()
+      .then((m) => {
+        if (m.code === 0 && motion.value) {
+          motion.value.running = m.data.running
+          motion.value.motion_count = m.data.motion_count
+          motion.value.last_event = m.data.last_event
+        }
+      })
+      .catch(() => {})
   }, 3000)
 })
 
@@ -93,91 +128,123 @@ onUnmounted(() => {
 </script>
 
 <template>
-  <section class="alarm">
-    <h2>告警与智能分析</h2>
-    <p class="muted tip">
-      保持「实时预览」打开约 3 秒后自动启动移动侦测；本页每 3 秒刷新事件。走动后看下方列表。
-    </p>
-    <p v-if="loading" class="muted">加载中…</p>
-    <div v-else class="grid">
-      <div class="panel">
-        <h3>检测配置</h3>
-        <label class="row-check">
-          <input type="checkbox" v-model="motion!.enabled" />
-          启用运动侦测
-        </label>
-        <label>
-          灵敏度 (0-4)
-          <input v-model.number="motion!.sensitivity" type="number" min="0" max="4" />
-        </label>
-        <label>
-          square_pct (阈值)
-          <input v-model.number="motion!.square_pct" type="number" min="1" />
-        </label>
-        <label>
-          连续命中帧 hit_frames
-          <input v-model.number="motion!.hit_frames" type="number" min="1" />
-        </label>
-        <div class="row">
-          <button type="button" :disabled="saving" @click="onSave">
-            {{ saving ? '…' : '保存并应用' }}
-          </button>
-          <button type="button" class="ghost" :disabled="saving" @click="refresh">刷新</button>
-        </div>
-
-        <p class="muted">
-          运行中：<b>{{ motion!.running ? '是' : '否' }}</b> · MotionCount：<b>{{ motion!.motion_count }}</b>
-        </p>
-        <p v-if="motion!.last_event" class="muted">
-          最近事件：ts={{ motion!.last_event.ts }} · square={{ motion!.last_event.square }} · pct_x10={{ motion!.last_event.pct_x10 }}
-        </p>
-      </div>
-
-      <div class="panel">
-        <h3>事件列表</h3>
-        <label>
-          显示最近 N 条
-          <input v-model.number="eventsLimit" type="number" min="1" max="200" />
-        </label>
-        <div class="row">
-          <button type="button" class="ghost" @click="refresh">刷新事件</button>
-        </div>
-        <div class="events">
-          <div v-if="events.length === 0" class="muted">暂无事件</div>
-          <div v-for="e in events" :key="e.ts" class="event">
-            <div class="line">
-              <b>{{ new Date(e.ts * 1000).toLocaleString() }}</b>
-              · square={{ e.square }}
-              · pct_x10={{ e.pct_x10 }}
-            </div>
-            <div class="muted">rect=[{{ e.rect[0] }},{{ e.rect[1] }},{{ e.rect[2] }},{{ e.rect[3] }}]</div>
-          </div>
-        </div>
-      </div>
+  <section class="page">
+    <div>
+      <h2 class="page-title">移动侦测</h2>
+      <p class="page-desc">保持「实时预览」打开约 3 秒后自动启动侦测；本页每 3 秒刷新事件。</p>
     </div>
 
-    <p v-if="error" class="error">{{ error }}</p>
-    <p v-if="ok" class="muted">{{ ok }}</p>
+    <el-row v-loading="loading" :gutter="16">
+      <el-col :xs="24" :lg="12">
+        <el-card v-if="motion" shadow="never" class="panel-card mb">
+          <template #header>检测配置</template>
+          <el-form label-width="120px">
+            <el-form-item label="启用侦测">
+              <el-switch v-model="motion.enabled" />
+            </el-form-item>
+            <el-form-item label="灵敏度 0-4">
+              <el-slider v-model="motion.sensitivity" :min="0" :max="4" show-stops />
+            </el-form-item>
+            <el-form-item label="square_pct">
+              <el-input-number v-model="motion.square_pct" :min="1" />
+            </el-form-item>
+            <el-form-item label="hit_frames">
+              <el-input-number v-model="motion.hit_frames" :min="1" />
+            </el-form-item>
+
+            <el-divider content-position="left">布防区域（约 640×360）</el-divider>
+            <el-form-item label="启用区域">
+              <el-switch v-model="motion.region.enabled" active-text="过滤区域外运动" />
+            </el-form-item>
+            <el-form-item label="矩形">
+              <el-space wrap>
+                <el-input-number v-model="motion.region.x" :min="0" controls-position="right" />
+                <el-input-number v-model="motion.region.y" :min="0" controls-position="right" />
+                <el-input-number v-model="motion.region.w" :min="0" controls-position="right" />
+                <el-input-number v-model="motion.region.h" :min="0" controls-position="right" />
+              </el-space>
+              <div class="hint">顺序：x / y / w / h</div>
+            </el-form-item>
+
+            <el-divider content-position="left">布防时间</el-divider>
+            <el-form-item label="启用时间表">
+              <el-switch v-model="motion.schedule.enabled" active-text="关闭=全天" />
+            </el-form-item>
+            <el-form-item label="起止">
+              <el-space>
+                <el-input v-model="startHm" style="width: 100px" placeholder="00:00" />
+                <span>—</span>
+                <el-input v-model="endHm" style="width: 100px" placeholder="24:00" />
+              </el-space>
+            </el-form-item>
+            <el-form-item label="星期">
+              <el-checkbox
+                v-for="(lab, i) in DAY_LABELS"
+                :key="lab"
+                :model-value="dayOn(i)"
+                @change="(v: string | number | boolean) => toggleDay(i, v)"
+              >
+                周{{ lab }}
+              </el-checkbox>
+            </el-form-item>
+
+            <el-form-item>
+              <el-button type="primary" :loading="saving" @click="onSave">保存并应用</el-button>
+              <el-button @click="refresh">刷新</el-button>
+            </el-form-item>
+          </el-form>
+
+          <el-descriptions :column="1" border size="small">
+            <el-descriptions-item label="运行中">{{ motion.running ? '是' : '否' }}</el-descriptions-item>
+            <el-descriptions-item label="MotionCount">{{ motion.motion_count }}</el-descriptions-item>
+            <el-descriptions-item v-if="motion.last_event" label="最近事件">
+              ts={{ motion.last_event.ts }} · square={{ motion.last_event.square }}
+              <span v-if="motion.last_event.snapshot"> · {{ motion.last_event.snapshot }}</span>
+            </el-descriptions-item>
+          </el-descriptions>
+        </el-card>
+      </el-col>
+
+      <el-col :xs="24" :lg="12">
+        <el-card shadow="never" class="panel-card">
+          <template #header>
+            <div class="hdr">
+              <span>事件列表</span>
+              <el-input-number v-model="eventsLimit" :min="1" :max="200" size="small" />
+            </div>
+          </template>
+          <el-table :data="events" height="560" empty-text="暂无事件" stripe>
+            <el-table-column label="时间" min-width="150">
+              <template #default="{ row }">
+                {{ new Date(row.ts * 1000).toLocaleString() }}
+              </template>
+            </el-table-column>
+            <el-table-column label="square" prop="square" width="80" />
+            <el-table-column label="抓图" min-width="120">
+              <template #default="{ row }">
+                <a v-if="row.snapshot" :href="alarmSnapshotUrl(row.snapshot)" target="_blank" rel="noopener">
+                  <img class="thumb" :src="alarmSnapshotUrl(row.snapshot)" :alt="row.snapshot" />
+                </a>
+                <span v-else class="hint">—</span>
+              </template>
+            </el-table-column>
+          </el-table>
+        </el-card>
+      </el-col>
+    </el-row>
   </section>
 </template>
 
 <style scoped>
-.alarm { max-width: 980px; display: grid; gap: 1rem; }
-.grid { display: grid; grid-template-columns: 1fr 1fr; gap: 1rem; }
-.panel { border: 1px solid var(--border); border-radius: 8px; padding: 0.85rem; display: grid; gap: 0.65rem; }
-h3 { margin: 0; font-size: 1rem; color: var(--text); }
-label { display: grid; gap: 0.35rem; color: var(--muted); font-size: 0.9rem; }
-input { padding: 0.35rem 0.5rem; }
-.row { display: flex; gap: 0.75rem; flex-wrap: wrap; align-items: center; }
-.row-check { display: flex; flex-direction: row; align-items: center; gap: 0.5rem; }
-.ghost { background: transparent; border: 1px solid var(--border); color: inherit; }
-.events { max-height: 460px; overflow: auto; display: grid; gap: 0.5rem; }
-.event { border: 1px solid var(--border); border-radius: 8px; padding: 0.6rem; }
-.line { font-size: 0.9rem; }
-.tip { font-size: 0.85rem; margin: 0; }
-
-@media (max-width: 860px) {
-  .grid { grid-template-columns: 1fr; }
+.mb { margin-bottom: 1rem; }
+.hint { color: var(--ipc-muted); font-size: 0.8rem; margin-top: 0.25rem; }
+.hdr { display: flex; align-items: center; justify-content: space-between; gap: 0.75rem; }
+.thumb {
+  max-width: 96px;
+  max-height: 64px;
+  object-fit: contain;
+  border: 1px solid var(--ipc-border);
+  background: #111;
+  vertical-align: middle;
 }
 </style>
-
