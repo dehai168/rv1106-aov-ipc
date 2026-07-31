@@ -1,5 +1,6 @@
 #include "web/web_service.h"
 
+#include "aov/aov_service.h"
 #include "common/log.h"
 #include "common/sha256.h"
 #include "media/media_service.h"
@@ -63,22 +64,27 @@ typedef struct {
   int used;
   int bootstrapped;
   int wait_key;
+  int stream; /* 0=sub(chn1), 1=main-preview(chn3) */
   int q_r;
   int q_n;
   PreviewItem q[PREVIEW_Q];
 } PreviewClient;
 
 typedef struct {
-  pthread_mutex_t lock;
   Fmp4Mux mux;
   int mux_ready;
+  uint8_t *init;
+  uint32_t init_len;
+  char codec[32];
+} PreviewTrack;
+
+typedef struct {
+  pthread_mutex_t lock;
+  PreviewTrack track[2];
   int listening;
   int media_owned;
   int nclients;
   PreviewClient clients[PREVIEW_MAX_CLIENTS];
-  uint8_t *init;
-  uint32_t init_len;
-  char codec[32];
   char iq_dir[256];
 } PreviewCtx;
 
@@ -94,8 +100,17 @@ static PreviewCtx g_prev = {
 static volatile int g_motion_automation_on = 0;
 static volatile int g_motion_defer_gen = 0;
 
+/* T7.6: continuous/schedule keep media+record without preview clients. */
+static volatile int g_record_policy_hold = 0;
+static volatile int g_schedule_poll_on = 0;
+static char g_record_policy_mode[16] = "motion";
+static time_t g_schedule_last_slot = -1;
+
 static int web_start_motion_automation_if_needed(void);
 static void web_stop_motion_automation(void);
+static int web_ensure_media_for_policy(void);
+static void web_schedule_tick(void);
+static void preview_load_encode(MediaEncodeConfig *ecfg);
 
 static void *motion_defer_worker(void *arg)
 {
@@ -119,7 +134,13 @@ static void *motion_defer_worker(void *arg)
 static void schedule_motion_automation(void)
 {
   pthread_t th;
-  int gen = ++g_motion_defer_gen;
+  int gen;
+  /* Motion policy: defer IVS until preview settles.
+   * Continuous/schedule: detect is started from web_apply_record_policy. */
+  if (strcmp(g_record_policy_mode, "motion") != 0) {
+    return;
+  }
+  gen = ++g_motion_defer_gen;
   if (pthread_create(&th, NULL, motion_defer_worker, (void *)(intptr_t)gen) == 0) {
     pthread_detach(th);
   }
@@ -812,6 +833,90 @@ static void handle_video_encode_set(struct mg_connection *c, struct mg_http_mess
   json_reply(c, 0, "ok", video_encode_to_json(&ecfg));
 }
 
+static cJSON *video_osd_to_json(const MediaOsdConfig *cfg)
+{
+  cJSON *data = cJSON_CreateObject();
+  cJSON_AddBoolToObject(data, "enabled", cfg->enabled ? 1 : 0);
+  cJSON_AddBoolToObject(data, "show_time", cfg->show_time ? 1 : 0);
+  cJSON_AddBoolToObject(data, "show_name", cfg->show_name ? 1 : 0);
+  cJSON_AddNumberToObject(data, "pos_x", cfg->pos_x);
+  cJSON_AddNumberToObject(data, "pos_y", cfg->pos_y);
+  cJSON_AddStringToObject(data, "name", cfg->name);
+  return data;
+}
+
+static void handle_video_osd_get(struct mg_connection *c, struct mg_http_message *hm)
+{
+  MediaOsdConfig cfg;
+  if (!auth_ok(hm)) {
+    json_reply(c, 1001, "unauthorized", NULL);
+    return;
+  }
+  media_osd_get(&cfg);
+  json_reply(c, 0, "ok", video_osd_to_json(&cfg));
+}
+
+static void handle_video_osd_set(struct mg_connection *c, struct mg_http_message *hm)
+{
+  MediaOsdConfig cfg;
+  cJSON *root;
+  cJSON *item;
+  const char *name;
+  int apply = 1;
+  int rc;
+
+  if (!auth_ok(hm)) {
+    json_reply(c, 1001, "unauthorized", NULL);
+    return;
+  }
+  media_osd_get(&cfg);
+  root = cJSON_ParseWithLength(hm->body.buf, hm->body.len);
+  if (!root) {
+    json_reply(c, 1002, "bad json", NULL);
+    return;
+  }
+  item = cJSON_GetObjectItem(root, "enabled");
+  if (cJSON_IsBool(item) || cJSON_IsNumber(item)) {
+    cfg.enabled = cJSON_IsTrue(item) || (cJSON_IsNumber(item) && item->valueint);
+  }
+  item = cJSON_GetObjectItem(root, "show_time");
+  if (cJSON_IsBool(item) || cJSON_IsNumber(item)) {
+    cfg.show_time = cJSON_IsTrue(item) || (cJSON_IsNumber(item) && item->valueint);
+  }
+  item = cJSON_GetObjectItem(root, "show_name");
+  if (cJSON_IsBool(item) || cJSON_IsNumber(item)) {
+    cfg.show_name = cJSON_IsTrue(item) || (cJSON_IsNumber(item) && item->valueint);
+  }
+  name = cJSON_GetStringValue(cJSON_GetObjectItem(root, "name"));
+  if (name) {
+    snprintf(cfg.name, sizeof(cfg.name), "%.63s", name);
+  }
+  item = cJSON_GetObjectItem(root, "pos_x");
+  if (cJSON_IsNumber(item)) {
+    cfg.pos_x = item->valueint;
+  }
+  item = cJSON_GetObjectItem(root, "pos_y");
+  if (cJSON_IsNumber(item)) {
+    cfg.pos_y = item->valueint;
+  }
+  item = cJSON_GetObjectItem(root, "apply");
+  if (cJSON_IsBool(item) || cJSON_IsNumber(item)) {
+    apply = cJSON_IsTrue(item) || (cJSON_IsNumber(item) && item->valueint);
+  }
+  cJSON_Delete(root);
+  rc = media_osd_set(&cfg, apply);
+  if (rc == -2) {
+    json_reply(c, 2102, "osd apply failed", NULL);
+    return;
+  }
+  if (rc != 0) {
+    json_reply(c, 2101, "osd save failed", NULL);
+    return;
+  }
+  media_osd_get(&cfg);
+  json_reply(c, 0, "ok", video_osd_to_json(&cfg));
+}
+
 /* ---- storage (T4.6) ---- */
 
 typedef struct {
@@ -1133,8 +1238,11 @@ static void handle_storage_format(struct mg_connection *c, struct mg_http_messag
     return;
   }
 
-  /* Stop motion automation so open files under records/alarms can be wiped. */
+  /* Stop recording so open files under records/alarms can be wiped. */
+  cancel_motion_automation_schedule();
   web_stop_motion_automation();
+  g_schedule_poll_on = 0;
+  record_deinit();
   deleted = storage_format_clear();
   if (deleted < 0) {
     json_reply(c, 2403, "format failed", NULL);
@@ -1149,18 +1257,27 @@ static void handle_storage_format(struct mg_connection *c, struct mg_http_messag
 
 static void on_detect_motion_record_cb(const DetectEvent *ev, void *user)
 {
+  int link = 1;
   (void)ev;
   (void)user;
-  record_on_motion();
+  /* Only motion-record policy consumes motion to start/extend segments.
+   * Continuous must not be switched into motion mode by this callback. */
+  if (strcmp(g_record_policy_mode, "motion") != 0) {
+    return;
+  }
+  config_get_bool("detect.link.record", &link, 1);
+  if (link) {
+    record_on_motion();
+  }
 }
 
-static int web_start_motion_automation_if_needed(void)
+/* Start IVS whenever media+detect VI are up (all record policies). */
+static int web_start_detect_runtime_if_needed(void)
 {
   int enabled = 1;
   DetectConfig dcfg;
-  RecordConfig rcfg;
 
-  if (g_motion_automation_on) {
+  if (detect_is_running()) {
     return 0;
   }
 
@@ -1170,35 +1287,44 @@ static int web_start_motion_automation_if_needed(void)
   }
 
   if (!media_stream_is_up() || !media_stream_detect_enabled()) {
-    log_warn("web", "motion automation needs preview detect VI");
+    log_warn("web", "detect runtime needs media + VI2");
     return -1;
-  }
-
-  /* Record: motion mode + muxing happens on detect callback. */
-  memset(&rcfg, 0, sizeof(rcfg));
-  config_get_int("record.segment_sec", &rcfg.segment_sec, 30);
-  config_get_int("record.recycle_free_percent", &rcfg.recycle_free_percent, 10);
-  config_get_int("record.pre_record_sec", &rcfg.pre_record_sec, 4);
-  config_get_int("record.quiet_sec", &rcfg.quiet_sec, 30);
-
-  config_get_int("video.encode.main_w", &rcfg.main_w, 1920);
-  config_get_int("video.encode.main_h", &rcfg.main_h, 1080);
-  config_get_int("video.encode.main_fps", &rcfg.main_fps, 15);
-  config_get_int("video.encode.main_bitrate_kbps", &rcfg.main_bitrate_kbps, 2048);
-
-  detect_stop();
-  if (record_init(&rcfg) != 0 || record_arm_motion() != 0) {
-    log_error("web", "motion automation record init/arm failed");
-    return -2;
   }
 
   detect_config_load(&dcfg);
   dcfg.enabled = enabled;
-
   detect_set_motion_cb(on_detect_motion_record_cb, NULL);
   if (detect_init(&dcfg) != 0 || detect_start() != 0) {
-    log_error("web", "motion automation detect init/start failed");
-    return -3;
+    log_error("web", "detect init/start failed");
+    return -2;
+  }
+  log_info("web", "detect runtime on (%dx%d)", media_stream_detect_width(),
+           media_stream_detect_height());
+  return 0;
+}
+
+static int web_start_motion_automation_if_needed(void)
+{
+  RecordConfig rcfg;
+
+  if (strcmp(g_record_policy_mode, "motion") != 0) {
+    /* Continuous/schedule: still run detect for alarms/events. */
+    return web_start_detect_runtime_if_needed();
+  }
+  if (g_motion_automation_on) {
+    return 0;
+  }
+
+  if (web_start_detect_runtime_if_needed() != 0) {
+    return -1;
+  }
+
+  record_config_load(&rcfg);
+  record_deinit();
+  if (record_init(&rcfg) != 0 || record_arm_motion() != 0) {
+    log_error("web", "motion automation record init/arm failed");
+    detect_stop();
+    return -2;
   }
 
   g_motion_automation_on = 1;
@@ -1207,12 +1333,272 @@ static int web_start_motion_automation_if_needed(void)
 
 static void web_stop_motion_automation(void)
 {
-  if (!g_motion_automation_on) {
-    return;
+  if (g_motion_automation_on) {
+    record_stop();
+    g_motion_automation_on = 0;
   }
   detect_stop();
-  record_stop();
-  g_motion_automation_on = 0;
+}
+
+static int web_ensure_media_for_policy(void)
+{
+  MediaEncodeConfig ecfg;
+  if (media_stream_is_up()) {
+    return 0;
+  }
+  preview_load_encode(&ecfg);
+  log_info("web", "policy starting media sub=%dx%d", ecfg.sub_w, ecfg.sub_h);
+  if (media_stream_start(&ecfg) != 0) {
+    log_error("web", "policy media_stream_start failed");
+    return -1;
+  }
+  return 0;
+}
+
+static int web_start_continuous_record(void)
+{
+  RecordConfig rcfg;
+  record_config_load(&rcfg);
+  if (web_ensure_media_for_policy() != 0) {
+    return -1;
+  }
+  record_deinit();
+  if (record_init(&rcfg) != 0 || record_start() != 0) {
+    log_error("web", "continuous record_init/start failed");
+    return -2;
+  }
+  return 0;
+}
+
+static void web_schedule_tick(void)
+{
+  RecordConfig cfg;
+  time_t now;
+  struct tm tm_now;
+  time_t slot;
+  int allow;
+  int running;
+
+  if (!g_schedule_poll_on) {
+    return;
+  }
+  record_config_load(&cfg);
+  now = time(NULL);
+  localtime_r(&now, &tm_now);
+  slot = (time_t)(tm_now.tm_yday * 24 + tm_now.tm_hour);
+  allow = record_schedule_allows_now(&cfg);
+  running = record_is_running() && record_mode() == RECORD_MODE_CONTINUOUS;
+
+  if (slot == g_schedule_last_slot && ((allow && running) || (!allow && !running))) {
+    return;
+  }
+  g_schedule_last_slot = slot;
+
+  if (allow) {
+    if (!running) {
+      if (web_start_continuous_record() == 0) {
+        log_info("web", "schedule: continuous on");
+      }
+    }
+  } else if (running) {
+    record_stop();
+    log_info("web", "schedule: continuous off (grid)");
+  }
+}
+
+int web_apply_record_policy(void)
+{
+  RecordConfig cfg;
+  record_config_load(&cfg);
+  snprintf(g_record_policy_mode, sizeof(g_record_policy_mode), "%s",
+           cfg.mode[0] ? cfg.mode : "motion");
+
+  cancel_motion_automation_schedule();
+  web_stop_motion_automation();
+  g_schedule_poll_on = 0;
+  g_schedule_last_slot = -1;
+  record_deinit();
+
+  if (strcmp(g_record_policy_mode, "continuous") == 0) {
+    g_record_policy_hold = 1;
+    if (web_start_continuous_record() != 0) {
+      g_record_policy_hold = 0;
+      return -1;
+    }
+    if (web_start_detect_runtime_if_needed() != 0) {
+      log_warn("web", "continuous: detect runtime not started");
+    }
+    log_info("web", "record policy=continuous (hold media)");
+    return 0;
+  }
+
+  if (strcmp(g_record_policy_mode, "schedule") == 0) {
+    g_record_policy_hold = 1;
+    if (web_ensure_media_for_policy() != 0) {
+      g_record_policy_hold = 0;
+      return -1;
+    }
+    if (web_start_detect_runtime_if_needed() != 0) {
+      log_warn("web", "schedule: detect runtime not started");
+    }
+    g_schedule_poll_on = 1;
+    web_schedule_tick();
+    log_info("web", "record policy=schedule (hold media, poll grid)");
+    return 0;
+  }
+
+  /* motion: release hold; preview clients may restart automation */
+  g_record_policy_hold = 0;
+  if (!media_stream_is_up()) {
+    /* idle until preview opens */
+    log_info("web", "record policy=motion (preview-gated)");
+    return 0;
+  }
+  if (g_prev.nclients > 0) {
+    schedule_motion_automation();
+  } else {
+    /* media left from previous hold — stop if no preview */
+    media_stream_stop();
+  }
+  log_info("web", "record policy=motion");
+  return 0;
+}
+
+static cJSON *record_config_to_json(const RecordConfig *cfg)
+{
+  cJSON *data = cJSON_CreateObject();
+  cJSON *schedule;
+  if (!cfg) {
+    return data;
+  }
+  cJSON_AddStringToObject(data, "mode", cfg->mode[0] ? cfg->mode : "motion");
+  cJSON_AddNumberToObject(data, "segment_sec", cfg->segment_sec);
+  cJSON_AddNumberToObject(data, "pre_record_sec", cfg->pre_record_sec);
+  cJSON_AddNumberToObject(data, "quiet_sec", cfg->quiet_sec);
+  cJSON_AddNumberToObject(data, "recycle_free_percent", cfg->recycle_free_percent);
+  schedule = cJSON_CreateObject();
+  cJSON_AddBoolToObject(schedule, "enabled", cfg->schedule_enabled ? 1 : 0);
+  cJSON_AddStringToObject(schedule, "grid", cfg->schedule_grid);
+  cJSON_AddItemToObject(data, "schedule", schedule);
+  cJSON_AddStringToObject(data, "runtime_mode",
+                          record_mode() == RECORD_MODE_CONTINUOUS
+                              ? "continuous"
+                              : (record_mode() == RECORD_MODE_MOTION ? "motion" : "off"));
+  cJSON_AddBoolToObject(data, "running", record_is_running() ? 1 : 0);
+  cJSON_AddBoolToObject(data, "policy_hold", g_record_policy_hold ? 1 : 0);
+  return data;
+}
+
+static void handle_record_get(struct mg_connection *c, struct mg_http_message *hm)
+{
+  RecordConfig cfg;
+  if (!auth_ok(hm)) {
+    json_reply(c, 1001, "unauthorized", NULL);
+    return;
+  }
+  record_config_load(&cfg);
+  json_reply(c, 0, "ok", record_config_to_json(&cfg));
+}
+
+static void handle_record_set(struct mg_connection *c, struct mg_http_message *hm)
+{
+  RecordConfig cfg;
+  cJSON *root;
+  cJSON *item;
+  cJSON *schedule;
+  int apply = 1;
+
+  if (!auth_ok(hm)) {
+    json_reply(c, 1001, "unauthorized", NULL);
+    return;
+  }
+  if (aov_is_active()) {
+    json_reply(c, 2601, "aov mode: record policy locked", NULL);
+    return;
+  }
+
+  record_config_load(&cfg);
+  root = cJSON_ParseWithLength(hm->body.buf, hm->body.len);
+  if (!root) {
+    json_reply(c, 1002, "bad json", NULL);
+    return;
+  }
+
+  item = cJSON_GetObjectItem(root, "mode");
+  if (cJSON_IsString(item) && item->valuestring) {
+    if (strcmp(item->valuestring, "continuous") == 0 ||
+        strcmp(item->valuestring, "schedule") == 0 ||
+        strcmp(item->valuestring, "motion") == 0) {
+      snprintf(cfg.mode, sizeof(cfg.mode), "%s", item->valuestring);
+    }
+  }
+  item = cJSON_GetObjectItem(root, "segment_sec");
+  if (cJSON_IsNumber(item)) {
+    cfg.segment_sec = item->valueint;
+  }
+  item = cJSON_GetObjectItem(root, "pre_record_sec");
+  if (cJSON_IsNumber(item)) {
+    cfg.pre_record_sec = item->valueint;
+  }
+  item = cJSON_GetObjectItem(root, "quiet_sec");
+  if (cJSON_IsNumber(item)) {
+    cfg.quiet_sec = item->valueint;
+  }
+  item = cJSON_GetObjectItem(root, "recycle_free_percent");
+  if (cJSON_IsNumber(item)) {
+    cfg.recycle_free_percent = item->valueint;
+  }
+
+  schedule = cJSON_GetObjectItem(root, "schedule");
+  if (cJSON_IsObject(schedule)) {
+    item = cJSON_GetObjectItem(schedule, "enabled");
+    if (cJSON_IsBool(item)) {
+      cfg.schedule_enabled = cJSON_IsTrue(item) ? 1 : 0;
+    } else if (cJSON_IsNumber(item)) {
+      cfg.schedule_enabled = item->valueint ? 1 : 0;
+    }
+    item = cJSON_GetObjectItem(schedule, "grid");
+    if (cJSON_IsString(item) && item->valuestring &&
+        strlen(item->valuestring) == RECORD_SCHEDULE_GRID_LEN) {
+      memcpy(cfg.schedule_grid, item->valuestring, RECORD_SCHEDULE_GRID_LEN);
+      cfg.schedule_grid[RECORD_SCHEDULE_GRID_LEN] = '\0';
+    }
+  }
+
+  item = cJSON_GetObjectItem(root, "apply");
+  if (cJSON_IsBool(item)) {
+    apply = cJSON_IsTrue(item) ? 1 : 0;
+  } else if (cJSON_IsNumber(item)) {
+    apply = item->valueint ? 1 : 0;
+  }
+  cJSON_Delete(root);
+
+  if (cfg.segment_sec <= 0) {
+    cfg.segment_sec = 30;
+  }
+  if (cfg.pre_record_sec <= 0) {
+    cfg.pre_record_sec = 4;
+  }
+  if (cfg.quiet_sec <= 0) {
+    cfg.quiet_sec = 30;
+  }
+  if (cfg.recycle_free_percent <= 0) {
+    cfg.recycle_free_percent = 10;
+  }
+  if (cfg.recycle_free_percent > 90) {
+    cfg.recycle_free_percent = 90;
+  }
+
+  if (record_config_save(&cfg) != 0) {
+    json_reply(c, 2401, "save failed", NULL);
+    return;
+  }
+  if (apply && web_apply_record_policy() != 0) {
+    json_reply(c, 2402, "apply failed (media/record)", NULL);
+    return;
+  }
+  record_config_load(&cfg);
+  json_reply(c, 0, "ok", record_config_to_json(&cfg));
 }
 
 /* ---- alarm (T4.7) ---- */
@@ -1248,20 +1634,45 @@ static cJSON *alarm_event_to_json(const DetectEvent *ev)
 
 static void alarm_add_region_schedule(cJSON *data, const DetectConfig *cfg)
 {
-  cJSON *region = cJSON_CreateObject();
-  cJSON *schedule = cJSON_CreateObject();
-  cJSON_AddBoolToObject(region, "enabled", cfg->region_enabled ? 1 : 0);
-  cJSON_AddNumberToObject(region, "x", cfg->region_x);
-  cJSON_AddNumberToObject(region, "y", cfg->region_y);
-  cJSON_AddNumberToObject(region, "w", cfg->region_w);
-  cJSON_AddNumberToObject(region, "h", cfg->region_h);
+  cJSON *region;
+  cJSON *regions;
+  cJSON *schedule;
+  cJSON *link;
+  int i;
+
+  regions = cJSON_CreateArray();
+  for (i = 0; i < DETECT_MAX_REGIONS; i++) {
+    cJSON *r = cJSON_CreateObject();
+    cJSON_AddBoolToObject(r, "enabled", cfg->regions[i].enabled ? 1 : 0);
+    cJSON_AddNumberToObject(r, "x", cfg->regions[i].x);
+    cJSON_AddNumberToObject(r, "y", cfg->regions[i].y);
+    cJSON_AddNumberToObject(r, "w", cfg->regions[i].w);
+    cJSON_AddNumberToObject(r, "h", cfg->regions[i].h);
+    cJSON_AddItemToArray(regions, r);
+  }
+  cJSON_AddItemToObject(data, "regions", regions);
+
+  /* Legacy single region = regions[0] */
+  region = cJSON_CreateObject();
+  cJSON_AddBoolToObject(region, "enabled", cfg->regions[0].enabled ? 1 : 0);
+  cJSON_AddNumberToObject(region, "x", cfg->regions[0].x);
+  cJSON_AddNumberToObject(region, "y", cfg->regions[0].y);
+  cJSON_AddNumberToObject(region, "w", cfg->regions[0].w);
+  cJSON_AddNumberToObject(region, "h", cfg->regions[0].h);
   cJSON_AddItemToObject(data, "region", region);
 
+  schedule = cJSON_CreateObject();
   cJSON_AddBoolToObject(schedule, "enabled", cfg->schedule_enabled ? 1 : 0);
   cJSON_AddNumberToObject(schedule, "start_min", cfg->schedule_start_min);
   cJSON_AddNumberToObject(schedule, "end_min", cfg->schedule_end_min);
   cJSON_AddNumberToObject(schedule, "days", (double)cfg->schedule_days);
+  cJSON_AddStringToObject(schedule, "grid", cfg->schedule_grid);
   cJSON_AddItemToObject(data, "schedule", schedule);
+
+  link = cJSON_CreateObject();
+  cJSON_AddBoolToObject(link, "record", cfg->link_record ? 1 : 0);
+  cJSON_AddBoolToObject(link, "snapshot", cfg->link_snapshot ? 1 : 0);
+  cJSON_AddItemToObject(data, "link", link);
 }
 
 static cJSON *alarm_motion_to_json(const DetectConfig *cfg)
@@ -1302,6 +1713,31 @@ static int json_read_bool(cJSON *item, int *out)
   return 0;
 }
 
+static void alarm_read_region_obj(cJSON *obj, DetectRegion *r)
+{
+  cJSON *item;
+  if (!cJSON_IsObject(obj) || !r) {
+    return;
+  }
+  (void)json_read_bool(cJSON_GetObjectItem(obj, "enabled"), &r->enabled);
+  item = cJSON_GetObjectItem(obj, "x");
+  if (cJSON_IsNumber(item)) {
+    r->x = item->valueint;
+  }
+  item = cJSON_GetObjectItem(obj, "y");
+  if (cJSON_IsNumber(item)) {
+    r->y = item->valueint;
+  }
+  item = cJSON_GetObjectItem(obj, "w");
+  if (cJSON_IsNumber(item)) {
+    r->w = item->valueint;
+  }
+  item = cJSON_GetObjectItem(obj, "h");
+  if (cJSON_IsNumber(item)) {
+    r->h = item->valueint;
+  }
+}
+
 static void handle_alarm_motion_get(struct mg_connection *c, struct mg_http_message *hm)
 {
   DetectConfig cfg;
@@ -1320,8 +1756,11 @@ static void handle_alarm_motion_set(struct mg_connection *c, struct mg_http_mess
   cJSON *root;
   cJSON *item;
   cJSON *region;
+  cJSON *regions;
   cJSON *schedule;
+  cJSON *link;
   int apply = 1;
+  int i;
 
   if (!auth_ok(hm)) {
     json_reply(c, 1001, "unauthorized", NULL);
@@ -1351,24 +1790,22 @@ static void handle_alarm_motion_set(struct mg_connection *c, struct mg_http_mess
     cfg.hit_frames = item->valueint;
   }
 
-  region = cJSON_GetObjectItem(root, "region");
-  if (cJSON_IsObject(region)) {
-    (void)json_read_bool(cJSON_GetObjectItem(region, "enabled"), &cfg.region_enabled);
-    item = cJSON_GetObjectItem(region, "x");
-    if (cJSON_IsNumber(item)) {
-      cfg.region_x = item->valueint;
+  regions = cJSON_GetObjectItem(root, "regions");
+  if (cJSON_IsArray(regions)) {
+    int n = cJSON_GetArraySize(regions);
+    if (n > DETECT_MAX_REGIONS) {
+      n = DETECT_MAX_REGIONS;
     }
-    item = cJSON_GetObjectItem(region, "y");
-    if (cJSON_IsNumber(item)) {
-      cfg.region_y = item->valueint;
+    for (i = 0; i < DETECT_MAX_REGIONS; i++) {
+      memset(&cfg.regions[i], 0, sizeof(cfg.regions[i]));
     }
-    item = cJSON_GetObjectItem(region, "w");
-    if (cJSON_IsNumber(item)) {
-      cfg.region_w = item->valueint;
+    for (i = 0; i < n; i++) {
+      alarm_read_region_obj(cJSON_GetArrayItem(regions, i), &cfg.regions[i]);
     }
-    item = cJSON_GetObjectItem(region, "h");
-    if (cJSON_IsNumber(item)) {
-      cfg.region_h = item->valueint;
+  } else {
+    region = cJSON_GetObjectItem(root, "region");
+    if (cJSON_IsObject(region)) {
+      alarm_read_region_obj(region, &cfg.regions[0]);
     }
   }
 
@@ -1387,6 +1824,23 @@ static void handle_alarm_motion_set(struct mg_connection *c, struct mg_http_mess
     if (cJSON_IsNumber(item)) {
       cfg.schedule_days = (unsigned)item->valueint & 0x7fu;
     }
+    item = cJSON_GetObjectItem(schedule, "grid");
+    if (cJSON_IsString(item) && item->valuestring) {
+      size_t glen = strlen(item->valuestring);
+      if (glen == DETECT_SCHEDULE_GRID_LEN) {
+        memcpy(cfg.schedule_grid, item->valuestring, DETECT_SCHEDULE_GRID_LEN);
+        cfg.schedule_grid[DETECT_SCHEDULE_GRID_LEN] = '\0';
+        detect_schedule_sync_days_from_grid(&cfg);
+      } else if (glen == 0) {
+        cfg.schedule_grid[0] = '\0';
+      }
+    }
+  }
+
+  link = cJSON_GetObjectItem(root, "link");
+  if (cJSON_IsObject(link)) {
+    (void)json_read_bool(cJSON_GetObjectItem(link, "record"), &cfg.link_record);
+    (void)json_read_bool(cJSON_GetObjectItem(link, "snapshot"), &cfg.link_snapshot);
   }
 
   item = cJSON_GetObjectItem(root, "apply");
@@ -1407,18 +1861,23 @@ static void handle_alarm_motion_set(struct mg_connection *c, struct mg_http_mess
   if (cfg.hit_frames <= 0) {
     cfg.hit_frames = 2;
   }
-  if (cfg.region_x < 0) {
-    cfg.region_x = 0;
+  for (i = 0; i < DETECT_MAX_REGIONS; i++) {
+    if (cfg.regions[i].x < 0) {
+      cfg.regions[i].x = 0;
+    }
+    if (cfg.regions[i].y < 0) {
+      cfg.regions[i].y = 0;
+    }
+    if (cfg.regions[i].w < 0) {
+      cfg.regions[i].w = 0;
+    }
+    if (cfg.regions[i].h < 0) {
+      cfg.regions[i].h = 0;
+    }
+    cfg.regions[i].enabled = cfg.regions[i].enabled ? 1 : 0;
   }
-  if (cfg.region_y < 0) {
-    cfg.region_y = 0;
-  }
-  if (cfg.region_w < 0) {
-    cfg.region_w = 0;
-  }
-  if (cfg.region_h < 0) {
-    cfg.region_h = 0;
-  }
+  cfg.link_record = cfg.link_record ? 1 : 0;
+  cfg.link_snapshot = cfg.link_snapshot ? 1 : 0;
   if (cfg.schedule_start_min < 0) {
     cfg.schedule_start_min = 0;
   }
@@ -1438,11 +1897,17 @@ static void handle_alarm_motion_set(struct mg_connection *c, struct mg_http_mess
   }
 
   if (apply) {
-    /* Restart runtime automation to apply IVS thresholds immediately. */
-    web_stop_motion_automation();
+    /* Restart detect runtime to apply IVS thresholds immediately. */
+    detect_stop();
+    g_motion_automation_on = 0;
     if (cfg.enabled) {
-      if (web_start_motion_automation_if_needed() != 0) {
-        json_reply(c, 2402, "apply failed (open preview or ensure detect VI)", NULL);
+      if (strcmp(g_record_policy_mode, "motion") == 0) {
+        if (web_start_motion_automation_if_needed() != 0) {
+          json_reply(c, 2402, "apply failed (open preview or ensure detect VI)", NULL);
+          return;
+        }
+      } else if (web_start_detect_runtime_if_needed() != 0) {
+        json_reply(c, 2402, "apply failed (media/detect VI not ready)", NULL);
         return;
       }
     }
@@ -1615,11 +2080,180 @@ static cJSON *system_time_to_json(const SystemTimeConfig *tc)
   return data;
 }
 
+static cJSON *aov_status_to_json(void)
+{
+  AovStatus st;
+  AovConfig cfg;
+  cJSON *data = cJSON_CreateObject();
+  aov_get_status(&st);
+  aov_load_config(&cfg);
+  cJSON_AddBoolToObject(data, "in_aov", st.in_aov ? 1 : 0);
+  cJSON_AddStringToObject(data, "state", aov_state_name(st.state));
+  cJSON_AddStringToObject(data, "last_wake", aov_wake_name(st.last_wake));
+  cJSON_AddNumberToObject(data, "cycles", (double)st.cycles);
+  cJSON_AddNumberToObject(data, "lapse_frames", (double)st.lapse_frames);
+  cJSON_AddNumberToObject(data, "event_records", (double)st.event_records);
+  cJSON_AddNumberToObject(data, "sleep_fail", (double)st.sleep_fail);
+  cJSON_AddNumberToObject(data, "media_reinit", (double)st.media_reinit);
+  cJSON_AddNumberToObject(data, "last_wake_ms", st.last_wake_ms);
+  cJSON_AddBoolToObject(data, "enabled", cfg.enabled ? 1 : 0);
+  cJSON_AddNumberToObject(data, "suspend_ms", cfg.suspend_ms);
+  cJSON_AddNumberToObject(data, "event_fps", cfg.event_fps);
+  cJSON_AddNumberToObject(data, "quiet_sec", cfg.quiet_sec);
+  cJSON_AddNumberToObject(data, "event_record_sec", cfg.event_record_sec);
+  cJSON_AddBoolToObject(data, "allow_mem_suspend", cfg.allow_mem_suspend ? 1 : 0);
+  cJSON_AddBoolToObject(data, "down_eth", cfg.down_eth ? 1 : 0);
+  return data;
+}
+
+static void handle_aov_status(struct mg_connection *c, struct mg_http_message *hm)
+{
+  if (!auth_ok(hm)) {
+    json_reply(c, 1001, "unauthorized", NULL);
+    return;
+  }
+  aov_init();
+  json_reply(c, 0, "ok", aov_status_to_json());
+}
+
+static void handle_aov_config_get(struct mg_connection *c, struct mg_http_message *hm)
+{
+  handle_aov_status(c, hm);
+}
+
+static void handle_aov_config_set(struct mg_connection *c, struct mg_http_message *hm)
+{
+  AovConfig cfg;
+  cJSON *root;
+  cJSON *item;
+
+  if (!auth_ok(hm)) {
+    json_reply(c, 1001, "unauthorized", NULL);
+    return;
+  }
+  aov_init();
+  aov_load_config(&cfg);
+  root = cJSON_ParseWithLength(hm->body.buf, hm->body.len);
+  if (!root) {
+    json_reply(c, 1003, "bad json", NULL);
+    return;
+  }
+  if ((item = cJSON_GetObjectItem(root, "suspend_ms")) && cJSON_IsNumber(item)) {
+    cfg.suspend_ms = item->valueint;
+  }
+  if ((item = cJSON_GetObjectItem(root, "event_fps")) && cJSON_IsNumber(item)) {
+    cfg.event_fps = item->valueint;
+  }
+  if ((item = cJSON_GetObjectItem(root, "quiet_sec")) && cJSON_IsNumber(item)) {
+    cfg.quiet_sec = item->valueint;
+  }
+  if ((item = cJSON_GetObjectItem(root, "event_record_sec")) && cJSON_IsNumber(item)) {
+    cfg.event_record_sec = item->valueint;
+  }
+  if ((item = cJSON_GetObjectItem(root, "down_eth")) && (cJSON_IsBool(item) || cJSON_IsNumber(item))) {
+    cfg.down_eth = cJSON_IsTrue(item) || item->valueint != 0;
+  }
+  if ((item = cJSON_GetObjectItem(root, "allow_mem_suspend")) &&
+      (cJSON_IsBool(item) || cJSON_IsNumber(item))) {
+    cfg.allow_mem_suspend = cJSON_IsTrue(item) || item->valueint != 0;
+  }
+  if ((item = cJSON_GetObjectItem(root, "enabled")) && (cJSON_IsBool(item) || cJSON_IsNumber(item))) {
+    cfg.enabled = cJSON_IsTrue(item) || item->valueint != 0;
+  }
+  cJSON_Delete(root);
+  if (aov_save_config(&cfg) != 0) {
+    json_reply(c, 2602, "aov config save failed", NULL);
+    return;
+  }
+  json_reply(c, 0, "ok", aov_status_to_json());
+}
+
+static void handle_aov_enter(struct mg_connection *c, struct mg_http_message *hm)
+{
+  cJSON *root;
+  cJSON *item;
+  int confirm = 0;
+
+  if (!auth_ok(hm)) {
+    json_reply(c, 1001, "unauthorized", NULL);
+    return;
+  }
+  root = cJSON_ParseWithLength(hm->body.buf, hm->body.len);
+  if (root) {
+    item = cJSON_GetObjectItem(root, "confirm");
+    if (item && (cJSON_IsTrue(item) || (cJSON_IsNumber(item) && item->valueint))) {
+      confirm = 1;
+    }
+    cJSON_Delete(root);
+  }
+  if (!confirm) {
+    json_reply(c, 1003, "confirm required", NULL);
+    return;
+  }
+  aov_init();
+  if (aov_enter() != 0) {
+    json_reply(c, 2603, "aov enter failed", NULL);
+    return;
+  }
+  json_reply(c, 0, "ok", aov_status_to_json());
+}
+
+static void handle_aov_leave(struct mg_connection *c, struct mg_http_message *hm)
+{
+  if (!auth_ok(hm)) {
+    json_reply(c, 1001, "unauthorized", NULL);
+    return;
+  }
+  (void)hm;
+  aov_init();
+  if (aov_leave() != 0) {
+    json_reply(c, 2604, "aov leave failed", NULL);
+    return;
+  }
+  (void)web_apply_record_policy();
+  json_reply(c, 0, "ok", aov_status_to_json());
+}
+
 static void handle_system_info(struct mg_connection *c, struct mg_http_message *hm)
 {
   SystemInfo info;
   if (!auth_ok(hm)) {
     json_reply(c, 1001, "unauthorized", NULL);
+    return;
+  }
+  if (system_get_info(&info) != 0) {
+    json_reply(c, 2502, "system info failed", NULL);
+    return;
+  }
+  json_reply(c, 0, "ok", system_info_to_json(&info));
+}
+
+static void handle_system_info_set(struct mg_connection *c, struct mg_http_message *hm)
+{
+  cJSON *root;
+  const char *name;
+  SystemInfo info;
+  int rc;
+
+  if (!auth_ok(hm)) {
+    json_reply(c, 1001, "unauthorized", NULL);
+    return;
+  }
+  root = cJSON_ParseWithLength(hm->body.buf, hm->body.len);
+  if (!root) {
+    json_reply(c, 1002, "bad json", NULL);
+    return;
+  }
+  name = cJSON_GetStringValue(cJSON_GetObjectItem(root, "device_name"));
+  if (!name || !name[0]) {
+    cJSON_Delete(root);
+    json_reply(c, 1002, "device_name required", NULL);
+    return;
+  }
+  rc = system_set_device_name(name);
+  cJSON_Delete(root);
+  if (rc != 0) {
+    json_reply(c, 1002, "invalid device_name", NULL);
     return;
   }
   if (system_get_info(&info) != 0) {
@@ -1759,6 +2393,8 @@ static void handle_system_log(struct mg_connection *c, struct mg_http_message *h
 {
   char name[64];
   char path[512];
+  char tail_s[16];
+  int tail_n = 0;
   struct mg_http_serve_opts opts;
 
   if (!auth_ok(hm)) {
@@ -1769,6 +2405,39 @@ static void handle_system_log(struct mg_connection *c, struct mg_http_message *h
   if (mg_http_get_var(&hm->query, "file", name, sizeof(name)) <= 0 || !name[0]) {
     snprintf(name, sizeof(name), "ipc_app.log");
   }
+  memset(tail_s, 0, sizeof(tail_s));
+  if (mg_http_get_var(&hm->query, "tail", tail_s, sizeof(tail_s)) > 0) {
+    tail_n = atoi(tail_s);
+  }
+  if (tail_n > 0) {
+    char *buf;
+    cJSON *data;
+    cJSON *arr;
+    char *line;
+    char *save = NULL;
+    int cap = 256 * 1024;
+    buf = (char *)malloc((size_t)cap);
+    if (!buf) {
+      json_reply(c, 2502, "oom", NULL);
+      return;
+    }
+    if (system_log_tail(name, tail_n, buf, cap) != 0) {
+      free(buf);
+      json_reply(c, 2502, "log not found", NULL);
+      return;
+    }
+    data = cJSON_CreateObject();
+    arr = cJSON_CreateArray();
+    cJSON_AddStringToObject(data, "file", name);
+    cJSON_AddNumberToObject(data, "tail", tail_n);
+    for (line = strtok_r(buf, "\n", &save); line; line = strtok_r(NULL, "\n", &save)) {
+      cJSON_AddItemToArray(arr, cJSON_CreateString(line));
+    }
+    cJSON_AddItemToObject(data, "lines", arr);
+    free(buf);
+    json_reply(c, 0, "ok", data);
+    return;
+  }
   if (system_log_path(name, path, (int)sizeof(path)) != 0) {
     json_reply(c, 2502, "log not found", NULL);
     return;
@@ -1777,6 +2446,69 @@ static void handle_system_log(struct mg_connection *c, struct mg_http_message *h
   opts.root_dir = "/";
   opts.extra_headers = "Content-Disposition: attachment\r\n";
   mg_http_serve_file(c, hm, path, &opts);
+}
+
+static cJSON *reboot_schedule_to_json(const SystemRebootSchedule *cfg)
+{
+  cJSON *data = cJSON_CreateObject();
+  cJSON_AddBoolToObject(data, "enabled", cfg->enabled ? 1 : 0);
+  cJSON_AddNumberToObject(data, "hour", cfg->hour);
+  cJSON_AddNumberToObject(data, "minute", cfg->minute);
+  cJSON_AddStringToObject(data, "days", cfg->days);
+  return data;
+}
+
+static void handle_reboot_schedule_get(struct mg_connection *c, struct mg_http_message *hm)
+{
+  SystemRebootSchedule cfg;
+  if (!auth_ok(hm)) {
+    json_reply(c, 1001, "unauthorized", NULL);
+    return;
+  }
+  system_reboot_schedule_get(&cfg);
+  json_reply(c, 0, "ok", reboot_schedule_to_json(&cfg));
+}
+
+static void handle_reboot_schedule_set(struct mg_connection *c, struct mg_http_message *hm)
+{
+  SystemRebootSchedule cfg;
+  cJSON *root;
+  cJSON *item;
+  const char *days;
+
+  if (!auth_ok(hm)) {
+    json_reply(c, 1001, "unauthorized", NULL);
+    return;
+  }
+  system_reboot_schedule_get(&cfg);
+  root = cJSON_ParseWithLength(hm->body.buf, hm->body.len);
+  if (!root) {
+    json_reply(c, 1002, "bad json", NULL);
+    return;
+  }
+  item = cJSON_GetObjectItem(root, "enabled");
+  if (cJSON_IsBool(item) || cJSON_IsNumber(item)) {
+    cfg.enabled = cJSON_IsTrue(item) || (cJSON_IsNumber(item) && item->valueint);
+  }
+  item = cJSON_GetObjectItem(root, "hour");
+  if (cJSON_IsNumber(item)) {
+    cfg.hour = item->valueint;
+  }
+  item = cJSON_GetObjectItem(root, "minute");
+  if (cJSON_IsNumber(item)) {
+    cfg.minute = item->valueint;
+  }
+  days = cJSON_GetStringValue(cJSON_GetObjectItem(root, "days"));
+  if (days) {
+    snprintf(cfg.days, sizeof(cfg.days), "%s", days);
+  }
+  cJSON_Delete(root);
+  if (system_reboot_schedule_set(&cfg) != 0) {
+    json_reply(c, 1002, "invalid reboot_schedule", NULL);
+    return;
+  }
+  system_reboot_schedule_get(&cfg);
+  json_reply(c, 0, "ok", reboot_schedule_to_json(&cfg));
 }
 
 /* ---- preview (T4.3) ---- */
@@ -1793,14 +2525,14 @@ static void preview_client_clear_q(PreviewClient *pc)
   pc->q_n = 0;
 }
 
-static void preview_enqueue_locked(const uint8_t *data, uint32_t len, int key)
+static void preview_enqueue_locked(int stream, const uint8_t *data, uint32_t len, int key)
 {
   int i;
   for (i = 0; i < PREVIEW_MAX_CLIENTS; i++) {
     PreviewClient *pc = &g_prev.clients[i];
     PreviewItem *it;
     int slot;
-    if (!pc->used || !pc->c) {
+    if (!pc->used || !pc->c || pc->stream != stream) {
       continue;
     }
     if (pc->wait_key) {
@@ -1833,37 +2565,79 @@ static void preview_enqueue_locked(const uint8_t *data, uint32_t len, int key)
   }
 }
 
-/* Called from fmp4_mux_push while g_prev.lock is held. */
+/* Called from fmp4_mux_push while g_prev.lock is held. user = track index. */
 static void preview_emit(const uint8_t *data, uint32_t len, int is_init, int is_key, void *user)
 {
-  (void)user;
+  int ti = (int)(intptr_t)user;
+  PreviewTrack *tr;
+  if (ti < 0 || ti > 1) {
+    return;
+  }
+  tr = &g_prev.track[ti];
   if (is_init) {
-    free(g_prev.init);
-    g_prev.init = (uint8_t *)malloc(len);
-    if (g_prev.init) {
-      memcpy(g_prev.init, data, len);
-      g_prev.init_len = len;
-      snprintf(g_prev.codec, sizeof(g_prev.codec), "%s", g_prev.mux.codec);
+    free(tr->init);
+    tr->init = (uint8_t *)malloc(len);
+    if (tr->init) {
+      memcpy(tr->init, data, len);
+      tr->init_len = len;
+      snprintf(tr->codec, sizeof(tr->codec), "%s", tr->mux.codec);
     } else {
-      g_prev.init_len = 0;
+      tr->init_len = 0;
     }
-  } else if (g_prev.init_len > 0) {
-    preview_enqueue_locked(data, len, is_key);
+  } else if (tr->init_len > 0) {
+    preview_enqueue_locked(ti, data, len, is_key);
   }
 }
 
 static void preview_on_packet(int chn, const uint8_t *data, uint32_t len, int key_frame,
                               int64_t pts_us, void *user)
 {
+  int ti;
+  int need = 0;
+  int i;
   (void)user;
-  if (chn != 1 || !data || len == 0) {
+  if (!data || len == 0) {
+    return;
+  }
+  if (chn == 1) {
+    ti = 0;
+  } else if (chn == 3) {
+    ti = 1;
+  } else {
     return;
   }
   pthread_mutex_lock(&g_prev.lock);
-  if (g_prev.mux_ready && g_prev.listening) {
-    fmp4_mux_push(&g_prev.mux, data, len, key_frame, pts_us);
+  for (i = 0; i < PREVIEW_MAX_CLIENTS; i++) {
+    if (g_prev.clients[i].used && g_prev.clients[i].stream == ti) {
+      need = 1;
+      break;
+    }
+  }
+  if (need && g_prev.track[ti].mux_ready && g_prev.listening) {
+    fmp4_mux_push(&g_prev.track[ti].mux, data, len, key_frame, pts_us);
   }
   pthread_mutex_unlock(&g_prev.lock);
+}
+
+static int preview_count_stream_locked(int stream)
+{
+  int i;
+  int n = 0;
+  for (i = 0; i < PREVIEW_MAX_CLIENTS; i++) {
+    if (g_prev.clients[i].used && g_prev.clients[i].stream == stream) {
+      n++;
+    }
+  }
+  return n;
+}
+
+static void preview_sync_main_encode(void)
+{
+  int main_n;
+  pthread_mutex_lock(&g_prev.lock);
+  main_n = preview_count_stream_locked(1);
+  pthread_mutex_unlock(&g_prev.lock);
+  (void)media_stream_preview_main_set_active(main_n > 0);
 }
 
 static void preview_load_encode(MediaEncodeConfig *ecfg)
@@ -1901,6 +2675,7 @@ static int preview_ensure_pipeline(void)
   MediaEncodeConfig ecfg;
   int need_start = 0;
   int need_listen = 0;
+  int ti;
 
   pthread_mutex_lock(&g_prev.lock);
   if (!media_stream_is_up()) {
@@ -1908,20 +2683,22 @@ static int preview_ensure_pipeline(void)
     g_prev.media_owned = 1;
   }
   if (!g_prev.listening) {
-    if (!g_prev.mux_ready) {
-      if (fmp4_mux_init(&g_prev.mux, preview_emit, NULL) != 0) {
-        g_prev.media_owned = 0;
-        pthread_mutex_unlock(&g_prev.lock);
-        return -2;
+    for (ti = 0; ti < 2; ti++) {
+      if (!g_prev.track[ti].mux_ready) {
+        if (fmp4_mux_init(&g_prev.track[ti].mux, preview_emit, (void *)(intptr_t)ti) != 0) {
+          g_prev.media_owned = 0;
+          pthread_mutex_unlock(&g_prev.lock);
+          return -2;
+        }
+        g_prev.track[ti].mux_ready = 1;
+      } else {
+        fmp4_mux_reset(&g_prev.track[ti].mux);
       }
-      g_prev.mux_ready = 1;
-    } else {
-      fmp4_mux_reset(&g_prev.mux);
+      free(g_prev.track[ti].init);
+      g_prev.track[ti].init = NULL;
+      g_prev.track[ti].init_len = 0;
+      g_prev.track[ti].codec[0] = '\0';
     }
-    free(g_prev.init);
-    g_prev.init = NULL;
-    g_prev.init_len = 0;
-    g_prev.codec[0] = '\0';
     g_prev.listening = 1;
     need_listen = 1;
   }
@@ -1948,12 +2725,12 @@ static int preview_ensure_pipeline(void)
       return -3;
     }
   }
-  /*
-   * Defer IVS+record ~3s after preview media is up so cold-start stays stable.
-   * Closing the last preview client cancels the schedule and stops automation.
-   */
   schedule_motion_automation();
   media_stream_request_idr(1);
+  preview_sync_main_encode();
+  if (media_stream_preview_main_active()) {
+    media_stream_request_idr(3);
+  }
   return 0;
 }
 
@@ -1962,35 +2739,69 @@ static void preview_shutdown_pipeline(void)
 {
   int media_owned;
   int listening;
+  int ti;
 
   pthread_mutex_lock(&g_prev.lock);
   listening = g_prev.listening;
   media_owned = g_prev.media_owned;
   g_prev.listening = 0;
   g_prev.media_owned = 0;
-  free(g_prev.init);
-  g_prev.init = NULL;
-  g_prev.init_len = 0;
-  g_prev.codec[0] = '\0';
-  if (g_prev.mux_ready) {
-    fmp4_mux_reset(&g_prev.mux);
+  for (ti = 0; ti < 2; ti++) {
+    free(g_prev.track[ti].init);
+    g_prev.track[ti].init = NULL;
+    g_prev.track[ti].init_len = 0;
+    g_prev.track[ti].codec[0] = '\0';
+    if (g_prev.track[ti].mux_ready) {
+      fmp4_mux_reset(&g_prev.track[ti].mux);
+    }
   }
   pthread_mutex_unlock(&g_prev.lock);
 
   if (listening) {
     media_stream_remove_packet_listener(preview_on_packet, NULL);
   }
+  (void)media_stream_preview_main_set_active(0);
   cancel_motion_automation_schedule();
-  web_stop_motion_automation();
-  if (media_owned) {
+  /* Motion policy is preview-gated; continuous/schedule keep detect while media held. */
+  if (strcmp(g_record_policy_mode, "motion") == 0) {
+    web_stop_motion_automation();
+  }
+  if (media_owned && !g_record_policy_hold) {
     media_stream_stop();
+  } else if (media_owned && g_record_policy_hold) {
+    log_info("web", "preview idle (media held by record policy)");
   }
 }
 
-static int preview_add_client(struct mg_connection *c)
+void web_preview_force_stop(void)
+{
+  int i;
+  cancel_motion_automation_schedule();
+  web_stop_motion_automation();
+  g_schedule_poll_on = 0;
+  g_record_policy_hold = 0;
+  record_deinit();
+  pthread_mutex_lock(&g_prev.lock);
+  for (i = 0; i < PREVIEW_MAX_CLIENTS; i++) {
+    if (g_prev.clients[i].used && g_prev.clients[i].c) {
+      g_prev.clients[i].c->is_closing = 1;
+      g_prev.clients[i].used = 0;
+      g_prev.clients[i].c = NULL;
+    }
+  }
+  g_prev.nclients = 0;
+  pthread_mutex_unlock(&g_prev.lock);
+  preview_shutdown_pipeline();
+  log_info("web", "preview force-stopped (AOV)");
+}
+
+static int preview_add_client(struct mg_connection *c, int stream)
 {
   int i;
   int slot = -1;
+  if (stream != 0 && stream != 1) {
+    stream = 0;
+  }
   pthread_mutex_lock(&g_prev.lock);
   for (i = 0; i < PREVIEW_MAX_CLIENTS; i++) {
     if (!g_prev.clients[i].used) {
@@ -2006,6 +2817,7 @@ static int preview_add_client(struct mg_connection *c)
   g_prev.clients[slot].c = c;
   g_prev.clients[slot].bootstrapped = 0;
   g_prev.clients[slot].wait_key = 1;
+  g_prev.clients[slot].stream = stream;
   preview_client_clear_q(&g_prev.clients[slot]);
   g_prev.nclients++;
   c->data[0] = PREVIEW_MARK;
@@ -2020,7 +2832,13 @@ static int preview_add_client(struct mg_connection *c)
     pthread_mutex_unlock(&g_prev.lock);
     return -2;
   }
-  log_info("web", "preview client + n=%d", g_prev.nclients);
+  log_info("web", "preview client + n=%d stream=%s", g_prev.nclients, stream ? "main" : "sub");
+  preview_sync_main_encode();
+  if (stream == 1) {
+    media_stream_request_idr(3);
+  } else {
+    media_stream_request_idr(1);
+  }
   return 0;
 }
 
@@ -2042,6 +2860,7 @@ static void preview_remove_client(struct mg_connection *c)
   }
   empty = (g_prev.nclients == 0);
   pthread_mutex_unlock(&g_prev.lock);
+  preview_sync_main_encode();
   if (empty) {
     preview_shutdown_pipeline();
     log_info("web", "preview idle (media stopped)");
@@ -2050,17 +2869,20 @@ static void preview_remove_client(struct mg_connection *c)
 
 static void preview_poll_client(PreviewClient *pc)
 {
-  char meta[64];
+  char meta[80];
+  PreviewTrack *tr;
   if (!pc->used || !pc->c || !pc->c->is_websocket) {
     return;
   }
+  tr = &g_prev.track[pc->stream == 1 ? 1 : 0];
   if (!pc->bootstrapped) {
-    if (g_prev.init_len == 0 || g_prev.codec[0] == '\0') {
+    if (tr->init_len == 0 || tr->codec[0] == '\0') {
       return;
     }
-    snprintf(meta, sizeof(meta), "{\"codec\":\"%s\"}", g_prev.codec);
+    snprintf(meta, sizeof(meta), "{\"codec\":\"%s\",\"stream\":\"%s\"}", tr->codec,
+             pc->stream ? "main" : "sub");
     mg_ws_send(pc->c, meta, strlen(meta), WEBSOCKET_OP_TEXT);
-    mg_ws_send(pc->c, g_prev.init, g_prev.init_len, WEBSOCKET_OP_BINARY);
+    mg_ws_send(pc->c, tr->init, tr->init_len, WEBSOCKET_OP_BINARY);
     pc->bootstrapped = 1;
   }
   while (pc->q_n > 0) {
@@ -2091,16 +2913,72 @@ static void preview_on_poll(void)
 
 static void handle_preview_ws(struct mg_connection *c, struct mg_http_message *hm)
 {
+  char stream_s[16];
+  int stream = 0;
   if (!auth_ok(hm)) {
     mg_http_reply(c, 401, "Content-Type: application/json\r\n",
                   "{\"code\":1001,\"msg\":\"unauthorized\",\"data\":{}}");
     return;
   }
+  if (aov_is_active()) {
+    mg_http_reply(c, 403, "Content-Type: application/json\r\n",
+                  "{\"code\":2601,\"msg\":\"aov mode: preview unavailable\",\"data\":{}}");
+    return;
+  }
+  memset(stream_s, 0, sizeof(stream_s));
+  if (mg_http_get_var(&hm->query, "stream", stream_s, sizeof(stream_s)) > 0) {
+    if (strcmp(stream_s, "main") == 0) {
+      stream = 1;
+    }
+  }
   mg_ws_upgrade(c, hm, NULL);
-  if (preview_add_client(c) != 0) {
+  if (preview_add_client(c, stream) != 0) {
     mg_ws_send(c, "{\"err\":\"preview busy\"}", 22, WEBSOCKET_OP_TEXT);
     c->is_closing = 1;
   }
+}
+
+/* T7.2.2: manual JPEG snapshot (VENC JPEG combo) while preview pipeline is up. */
+static void handle_preview_snapshot_post(struct mg_connection *c, struct mg_http_message *hm)
+{
+  char name[64];
+  char path[320];
+  time_t now;
+  struct tm tm_now;
+  cJSON *data;
+
+  if (!auth_ok(hm)) {
+    json_reply(c, 1001, "unauthorized", NULL);
+    return;
+  }
+  if (aov_is_active()) {
+    json_reply(c, 2601, "aov mode: preview unavailable", NULL);
+    return;
+  }
+  if (preview_ensure_pipeline() != 0) {
+    json_reply(c, 2102, "preview media not ready", NULL);
+    return;
+  }
+  now = time(NULL);
+  localtime_r(&now, &tm_now);
+  strftime(name, sizeof(name), "%Y%m%d_%H%M%S.jpg", &tm_now);
+  if (storage_ensure_dirs() != 0) {
+    json_reply(c, 2201, "storage not ready", NULL);
+    return;
+  }
+  snprintf(path, sizeof(path), "%s/%s", storage_snapshots_path(), name);
+  if (media_snapshot_jpeg(path) != 0) {
+    json_reply(c, 2102, "snapshot failed", NULL);
+    return;
+  }
+  data = cJSON_CreateObject();
+  if (!data) {
+    json_reply(c, 2102, "oom", NULL);
+    return;
+  }
+  cJSON_AddStringToObject(data, "file", name);
+  cJSON_AddStringToObject(data, "url", "/api/v1/alarm/snapshot");
+  json_reply(c, 0, "ok", data);
 }
 
 static void ev_handler(struct mg_connection *c, int ev, void *ev_data)
@@ -2119,6 +2997,11 @@ static void ev_handler(struct mg_connection *c, int ev, void *ev_data)
 
   if (mg_match(hm->uri, mg_str("/api/v1/preview/ws"), NULL)) {
     handle_preview_ws(c, hm);
+    return;
+  }
+  if (mg_match(hm->uri, mg_str("/api/v1/preview/snapshot"), NULL) &&
+      mg_strcmp(hm->method, mg_str("POST")) == 0) {
+    handle_preview_snapshot_post(c, hm);
     return;
   }
   if (mg_match(hm->uri, mg_str("/api/v1/auth/login"), NULL) &&
@@ -2171,6 +3054,16 @@ static void ev_handler(struct mg_connection *c, int ev, void *ev_data)
     handle_video_encode_set(c, hm);
     return;
   }
+  if (mg_match(hm->uri, mg_str("/api/v1/video/osd"), NULL) &&
+      mg_strcmp(hm->method, mg_str("GET")) == 0) {
+    handle_video_osd_get(c, hm);
+    return;
+  }
+  if (mg_match(hm->uri, mg_str("/api/v1/video/osd"), NULL) &&
+      mg_strcmp(hm->method, mg_str("POST")) == 0) {
+    handle_video_osd_set(c, hm);
+    return;
+  }
 
   if (mg_match(hm->uri, mg_str("/api/v1/storage/status"), NULL) &&
       mg_strcmp(hm->method, mg_str("GET")) == 0) {
@@ -2190,6 +3083,16 @@ static void ev_handler(struct mg_connection *c, int ev, void *ev_data)
   if (mg_match(hm->uri, mg_str("/api/v1/storage/format"), NULL) &&
       mg_strcmp(hm->method, mg_str("POST")) == 0) {
     handle_storage_format(c, hm);
+    return;
+  }
+  if (mg_match(hm->uri, mg_str("/api/v1/record"), NULL) &&
+      mg_strcmp(hm->method, mg_str("GET")) == 0) {
+    handle_record_get(c, hm);
+    return;
+  }
+  if (mg_match(hm->uri, mg_str("/api/v1/record"), NULL) &&
+      mg_strcmp(hm->method, mg_str("POST")) == 0) {
+    handle_record_set(c, hm);
     return;
   }
 
@@ -2213,9 +3116,40 @@ static void ev_handler(struct mg_connection *c, int ev, void *ev_data)
     handle_alarm_snapshot(c, hm);
     return;
   }
+  if (mg_match(hm->uri, mg_str("/api/v1/aov/status"), NULL) &&
+      mg_strcmp(hm->method, mg_str("GET")) == 0) {
+    handle_aov_status(c, hm);
+    return;
+  }
+  if (mg_match(hm->uri, mg_str("/api/v1/aov/config"), NULL) &&
+      mg_strcmp(hm->method, mg_str("GET")) == 0) {
+    handle_aov_config_get(c, hm);
+    return;
+  }
+  if (mg_match(hm->uri, mg_str("/api/v1/aov/config"), NULL) &&
+      mg_strcmp(hm->method, mg_str("POST")) == 0) {
+    handle_aov_config_set(c, hm);
+    return;
+  }
+  if (mg_match(hm->uri, mg_str("/api/v1/aov/enter"), NULL) &&
+      mg_strcmp(hm->method, mg_str("POST")) == 0) {
+    handle_aov_enter(c, hm);
+    return;
+  }
+  if (mg_match(hm->uri, mg_str("/api/v1/aov/leave"), NULL) &&
+      mg_strcmp(hm->method, mg_str("POST")) == 0) {
+    handle_aov_leave(c, hm);
+    return;
+  }
+
   if (mg_match(hm->uri, mg_str("/api/v1/system/info"), NULL) &&
       mg_strcmp(hm->method, mg_str("GET")) == 0) {
     handle_system_info(c, hm);
+    return;
+  }
+  if (mg_match(hm->uri, mg_str("/api/v1/system/info"), NULL) &&
+      mg_strcmp(hm->method, mg_str("POST")) == 0) {
+    handle_system_info_set(c, hm);
     return;
   }
   if (mg_match(hm->uri, mg_str("/api/v1/system/time"), NULL) &&
@@ -2231,6 +3165,16 @@ static void ev_handler(struct mg_connection *c, int ev, void *ev_data)
   if (mg_match(hm->uri, mg_str("/api/v1/system/reboot"), NULL) &&
       mg_strcmp(hm->method, mg_str("POST")) == 0) {
     handle_system_reboot(c, hm);
+    return;
+  }
+  if (mg_match(hm->uri, mg_str("/api/v1/system/reboot_schedule"), NULL) &&
+      mg_strcmp(hm->method, mg_str("GET")) == 0) {
+    handle_reboot_schedule_get(c, hm);
+    return;
+  }
+  if (mg_match(hm->uri, mg_str("/api/v1/system/reboot_schedule"), NULL) &&
+      mg_strcmp(hm->method, mg_str("POST")) == 0) {
+    handle_reboot_schedule_set(c, hm);
     return;
   }
   if (mg_match(hm->uri, mg_str("/api/v1/system/reset"), NULL) &&
@@ -2268,6 +3212,8 @@ static void *web_thread(void *arg)
   while (!g_web.quit) {
     mg_mgr_poll(&g_web.mgr, 50);
     preview_on_poll();
+    web_schedule_tick();
+    system_reboot_schedule_tick();
   }
   return NULL;
 }
@@ -2305,9 +3251,17 @@ void web_deinit(void)
   }
   preview_shutdown_pipeline();
   pthread_mutex_lock(&g_prev.lock);
-  if (g_prev.mux_ready) {
-    fmp4_mux_deinit(&g_prev.mux);
-    g_prev.mux_ready = 0;
+  {
+    int ti;
+    for (ti = 0; ti < 2; ti++) {
+      if (g_prev.track[ti].mux_ready) {
+        fmp4_mux_deinit(&g_prev.track[ti].mux);
+        g_prev.track[ti].mux_ready = 0;
+      }
+      free(g_prev.track[ti].init);
+      g_prev.track[ti].init = NULL;
+      g_prev.track[ti].init_len = 0;
+    }
   }
   pthread_mutex_unlock(&g_prev.lock);
   mg_mgr_free(&g_web.mgr);
@@ -2327,6 +3281,7 @@ int web_start(void)
     return -2;
   }
   g_web.running = 1;
+  (void)web_apply_record_policy();
   return 0;
 }
 

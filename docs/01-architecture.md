@@ -68,11 +68,14 @@
 ```
 Sensor(MIS5001) → ISP(RKAIQ) → VI
    ├─ VI ch0 ─→ VENC0 H.265 主码流 ─→ record_service → MP4/TF卡
-   ├─ VI ch1 ─→ VENC1 H.264 子码流 ─→ web_service → WS 预览
-   └─ VI ch2 (640x360 NV12) ─→ detect_service（IVS/帧差 → 可选 RKNN 确认）
+   ├─ VI ch1 ─→ VENC1 H.264 子码流 ─→ web_service → WS 预览（默认 sub）
+   │              └─ VENC2 JPEG combo（抓图）
+   └─ VI ch2（≤1280×720）─→ IVS 移动侦测
+                            └─ VENC3 H.264 主预览（按需启停，?stream=main）
 ```
 
 - 编码参数（分辨率/码率/帧率/GOP/CBR-VBR）全部走配置中心，Web 可改，改后重建对应 VENC 通道。
+- OSD：RGN Overlay 烧录到 VENC0/1/3；中文依赖 FreeType + `simsun_cn_3000.ttf`；`pos_x/pos_y` 须 16 对齐。
 - 参考实现：Luckfox SDK 例程 `luckfox-pico/example`（RKMPI VI+VENC 示例）与 wiki 的 RKMPI 文档。
 
 ### 4.2 录像与存储
@@ -97,16 +100,23 @@ RECORDING ──静默超时(默认30s无运动)──→ IDLE
 ### 4.4 Web 管理
 
 - 后端：mongoose HTTP + REST（`/api/v1/...`），JSON 报文；登录发放 token（HttpOnly cookie，超时可配），密码加盐哈希存储；预留 HTTPS。
-- 预览：子码流 H.264 经 WebSocket 以 fMP4 分片推送，前端 MSE（`mpegts.js`/`jessibuca` 二选一）播放；同时提供 RTSP（可选，方便 VLC 调试）。
-- 前端：Vue3 + Vite 构建为纯静态资源，构建产物 gzip 后放入 `/oem/www`；控制体积 < 2MB。
+- 预览：默认子码流 H.264→WebSocket fMP4/MSE；可选 `?stream=main`（VI2→VENC3，按需编码）。OSD 可烧录。
+- 前端：Vue3 + Element Plus + Vite，产物放入 `/userdata/www`（或 `/oem/www`）；控制体积 < 1.5MB。
 - 功能页面与 API 域对应：登录注销 / 实时预览 / 网络参数 / 图像与编码参数 / 存储与回放（文件列表、下载、在线播放）/ 告警与智能分析（侦测开关、灵敏度、区域、布防时间）/ 系统管理（设备信息、时间、用户密码、重启、恢复出厂、升级）。
 
-### 4.5 AOV 低功耗快起（二期）
+### 4.5 变帧率 AOV（二期）
 
-分两阶段落地，避免一开始就被低功耗阻塞：
+分阶段落地：
 
-- **Phase 1（常电模式）**：进程常驻，侦测→录像全链路先跑通。
-- **Phase 2（AOV 模式）**：利用 RV1106 AOV 能力：系统 suspend 待机，RTC 定时唤醒（如 1s/次）快起出流 → 单帧/短序列侦测 → 无事件回到 suspend，有事件转连续录像。依赖 SDK 的 AOV 参考方案（Luckfox wiki AOV 章节），涉及内核挂起/快速出流调优。
+- **Phase 1（常电）**：进程常驻，侦测→录像已跑通（T5.3 PASS）。
+- **Phase 2（变帧率 AOV）**：
+  - **静态**：主控 `mem` + HPMCU 看场，约 **1fps** lapse（PMU `0xff300048` 节拍）；关网/关 Web。
+  - **动态**：MCU **FastAeMd**（或醒后 IVS）检测到运动 → 切 **20~30fps** 全性能录像；安静超时后再回 1fps。
+  - 人/车分类在 **ARM 唤醒后** 做，不是 MCU 侧模型。
+  - 休眠前须安全卸载 TF；进睡 ISP 单帧 / 事件 ISP 多帧。
+
+详细设计见 **`docs/design/aov.md`**；任务见 **`docs/07-todolist-aov.md`**。  
+**当前硬阻塞**：`mem` resume 未通；MIS5001 缺匹配 wakeup MCU 固件（见 `docs/design/aov-resume-blockers.md`）。
 
 ### 4.6 时间管理
 

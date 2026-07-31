@@ -1,0 +1,691 @@
+===== PAGE 1 =====
+Rockchip RV1106 AOV 开发指南  
+⽂件标识： RK-KF-YF-A17
+发布版本： V1.0.4
+⽇期： 2024-02-21
+⽂件密级： □ 绝密    □ 秘密    □ 内部资料    ■ 公开
+免责声明
+本⽂档按 “ 现状 ” 提供，瑞芯微电⼦股份有限公司（ “ 本公司 ” ，下同）不对本⽂档的任何陈述、信息和内
+容的准确性、可靠性、完整性、适销性、特定⽬的性和⾮侵权性提供任何明⽰或暗⽰的声明或保证。本
+⽂档仅作为使⽤指导的参考。
+由于产品版本升级或其他原因，本⽂档将可能在未经任何通知的情况下，不定期进⾏更新或修改。
+商标声明
+“Rockchip” 、 “ 瑞芯微 ” 、 “ 瑞芯 ” 均为本公司的注册商标，归本公司所有。
+本⽂档可能提及的其他所有注册商标或商标，由其各⾃拥有者所有。
+版权所有  © 2024 瑞芯微电⼦股份有限公司
+超越合理使⽤范畴，⾮经本公司书⾯许可，任何单位和个⼈不得擅⾃摘抄、复制本⽂档内容的部分或全
+部，并不得以任何形式传播。
+瑞芯微电⼦股份有限公司
+Rockchip Electronics Co., Ltd.
+地址：      福建省福州市铜盘路软件园 A 区 18 号
+⽹址：      www.rock-chips.com
+客⼾服务电话：  +86-4007-700-590
+客⼾服务传真：  +86-591-83951833
+客⼾服务邮箱：  fae@rock-chips.com
+===== PAGE 2 =====
+芯⽚名称 内核版本
+RV1106 stable-5.10
+版本号 作者 修改⽇期 修改说明
+V1.0.0 YYZ, HL, HKH, CWW 2023-12-12 初始版本
+V1.0.1 XY, MLC 2023-12-25 添加 WiFi/4G 、摄像头驱动说明
+V1.0.2 ZY 2024-01-10 添加双⽬说明
+V1.0.3 HKH 2024-02-19 添加休眠状态时钟源说明
+V1.0.4 HKH 2024-04-27 更新调试说明
+前⾔
+概述
+本⽂主要介绍 AOV(Always On Video) 的基本功能和开发指南。
+产品版本
+读者对象
+本⽂档（本指南）主要适⽤于以下⼯程师：
+技术⽀持⼯程师
+软件开发⼯程师
+修订记录
+===== PAGE 3 =====
+⽬录
+Rockchip RV1106 AOV 开发指南
+1.   AOV 简介
+1.1   场景说明
+1.2   AOV ⼯作流程说明
+2.   硬件说明
+2.1   硬件接⼝说明
+2.1.1   接⼝功能
+3.   开发说明
+3.1   AOV 状态切换
+3.1.1   设置 AOV 定时休眠时间
+3.1.2   从正常模式进⼊ AOV
+3.1.3   从 AOV 模式进⼊正常模式
+3.1.4   AOV 模式
+3.2   AOV 配置
+3.2.1   系统配置
+3.2.1.1   Kernel
+3.2.1.2   BoardConfig
+3.2.2   按键唤醒配置
+3.2.3   摄像头驱动
+3.2.3.1   Standby 模式
+3.2.3.2   掉电模式
+3.2.3.3   补光灯控制
+3.2.4   WiFi/4G 开发说明
+3.2.5   休眠状态时钟源
+4.   调试说明
+4.1   Demo 说明
+4.1.1   ISP 取流测试
+4.1.2   主码流编码测试
+4.1.3   ⼈形检测测试
+4.1.4   AIISP 测试
+4.1.5   双摄 ISP 取流测试
+4.1.6   双摄主码流编码测试
+4.1.7   双摄⼈形检测测试
+4.1.8   完整应⽤测试
+4.2   休眠唤醒耗时排查
+4.2.1   AOV 耗时确认
+4.2.2   软件耗时排查
+4.3   排查不出流问题
+5.   典型功耗数据
+5.1   基础休眠功耗
+5.2   SC200AI 数据
+5.2.1   编码⼀帧 + ⼈形检测
+5.2.2   AIISP+ 编码⼀帧 + ⼈形检测
+6.   常⻅问题
+6.1   应⽤层时间怎么加上休眠时间
+6.2   如何获取唤醒源
+6.3   为何 AOV SDK 开机后 SD 卡⽆法识别
+6.4   如何解决 AOV 过程中， SD 卡或者 4G 传输数据时短暂没数据
+6.5   如何更低功耗控制红外灯
+===== PAGE 4 =====
+1. AOV 简介  
+AOV(Always On Video) 基于休眠唤醒实现的 24 ⼩时低帧率持续录像，有事件时也可以切回正常帧率模
+式，如 AI 检测、 PIR 触发、 WIFI 唤醒等。
+1.1 场景说明  
+三个场景：
+正常帧率模式：远程预览、 PIR 事件、⼈形检测事件时进⼊。需要录像、联⽹等功能；
+AOV 低帧率模式：空闲时，电量⾜， SOC 低帧率主码流录像、 WiFi/4G 保活；
+低功耗保活模式：空闲时，电量较低时， SOC 下电、 WiFi/4G 保活。
+1.2 AOV ⼯作流程说明  
+===== PAGE 5 =====
+2. 硬件说明  
+2.1 硬件接⼝说明  
+===== PAGE 6 =====
+2.1.1 接⼝功能  
+
+===== PAGE 7 =====
+序
+号 名称 功能
+1 Ethernet 以太⽹接⼝
+2 FW Dowload &
+Debug 串⼝烧录与调试
+3 DCIN 直流适配器输⼊ 12V 电源
+4 the boat switch 船型电源开关
+5 TF card TF 卡接⼝
+6 USB
+HOST/DEVICE USB 烧写⼝
+7 BAT 电池接⼊⼝ ( 正负极标识上图 )
+8 Ethernet switch
+以太⽹电源切换（短接 ab ，使能以太⽹；短接 bc ， 
+切断以太⽹）必须注意 c 脚是没接线，即为悬空状态。如果是
+EVB2_V14 ，使⽤拨码开关即可
+3. 开发说明  
+===== PAGE 8 =====
+3.1 AOV 状态切换  
+3.1.1 设置 AOV 定时休眠时间  
+最⼤⽀持 37 ⼩时，单位 ms ，详细可以参考 3.2.5 章节
+3.1.2 从正常模式进⼊ AOV  
+从正常帧率进⼊ AOV 模式，需要除 AOV 录像外的媒体数据流和卸载外部设备来节省功耗，如下：
+1 ）从正常帧率模式进⼊ AOV 单帧模式，需要将系统剩余的帧取完，防⽌残留帧影响休眠唤醒
+2 ）关闭⼦码流、⾳频等 AOV 模式下不需要的媒体数据流
+3 ）卸载外设，节省休眠时和唤醒时功耗
+SD 卡：
+以太⽹：
+⾳频驱动：
+4 ）进⼊ AOV
+int SAMPLE_COMM_AOV_SetSuspendTime(int wakeup_suspend_time);
+    SAMPLE_COMM_ISP_SingleFrame(0);
+    // drop frame
+    VIDEO_FRAME_INFO_S stViFrame_tmp;
+    while (RK_MPI_VI_GetChnFrame(ctx->s32DevId, ctx->s32ChnId, &stViFrame_tmp, 
+1000) ==
+           RK_SUCCESS) {
+        RK_MPI_VI_ReleaseChnFrame(ctx->s32DevId, ctx->s32ChnId, 
+&stViFrame_tmp);
+    }
+# 暂停⼦码流
+RK_MPI_VI_PauseChn(ctx->vi[2].u32PipeId, ctx->vi[2].s32ChnId);
+# 关闭⾳频
+TBD
+int SAMPLE_COMM_AOV_UnbindSdcard(); // 卸载 SD 卡
+int SAMPLE_COMM_AOV_UnbindEthernet(); // 卸载以太⽹
+int SAMPLE_COMM_AOV_UnbindSoundcard(); // 卸载⾳频
+void SAMPLE_COMM_AOV_EnterSleep();
+===== PAGE 9 =====
+3.1.3 从 AOV 模式进⼊正常模式  
+主要是做媒体数据流和外设的恢复，具体参考如下
+1 ）恢复多帧模式
+2 ）恢复⼦码流、⾳频等媒体数据流
+3 ）恢复外设
+SD 卡 :
+以太⽹ :
+⾳频驱动：
+3.1.4 AOV 模式  
+AOV 模式可以将码流存储，等到累计到⼀定的值，才将码流⼀次性写到 SD 卡或者通过 WIFI 传输出去，
+以下为 SD 卡写卡参考：
+取完码流或者做完⼈形检测之后⽴即进⼊ AOV ，如果想做更低的功耗可以先将 YUV 取出，待休眠唤醒之
+后再做编码 +IVS+ ⼈形检测：
+产品如果关注亮度收敛时间，可以使⽤以下流程进⾏亮度快速收敛
+RK_S32 SAMPLE_COMM_ISP_MultiFrame(int cam_id);
+# 恢复⼦码流
+RK_MPI_VI_ResumeChn(ctx->vi[2].u32PipeId, ctx->vi[2].s32ChnId);
+# 初始化 AI/AO
+TBD
+int SAMPLE_COMM_AOV_BindSdcard(); // 挂载 SD 卡
+int SAMPLE_COMM_AOV_BindEthernet(); // 挂载以太⽹
+int SAMPLE_COMM_AOV_BindSoundcard(); // 挂载⾳频驱动
+SAMPLE_COMM_AOV_CopyStreamToSdcard
+SAMPLE_COMM_AOV_EnterSleep();
+// 1. 检测是否⼤变化
+RK_BOOL SAMPLE_COMM_ISP_IsExpBigChange(int cam_id); // 环境亮度变化⼤，返回 TRUE
+// 2. ⼤变化则切换到连续帧模式
+// 3. 连续帧模式下判断是否收敛
+RK_BOOL SAMPLE_COMM_ISP_IsExpConverge(int cam_id);  // 亮度收敛之后，返回 TRUE
+// 4. 收敛完成后 , 切换为 AOV 模式
+===== PAGE 10 =====
+3.2 AOV 配置  
+3.2.1 系统配置  
+3.2.1.1 Kernel  
+1 ） Config 配置
+arch/arm/configs/rv1106-pm.config
+arch/arm/configs/rv1106-wakeup.config
+2 ） PM-GPIO 配置
+休眠后，只有 PMUIO 有电，其他常规 IO 都掉电了，所以需要根据在待机时外设需要保持的状态  ，将
+GPIO0A0~GPIO0A6 配置为上拉或者下拉。若该 GPIO ⼝没有接外设，则配置为下拉，以下为 EVB2-V13 参
+考配置：
+rockchip_suspend: rockchip-suspend {
+        compatible = "rockchip,pm-rv1106";
+        status = "okay";
+        rockchip,sleep-io-config = <
+            (0
+            | RKPM_IO_CFG_IOMUX_GPIO
+            | RKPM_IO_CFG_GPIO_DIR_INPUT
+            | RKPM_IO_CFG_PULL_DOWN
+            | RKPM_IO_CFG_ID(0)
+            )
+            (0
+            | RKPM_IO_CFG_IOMUX_GPIO
+            | RKPM_IO_CFG_GPIO_DIR_INPUT
+            | RKPM_IO_CFG_PULL_DOWN
+            | RKPM_IO_CFG_ID(1)
+            )
+            (0
+            | RKPM_IO_CFG_IOMUX_GPIO
+            | RKPM_IO_CFG_GPIO_DIR_INPUT
+            | RKPM_IO_CFG_PULL_DOWN
+            | RKPM_IO_CFG_ID(2)
+            )
+            (0
+            | RKPM_IO_CFG_IOMUX_GPIO
+            | RKPM_IO_CFG_GPIO_DIR_INPUT
+            | RKPM_IO_CFG_PULL_UP
+            | RKPM_IO_CFG_ID(3)
+            )
+            (0
+            | RKPM_IO_CFG_IOMUX_GPIO
+            | RKPM_IO_CFG_GPIO_DIR_INPUT
+            | RKPM_IO_CFG_PULL_UP
+            | RKPM_IO_CFG_ID(4)
+            )
+            (0
+            | RKPM_IO_CFG_IOMUX_GPIO
+            | RKPM_IO_CFG_GPIO_DIR_INPUT
+===== PAGE 11 =====
+3 ）常规 IO
+保活外设如果和常规 IO 有连接，这些外设的 IO 要切换到⾼阻，否则会漏电到相应电源域的电源上，造成
+异常。
+3.2.1.2 BoardConfig  
+BoardConfig.mk 添加以下两个配置：
+3.2.2 按键唤醒配置  
+1 ） BoardConfig.mk 打开 rv1106-pm.config 、 rv1106-wakeup.config 配置以
+project/cfg/BoardConfig_BatteryIPC/BoardConfig-SPI_NOR-NONE-RV1106_EVB2_V11-BAT_IPC_AOV.mk
+为例：
+2 ）配置内核 
+使能 GPIO 按键唤醒（对应 EVB2 板⼦上的 key2 ）。需要注意该按键的初始状态需要和 PM-GPIO 中的配置
+保持⼀致，否则可能会误唤醒。
+            | RKPM_IO_CFG_PULL_NONE
+            | RKPM_IO_CFG_ID(5)
+            )
+            (0
+            | RKPM_IO_CFG_IOMUX_GPIO
+            | RKPM_IO_CFG_GPIO_DIR_INPUT
+            | RKPM_IO_CFG_PULL_NONE
+            | RKPM_IO_CFG_ID(6)
+            )
+        >;
+    };
+export RK_APP_TYPE=RK_SAMPLE_AOV
+export RK_ENABLE_AOV=y
+export RK_KERNEL_DEFCONFIG_FRAGMENT="rv1106-tb.config rv1106-battery-ipc.config 
+rv1106-pm.config rv1106-wakeup.config rv1106-sdiowifi.config"
+diff --git a/arch/arm/boot/dts/rv1106g-evb2-v10.dts 
+b/arch/arm/boot/dts/rv1106g-evb2-v10.dts
+index 41e31555a203..f4e758927766 100644
+--- a/arch/arm/boot/dts/rv1106g-evb2-v10.dts
++++ b/arch/arm/boot/dts/rv1106g-evb2-v10.dts
+@@ -50,6 +50,29 @@ wireless_wlan: wireless-wlan {
+===== PAGE 12 =====
+如果触发⽅式要改成单边沿， dts 中 power-key 节点增加如下：
+3.2.3 摄像头驱动  
+AOV 摄像头⽀持 Standby 和掉电两种⽅式，如果摄像头本⾝⽀持 Standby 低功耗，建议选择 Standby ⽅式，
+开发会更简单。具体开发详⻅ Rockchip_Trouble_Shooting_Linux5.10_Camera_CN.pdf
+                WIFI,host_wake_irq = <&gpio1 RK_PB0 GPIO_ACTIVE_HIGH>;
+                status = "okay";
+        };
++
++   gpio-keys {
++          compatible = "gpio-keys";
++          autorepeat;
++          pinctrl-names = "default";
++          pinctrl-0 = <&pwr_key>;
++          power-key {
++                  gpios = <&gpio0 RK_PA1 GPIO_ACTIVE_HIGH>;
++                  linux,code = <KEY_POWER>;
++                  label ="GPIO Key Power";
++                  debounce-interval = <100>;
++                  wakeup-source;
++                  /* gpio-key,wakeup; */
++          };
++       };
++};
++
++&pinctrl {
++       buttons {
++               pwr_key:pwr-key {
++                       rockchip,pins = <0 RK_PA1 RK_FUNC_GPIO 
+&pcfg_pull_down>;
++               };
++       };
+};
+diff --git a/arch/arm/configs/rv1106-battery-ipc.config 
+b/arch/arm/configs/rv1106-battery-ipc.config
+index c9f8f88003a3..07c6f00f7c5a 100644
+--- a/arch/arm/configs/rv1106-battery-ipc.config
++++ b/arch/arm/configs/rv1106-battery-ipc.config
+@@ -268,3 +267,6 @@ CONFIG_SPI_ROCKCHIP_SFC=y
+# CONFIG_VIDEO_S5C73M3 is not set
+CONFIG_ZLIB_DEFLATE=y
+CONFIG_ZLIB_INFLATE=y
++CONFIG_INPUT=y
++CONFIG_INPUT_KEYBOARD=y
++CONFIG_KEYBOARD_GPIO=y
+wakeup-event-action = <EV_ACT_ASSERTED>;    // 上升沿触发
+wakeup-event-action = <EV_ACT_DEASSERTED>;  // 下降沿触发
+===== PAGE 13 =====
+3.2.3.1 Standby 模式  
+以 SC200AI 为例，取流时进⼊正常模式，关流时进⼊ Standby 低功耗模式。摄像头有不同特性，最好跟原
+⼚沟通确认清楚。
+3.2.3.2 掉电模式  
+软件恢复摄像头状态，硬件上三路电压在休眠状态下⽆需供电，但是由于摄像头状态是由于软件恢复
+的，所以 AOV 整体⼯作时间占空⽐会更⻓，时⻓跟 I2C 写寄存器序列相关。
+3.2.3.3 补光灯控制  
+灯的功耗是较⾼的，⽽ AOV 模式下摄像头并不是⼀直在⼯作的，为了将灯的⼯作占空⽐降低即降低功
+耗，需要由驱动精准的对灯的开关进⾏控制。
+3.2.4 WiFi/4G 开发说明  
+硬件要求：
+WiFi/4G 模块：⼀个是可唤醒的 WiFi/4G_WAKE_GPIO ，另⼀个是普通的
+WiFi/4G_NORMAL_GPIO ；
+RV1106 ：⼀个是可唤醒的 RK_WAKE_GPIO ，另⼀个是普通 RK_NORMAL_GPIO ；
+WiFi/4G 建议使⽤低功耗的，内部⽀持独⽴的⽹络协议栈，可以独⽴连接外部服务器，⽀持休眠状
+态下 WiFi/4G 保持连接，且⽀持⽹络唤醒，⽐如 WiFi ：海思 Hi3861L ， 4G 模块：合宙 Air780E ；
+唤醒⽅式：
+RK_NORMAL_GPIO 与  WiFi/4G_WAKE_GPIO 相连：⽬的是使 RK 主控可以主动唤醒 WiFi/4G 模块；
+WiFi/4G_NORMAL_GPIO 与  RK_WAKE_GPIO 相连：⽬的是使 WiFi/4G 模块可以主动唤醒 RK 主控；
+使⽤场景：
+1. WiFi/4G 负责基本的数据通信，且⽀持主控休眠后， WiFi/4G 独⽴能与外部服务器保持连接，并处于
+低功耗模式下，且能通过服务器远程唤醒 WiFi/4G 模块，或 RK 主控通过 GPIO 中断主动唤醒 WiFi/4G
+模块；
+2. 当主控休眠需要进⼊休眠前，需要做如下操作：
+先发送休眠指令（⽐如 AT 指令）给 WiFi/4G 模块，让其保持低功耗模式；
+如果需要⽹络唤醒，则还需要发送远程服务器地址 / 端⼝给 WiFi/4G ，让 WiFi/4G 连接到远端服
+务器；
+最后 rmmod 卸载掉 WiFi/4G 驱动，⽬的是为了在休眠唤醒期间， kernel ⽆需再处理 WiFi/4G 的驱
+动以及设备枚举问题；
+3. 主控进⼊ 1 秒⼀次休眠循环中，此时有以下⼏种情况：
+主控被 PIR 或其它外设唤醒，但此时并不需要 WiFi/4G 通信，则⽆需任何操作 WiFi/4G ；
+主控被 PIR 或其它外设唤醒，且需要连接 WiFi ⽹络通信，此时 RK 主控需要通过拉⾼ / 拉低连接
+到 WiFi/4G 模块的 RK_NORMAL_GPIO 来唤醒 WiFi 模块，然后主控需要重新加载 WiFi/4G 的
+KO ，并配置 IP 地址后就可以联⽹；（注意：由于 WiFi/4G 只是处于低功耗模式，⽹络⼀直是连
+着的，所以唤醒后能快速连接⽹络）
+WiFi/4G 被远端服务器唤醒， WiFi/4G 通过拉⾼ / 拉低连接到主控的 WIFI/4G_NORMAL_GPIO
+来唤醒 RK 主控，此时主控需要重新加载 WiFi/4G KO ，并配置 IP 地址后就可以联⽹；
+4. 循环到第 2 步；
+===== PAGE 14 =====
+WiFi/4G 软件流程参考
+从以下地址获取具体的流程及步骤：
+FTP 地址： ftp://www.rockchip.com.cn 
+注意： FTP 软件要⽀持中⽂编码 
+账号名： rkwifi 
+密码： Cng9280H8t 
+/11-Linux 平台 /WIFI 低功耗⽅案 /AOV
+3.2.5 休眠状态时钟源  
+在休眠模式下，时钟源可以选择 PVTM 分频或 RTC 输出时钟。 PVTM ⽅案可能存在⼀定的误差，该误差受
+温度、电压和频率等因素影响，从⽽影响休眠时⻓。 SDK 默认采⽤ PVTM ⽅案。
+RTC ⽅案：
+硬件：
+需要使能 RTC （仅适⽤于 RV1106 ， RV1103 ⽆内置 RTC ）具体参考硬件参考设计。
+内核配置：
+4. 调试说明  
+4.1 Demo 说明  
+4.1.1 ISP 取流测试  
+说明：
+从 ISP 取⼀帧，并进⼊休眠
+&rtc {
+       rockchip,rtc-suspend-bypass;
+       status = "okay";
+};
+&rockchip_suspend {
+       rockchip,sleep-mode-config = <
+               (0
+               | RKPM_SLP_32K_EXT
+               )
+       >;
+       status = "okay";
+};
+CONFIG_RTC_DRV_ROCKCHIP=y
+===== PAGE 15 =====
+选项 描述 默认值
+-w 分辨率宽 1920
+-h 分辨率⾼ 1080
+-a | --aiq 内置 ISP 功能启⽤，  输⼊该选项启⽤内置 ISP 功能， 
+⽆参数则使⽤默认值，  参数为 aiq ⽂件所在⽂件夹路径。 NULL
+--suspend_time 系统休眠时⻓，单位 ms 1000
+--aov_loop_count 设置 AOV 输出多少帧之后退出程序 -1
+--boot_frame 设置运⾏程序后多少帧之后进⼊ AOV 模式 60
+--output_path yuv 的输出路径，⽂件名为 vi_0.bin NULL
+--vi_frame_mode 单帧或者单帧多帧模式切换。
+0 ：单帧模式， 1 ：单帧 -> 多帧 -> 单帧 0
+代码路径：
+project/app/aov_sample/sample_aov_vi.c
+快速使⽤：
+ sample_aov_vi -w 1920 -h 1080 -a /etc/iqfiles/ --aov_loop_count 50 --boot_frame 50 --suspend_time 1000
+4.1.2 主码流编码测试  
+说明
+从 ISP 取⼀帧并送编码，编码完成之后进⼊休眠，如果有插 sd 卡，会将码流存储
+到 /mnt/sdcard/wakeup_frame_%d ，阈值为 10M ，如果超过 100 个⽂件夹，需要⼿动删除。
+代码路径：
+project/app/aov_sample/sample_aov_vi_venc.c
+快速使⽤：
+sample_aov_vi_venc -w 1920 -h 1080 -a /etc/iqfiles/
+===== PAGE 16 =====
+选项 描述 默认值
+-w 分辨率宽 1920
+-h 分辨率⾼ 1080
+-a | --aiq 内置 ISP 功能启⽤，  输⼊该选项启⽤内置 ISP 功能， 
+⽆参数则使⽤默认值，  参数为 aiq ⽂件所在⽂件夹路径。 NULL
+-e | --encode 设置编码⽅式 h264cbr
+-b | --bitrate 设置编码码率 4096
+-r | --wrap 卷绕开关， 0 ：关闭， 1 ：开启 0
+--wrap_lines 卷绕⾏设置， 0 ： height/2 ， 1 ： height/4 ， 2 ： height/8 1
+--suspend_time 系统休眠时⻓，单位 ms 1000
+--aov_loop_count 设置 AOV 输出多少帧之后退出程序 -1
+--boot_frame 设置运⾏程序后多少帧之后进⼊ AOV 模式 60
+   
+4.1.3 ⼈形检测测试  
+说明：
+从 ISP 取流⼀帧，送 NN 做⼈形识别，如果识别到⼈形会切换为连续帧模式，等到连续 5 帧没识别到⼈
+形，再进⼊休眠。
+代码路径：
+project/app/aov_sample/sample_aov_vi_iva_venc.c
+快速使⽤：
+sample_aov_vi_iva_venc -w 1920 -h 1080 -a /etc/iqfiles/
+===== PAGE 17 =====
+选项 描述 默认值
+-w 分辨率宽 1920
+-h 分辨率⾼ 1080
+-a | --aiq 内置 ISP 功能启⽤，  输⼊该选项启⽤内置 ISP 功能， 
+⽆参数则使⽤默认值，  参数为 aiq ⽂件所在⽂件夹路径。 NULL
+-e | --encode 设置编码⽅式 h265vbr
+-b | --bitrate 设置编码码率 4096
+-r | --wrap 卷绕开关， 0 ：关闭， 1 ：开启 0
+-f | --fps 设置摄像头帧率 25
+--wrap_lines 卷绕⾏设置， 0 ： height/2 ， 1 ： height/4 ， 2 ： height/8 1
+--suspend_time 系统休眠时⻓，单位 ms 1000
+--aov_loop_count 设置 AOV 输出多少帧之后退出程序 -1
+--boot_frame 设置运⾏程序后多少帧之后进⼊ AOV 模式 60
+--enable_multi_frame识别到⼈形是否进⼊连续帧， 1 ：进⼊连续帧， 0 ：继续休眠 1
+--low_power 低功耗模式， 0 ：关闭， 1 ：开启 0
+--camera_mirror_flip设置摄像头旋转， 0: 0, 1: 90, 2: 180, 3: 270 0
+--fast_ae 使能曝光快速收敛， 0 ：关闭， 1 ：开启 0
+4.1.4 AIISP 测试  
+说明：
+经过 AIISP 处理后，送 NN 做⼈形识别，如果识别到⼈形会切换为连续帧模式，等到连续 5 帧没识别到⼈
+形，再进⼊休眠。
+代码路径：
+project/app/aov_sample/sample_aov_aiisp_venc.c
+快速使⽤：
+sample_aov_aiisp_iva_venc  -w 1920 -h 1080  -a /etc/iqfiles/ -I 0 -e h264cbr
+===== PAGE 18 =====
+选项 描述 默认值
+-w 分辨率宽 1920
+-h 分辨率⾼ 1080
+-a | --aiq 内置 ISP 功能启⽤，  输⼊该选项启⽤内置 ISP 功能， 
+⽆参数则使⽤默认值，  参数为 aiq ⽂件所在⽂件夹路径。 NULL
+-e | --encode 设置编码⽅式 h265vbr
+-b | --bitrate 设置编码码率 4096
+-r | --wrap 卷绕开关， 0 ：关闭， 1 ：开启 0
+-f | --fps 设置摄像头帧率 25
+--wrap_lines 卷绕⾏设置， 0 ： height/2 ， 1 ： height/4 ， 2 ： height/8 1
+--suspend_time 系统休眠时⻓，单位 ms 1000
+--aov_loop_count 设置 AOV 输出多少帧之后退出程序 -1
+--boot_frame 设置运⾏程序后多少帧之后进⼊ AOV 模式 60
+--enable_multi_frame识别到⼈形是否进⼊连续帧， 0 ：继续休眠， 1 ：进⼊连续帧 1
+--enable_aiisp 是否开启 AIISP ， 0 ：关闭， 1 ：开启  
+--enable_aov 是否开启 AOV 模式， 0 ：关闭， 1 ：开启。 
+如果关闭可以⽤ rtsp 预览码流 rtsp://xx.xx.xx.xx/live/0 1
+--low_power 低功耗模式， 0 ：关闭， 1 ：开启 1
+--camera_mirror_flip设置摄像头旋转， 0: 0, 1: 90, 2: 180, 3: 270 0
+--fast_ae 使能曝光快速收敛， 0 ：关闭， 1 ：开启 0
+4.1.5 双摄 ISP 取流测试  
+说明：
+从 ISP0 与 ISP1 各取⼀帧，并进⼊休眠：
+代码路径：
+project/app/aov_sample/sample_aov_multi_vi.c
+快速使⽤：
+sample_aov_multi_vi -s 0 -w 2048 -h 1536 -s 1 -w 1920 -h 1080 -a /etc/iqfiles/ --aov_loop_count 10
+===== PAGE 19 =====
+选项 描述 默认值
+-s 0 表⽰主摄， 1 表⽰副摄，⽤于设置对应摄像头的分辨率 0
+-w 分辨率宽 1920
+-h 分辨率⾼ 1080
+-a | --aiq 内置 ISP 功能启⽤，  输⼊该选项启⽤内置 ISP 功能， 
+⽆参数则使⽤默认值，  参数为 aiq ⽂件所在⽂件夹路径。 NULL
+--suspend_time 系统休眠时⻓，单位 ms 1000
+--aov_loop_count 设置 AOV 输出多少帧之后退出程序 -1
+--boot_frame 设置运⾏程序后多少帧之后进⼊ AOV 模式 60
+--vi_frame_mode 单帧或者单帧多帧模式切换。
+0 ：单帧模式， 1 ：单帧 -> 多帧 -> 单帧 0
+--output_path yuv 的输出路径，⽂件名为 vi_0.bin NULL
+4.1.6 双摄主码流编码测试  
+说明：
+从 ISP0 与 ISP1 取⼀帧并送编码，全部编码完成之后进⼊休眠，如果有插 sd 卡会将码流存储
+到 /mnt/sdcard/wakeup_frame_%d ，阈值为 10M ，如果超过 100 个⽂件夹，需要⼿动删除。
+代码路径：
+project/app/aov_sample/sample_aov_multi_vi_venc.c
+快速使⽤：
+sample_aov_multi_vi_venc -s 0 -w 2048 -h 1536 -s 1 -w 1920 -h 1080 -a /etc/iqfiles/ --aov_loop_count 10
+===== PAGE 20 =====
+选项 描述 默认值
+-s 0 表⽰主摄， 1 表⽰副摄，⽤于设置对应摄像头的分辨率 0
+-w 分辨率宽 1920
+-h 分辨率⾼ 1080
+-a | --aiq 内置 ISP 功能启⽤，  输⼊该选项启⽤内置 ISP 功能， 
+⽆参数则使⽤默认值，  参数为 aiq ⽂件所在⽂件夹路径。 NULL
+-e | --encode 设置编码⽅式 h264cbr
+-b | --bitrate 设置编码码率 4096
+-r | --wrap 卷绕开关， 0 ：关闭， 1 ：开启 0
+--wrap_lines 卷绕⾏设置， 0 ： height/2 ， 1 ： height/4 ， 2 ： height/8 1
+--suspend_time 系统休眠时⻓，单位 ms 1000
+--aov_loop_count 设置 AOV 输出多少帧之后退出程序 -1
+--boot_frame 设置运⾏程序后多少帧之后进⼊ AOV 模式 60
+   
+4.1.7 双摄⼈形检测测试  
+说明：
+从 ISP0 与 ISP1 各取⼀帧，全部送到 NN 做⼈形识别，如果识别到⼈形会切换为连续帧模式，等到连续 5 帧
+没识别到⼈形，再进⼊休眠。
+project/app/aov_sample/sample_aov_multi_vi_iva_venc.c
+快速使⽤：
+sample_aov_multi_vi__iva_venc -s 0 -w 2048 -h 1536 -s 1 -w 1920 -h 1080 -a /etc/iqfiles/
+===== PAGE 21 =====
+选项 描述 默认值
+-s 0 表⽰主摄， 1 表⽰副摄，⽤于设置对应摄像头的分辨率 0
+-w 分辨率宽 1920
+-h 分辨率⾼ 1080
+-a | --aiq 内置 ISP 功能启⽤，  输⼊该选项启⽤内置 ISP 功能， 
+⽆参数则使⽤默认值，  参数为 aiq ⽂件所在⽂件夹路径。 NULL
+-e | --encode 设置编码⽅式 h264cbr
+-b | --bitrate 设置编码码率 4096
+-r | --wrap 卷绕开关， 0 ：关闭， 1 ：开启 0
+--wrap_lines 卷绕⾏设置， 0 ： height/2 ， 1 ： height/4 ， 2 ： height/8 1
+--suspend_time 系统休眠时⻓，单位 ms 1000
+--aov_loop_count 设置 AOV 输出多少帧之后退出程序 -1
+--boot_frame 设置运⾏程序后多少帧之后进⼊ AOV 模式 60
+   
+4.1.8 完整应⽤测试  
+4.2 休眠唤醒耗时排查  
+4.2.1 AOV 耗时确认  
+⽅法⼀： power_en 管脚接出来，通过⽰波器看⼯作时⻓；
+⽅法⼆：摄像头对着秒表计时器，查看帧与帧的平均间隔。
+4.2.2 软件耗时排查  
+1 ）关闭串⼝异步打印：
+2 ）打开 PM-Log ，检查整体驱动休眠唤醒耗时，如果有发现耗时偏⻓的驱动，参考 sd 卡驱动让其不参与
+AOV 休眠唤醒过程。
+关闭选项 CONFIG_RK_CONSOLE_THREAD
+echo 0 > /sys/power/pm_async
+echo N > /sys/module/printk/parameters/console_suspend
+echo 1 > sys/power/pm_print_times
+===== PAGE 22 =====
+4.3 排查不出流问题  
+1 ） Camera 驱动确认是否有调⽤到流恢复：
+如果未增加 log ，也可以读取 Sensor 的出流寄存器判断是否正常⼯作
+2 ）查看 cif 、 isp 节点是否有出流：
+3 ） AOV 模式下整条媒体通路均不能使⽤丢帧策略
+4 ）卷绕情况下不出流，可以依次使⽤以下三个策略：
+将卷绕⾏改⼤
+可以将卷绕⾏改成 1/2 ，或者全 BUF
+提升编码器频率
+case RKMODULE_SET_QUICK_STREAM:
+    stream = *((u32 *)arg);
+    if (stream)
+        ret = sc200ai_write_reg(sc200ai->client, SC200AI_REG_CTRL_MODE,
+             SC200AI_REG_VALUE_08BIT, SC200AI_MODE_STREAMING);
+    else
+        ret = sc200ai_write_reg(sc200ai->client, SC200AI_REG_CTRL_MODE,
+             SC200AI_REG_VALUE_08BIT, SC200AI_MODE_SW_STANDBY);
+i2ctransfer -f -y 4 w2@0x30 0x01 0x00 r1
+cat /proc/rkcif-mipi-lvds
+cat  proc/rkisp-vir0
+sysdrv/source/kernel$ git diff arch/arm/boot/dts/rv1106.dtsi
+diff --git a/arch/arm/boot/dts/rv1106.dtsi b/arch/arm/boot/dts/rv1106.dtsi
+index 6180d18da..6830e75f1 100644
+--- a/arch/arm/boot/dts/rv1106.dtsi
++++ b/arch/arm/boot/dts/rv1106.dtsi
+@@ -76,7 +76,7 @@ cpu_pvtpll: cpu-pvtpll {
+                rkvenc_pvtpll: pvtpll-0 {
+                        compatible = "fixed-clock";
+-                       clock-frequency = <410000000>;
++                       clock-frequency = <500000000>;
+                        clock-output-names = "clk_pvtpll_0";
+                        #clock-cells = <0>;
+                };
+@@ -1272,9 +1272,9 @@ rkvenc: rkvenc@ffa50000 {
+                interrupt-names = "irq_rkvenc";
+                clocks = <&cru ACLK_VEPU>, <&cru HCLK_VEPU>, <&cru 
+CLK_CORE_VEPU>;
+                clock-names = "aclk_vcodec", "hclk_vcodec", "clk_core";
+-               rockchip,normal-rates = <300000000>, <0>, <410000000>;
++               rockchip,normal-rates = <300000000>, <0>, <500000000>;
+                assigned-clocks = <&cru ACLK_VEPU>, <&cru CLK_CORE_VEPU>;
+-               assigned-clock-rates = <300000000>, <400000000>;
+===== PAGE 23 =====
+dts 修改完，需要输这个指令才会⽣效
+降低 ISP 频率
+5. 典型功耗数据  
+5.1 基础休眠功耗  
+主控端不含外设休眠时整机功耗应该在 5mW 左右，如测试数据不符合，应该检查是否漏电到主控端，参
+考章节 PM-GPIO 配置，详细如下
+1 ）测试命令
+2 ）功耗数据
++               assigned-clock-rates = <300000000>, <500000000>;
+                resets = <&cru SRST_A_VEPU>, <&cru SRST_H_VEPU>, <&cru 
+SRST_CORE_VEPU>;
+                reset-names = "video_a", "video_h", "video_core";
+                rockchip,srv = <&mpp_srv>;
+echo clk_core_vepu 500000000 > /proc/clk/rate
+diff --git a/drivers/media/platform/rockchip/isp/hw.c 
+b/drivers/media/platform/rockchip/isp/hw.c
+index 6457772f7b89..aaa1647b309f 100644
+--- a/drivers/media/platform/rockchip/isp/hw.c
++++ b/drivers/media/platform/rockchip/isp/hw.c
+@@ -683,10 +683,10 @@ static const struct isp_clk_info rv1106_isp_clk_rate[] = 
+{
+                .clk_rate = 200,
+                .refer_data = 2688,
+        }, {
+-               .clk_rate = 350,
++               .clk_rate = 200,
+                .refer_data = 3072,
+        }, {
+-               .clk_rate = 440,
++               .clk_rate = 200,
+                .refer_data = 3840,
+        }
+};
+io -4 0xff300048 320000000
+echo mem > /sys/power/state
+===== PAGE 24 =====
+电路 电流
+3V3_STB 约 0.05mA
+0V9_STB 约 0.15mA(RTC)\ 约 0.41mA(PVTM)
+DDR_1V36 约 1.8mA
+休眠时⻓ ⼯作时⻓ 整机功耗
+1000ms 75ms 39mW
+500ms 75ms 66mW
+330ms 75ms 92mW
+休眠时⻓ ⼯作时⻓ 整机功耗
+1000ms 75ms 76mW
+500ms 75ms 129mW
+330ms 75ms 170mW
+5.2 SC200AI 数据  
+5.2.1 编码⼀帧 + ⼈形检测  
+1 ）测试命令
+sample_aov_vi_iva_venc -w 1920 -h 1080 -a /etc/iqfiles/ --enable_multi_frame 0 --suspend_time 1000 --
+low_power 1
+--enable_multi_frame  0 ：表⽰识别到⼈形不会进⼊连续帧模式， 1 ：表⽰识别到⼈形会进⼊连续帧模
+式
+--suspend_time 1000 ，指定休眠时间，单位 ms
+--low_power ，使能低功耗模式
+2 ）功耗实测数据
+5.2.2 AIISP+ 编码⼀帧 + ⼈形检测  
+1 ）测试命令
+ sample_aov_aiisp_iva_venc -w 1920 -h 1080 -a /etc/iqfiles/ --suspend_time 1000 --enable_multi_frame 0
+--enable_multi_frame  0 ：表⽰识别到⼈形不会进⼊连续帧模式， 1 ：表⽰识别到⼈形会进⼊连续帧模
+式
+--suspend_time 1000 ，指定休眠时间，单位 ms
+2 ）功耗实测数据（ AIISP 使能且⼯作情况下）
+===== PAGE 25 =====
+6. 常⻅问题  
+6.1 应⽤层时间怎么加上休眠时间  
+6.2 如何获取唤醒源  
+1 ）如果是注册成按键事件，可以参考以下接⼝
+2 ）可以通过以下节点查阅
+6.3 为何 AOV SDK 开机后 SD 卡⽆法识别  
+SDK 默认将 SD 卡驱动卸载掉，可以使⽤如下命令将 SD 卡加载回来
+6.4 如何解决 AOV 过程中， SD 卡或者 4G 传输数据时短暂没数据 
+SDK 提供如下接⼝，⽤于在单帧模式下可以由应⽤调⽤再⼿动出⼀帧，每调⽤第⼀次出⼀帧：
+6.5 如何更低功耗控制红外灯  
+在 AOV 过程中，红外灯不需要常亮，可以通过如下接⼝控制红外补光灯的开关
+注意：接⼝使能红外灯，这个⽅式不能再使⽤ export 等其他外部⽅式控制红外灯。摄像头驱动开发参考
+补光灯控制章节
+struct timespec t;
+clock_gettime(CLOCK_BOOTTIME, &t);
+bool SAMPLE_COMM_AOV_GetGpioIrqStat();
+cat sys/kernel/wakeup_reasons/last_resume_reason
+echo "ffaa0000.mmc" > /sys/bus/platform/drivers/dwmmc_rockchip/bind
+RK_MPI_VI_DevEnableSinglelFrame
+RK_MPI_VI_DevEnableLight
+===== PAGE 26 =====

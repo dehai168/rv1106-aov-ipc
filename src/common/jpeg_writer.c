@@ -15,6 +15,11 @@ static const unsigned char k_std_lum_quant[64] = {
     18, 22, 37, 56, 68,  109, 103, 77,  24, 35, 55, 64, 81,  104, 113, 92,
     49, 64, 78, 87, 103, 121, 120, 101, 72, 92, 95, 98, 112, 100, 103, 99};
 
+static const unsigned char k_std_chr_quant[64] = {
+    17, 18, 24, 47, 99, 99, 99, 99, 18, 21, 26, 66, 99, 99, 99, 99, 24, 26, 56, 99, 99, 99,
+    99, 99, 47, 66, 99, 99, 99, 99, 99, 99, 99, 99, 99, 99, 99, 99, 99, 99, 99, 99, 99, 99,
+    99, 99, 99, 99, 99, 99, 99, 99, 99, 99, 99, 99, 99, 99, 99, 99, 99, 99, 99, 99};
+
 static const unsigned char k_std_dc_lum_nrcodes[17] = {0, 0, 1, 5, 1, 1, 1, 1, 1, 1, 0, 0, 0, 0, 0, 0, 0};
 static const unsigned char k_std_dc_lum_values[12] = {0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11};
 static const unsigned char k_std_ac_lum_nrcodes[17] = {0, 0, 2, 1, 3, 3, 2, 4, 3, 5, 5, 4, 4, 0, 0, 1, 0x7d};
@@ -39,6 +44,7 @@ typedef struct {
   int bitn;
   int err;
   unsigned char quant[64];
+  unsigned char quant_c[64];
   unsigned short dc_code[12];
   unsigned char dc_len[12];
   unsigned short ac_code[256];
@@ -188,14 +194,14 @@ static int bitcount(int v)
   return n;
 }
 
-static void encode_block(Jpg *j, float *du, int *dc)
+static void encode_block_q(Jpg *j, float *du, int *dc, const unsigned char *quant)
 {
   int duq[64];
   int i;
   int last = -1;
   fdct(du);
   for (i = 0; i < 64; i++) {
-    float v = du[k_zz[i]] / (float)j->quant[i];
+    float v = du[k_zz[i]] / (float)quant[i];
     duq[i] = (int)(v < 0 ? v - 0.5f : v + 0.5f);
   }
   {
@@ -238,6 +244,34 @@ static void encode_block(Jpg *j, float *du, int *dc)
   }
   if (last < 63) {
     put_bits(j, j->ac_code[0], j->ac_len[0]);
+  }
+}
+
+static void encode_block(Jpg *j, float *du, int *dc)
+{
+  encode_block_q(j, du, dc, j->quant);
+}
+
+static void scale_quant(unsigned char *dst, const unsigned char *src, int quality)
+{
+  int q;
+  int i;
+  if (quality < 1) {
+    quality = 1;
+  }
+  if (quality > 100) {
+    quality = 100;
+  }
+  q = quality < 50 ? 5000 / quality : 200 - quality * 2;
+  for (i = 0; i < 64; i++) {
+    int v = (src[i] * q + 50) / 100;
+    if (v < 1) {
+      v = 1;
+    }
+    if (v > 255) {
+      v = 255;
+    }
+    dst[k_zz[i]] = (unsigned char)v;
   }
 }
 
@@ -390,4 +424,235 @@ size_t jpeg_write_nv12_gray(const uint8_t *nv12, int width, int height, uint8_t 
     return 0;
   }
   return jpeg_write_gray(nv12, width, height, width, out, out_cap, quality);
+}
+
+static uint8_t sample_y(const uint8_t *y, int width, int height, int stride, int x, int y0)
+{
+  if (x < 0) {
+    x = 0;
+  }
+  if (y0 < 0) {
+    y0 = 0;
+  }
+  if (x >= width) {
+    x = width - 1;
+  }
+  if (y0 >= height) {
+    y0 = height - 1;
+  }
+  return y[y0 * stride + x];
+}
+
+static void sample_uv(const uint8_t *uv, int width, int height, int stride, int x, int y0,
+                      uint8_t *u, uint8_t *v)
+{
+  int ux = x / 2;
+  int uy = y0 / 2;
+  int uw = (width + 1) / 2;
+  int uh = (height + 1) / 2;
+  const uint8_t *p;
+  if (ux < 0) {
+    ux = 0;
+  }
+  if (uy < 0) {
+    uy = 0;
+  }
+  if (ux >= uw) {
+    ux = uw - 1;
+  }
+  if (uy >= uh) {
+    uy = uh - 1;
+  }
+  p = uv + uy * stride + ux * 2;
+  *u = p[0];
+  *v = p[1];
+}
+
+size_t jpeg_write_nv12_planes(const uint8_t *yplane, const uint8_t *uvplane, int width, int height,
+                              int y_stride, int uv_stride, uint8_t *out, size_t out_cap,
+                              int quality)
+{
+  Jpg j;
+  int i;
+  int dc_y = 0;
+  int dc_u = 0;
+  int dc_v = 0;
+  int mx, my;
+
+  if (!yplane || !uvplane || !out || width <= 0 || height <= 0 || y_stride < width ||
+      uv_stride < width || out_cap < 512) {
+    return 0;
+  }
+
+  memset(&j, 0, sizeof(j));
+  j.out = out;
+  j.cap = out_cap;
+  scale_quant(j.quant, k_std_lum_quant, quality);
+  scale_quant(j.quant_c, k_std_chr_quant, quality);
+  compute_huff(k_std_dc_lum_nrcodes, k_std_dc_lum_values, 12, j.dc_code, j.dc_len);
+  compute_huff(k_std_ac_lum_nrcodes, k_std_ac_lum_values, 162, j.ac_code, j.ac_len);
+
+  put_byte(&j, 0xff);
+  put_byte(&j, 0xd8);
+  /* APP0 JFIF */
+  put_byte(&j, 0xff);
+  put_byte(&j, 0xe0);
+  put_byte(&j, 0x00);
+  put_byte(&j, 0x10);
+  put_byte(&j, 'J');
+  put_byte(&j, 'F');
+  put_byte(&j, 'I');
+  put_byte(&j, 'F');
+  put_byte(&j, 0);
+  put_byte(&j, 1);
+  put_byte(&j, 1);
+  put_byte(&j, 0);
+  put_byte(&j, 0);
+  put_byte(&j, 1);
+  put_byte(&j, 0);
+  put_byte(&j, 1);
+  put_byte(&j, 0);
+  put_byte(&j, 0);
+
+  /* DQT luma */
+  put_byte(&j, 0xff);
+  put_byte(&j, 0xdb);
+  put_byte(&j, 0x00);
+  put_byte(&j, 0x43);
+  put_byte(&j, 0x00);
+  for (i = 0; i < 64; i++) {
+    put_byte(&j, j.quant[k_zz[i]]);
+  }
+  /* DQT chroma */
+  put_byte(&j, 0xff);
+  put_byte(&j, 0xdb);
+  put_byte(&j, 0x00);
+  put_byte(&j, 0x43);
+  put_byte(&j, 0x01);
+  for (i = 0; i < 64; i++) {
+    put_byte(&j, j.quant_c[k_zz[i]]);
+  }
+
+  /* SOF0: YCbCr 4:2:0 */
+  put_byte(&j, 0xff);
+  put_byte(&j, 0xc0);
+  put_byte(&j, 0x00);
+  put_byte(&j, 0x11);
+  put_byte(&j, 0x08);
+  put_byte(&j, (unsigned char)(height >> 8));
+  put_byte(&j, (unsigned char)height);
+  put_byte(&j, (unsigned char)(width >> 8));
+  put_byte(&j, (unsigned char)width);
+  put_byte(&j, 3);
+  put_byte(&j, 1);
+  put_byte(&j, 0x22); /* Y 2x2 */
+  put_byte(&j, 0x00);
+  put_byte(&j, 2);
+  put_byte(&j, 0x11); /* Cb 1x1 */
+  put_byte(&j, 0x01);
+  put_byte(&j, 3);
+  put_byte(&j, 0x11); /* Cr 1x1 */
+  put_byte(&j, 0x01);
+
+  /* DHT DC/AC (reuse luma tables for chroma) */
+  put_byte(&j, 0xff);
+  put_byte(&j, 0xc4);
+  put_byte(&j, 0x00);
+  put_byte(&j, 0x1f);
+  put_byte(&j, 0x00);
+  for (i = 1; i <= 16; i++) {
+    put_byte(&j, k_std_dc_lum_nrcodes[i]);
+  }
+  for (i = 0; i < 12; i++) {
+    put_byte(&j, k_std_dc_lum_values[i]);
+  }
+  put_byte(&j, 0xff);
+  put_byte(&j, 0xc4);
+  put_byte(&j, 0x00);
+  put_byte(&j, 0xb5);
+  put_byte(&j, 0x10);
+  for (i = 1; i <= 16; i++) {
+    put_byte(&j, k_std_ac_lum_nrcodes[i]);
+  }
+  for (i = 0; i < 162; i++) {
+    put_byte(&j, k_std_ac_lum_values[i]);
+  }
+
+  /* SOS */
+  put_byte(&j, 0xff);
+  put_byte(&j, 0xda);
+  put_byte(&j, 0x00);
+  put_byte(&j, 0x0c);
+  put_byte(&j, 0x03);
+  put_byte(&j, 0x01);
+  put_byte(&j, 0x00);
+  put_byte(&j, 0x02);
+  put_byte(&j, 0x00);
+  put_byte(&j, 0x03);
+  put_byte(&j, 0x00);
+  put_byte(&j, 0x00);
+  put_byte(&j, 0x3f);
+  put_byte(&j, 0x00);
+
+  for (my = 0; my < height; my += 16) {
+    for (mx = 0; mx < width; mx += 16) {
+      int by, bx;
+      float du[64];
+      int yy, xx;
+      /* 4 Y blocks */
+      for (by = 0; by < 2; by++) {
+        for (bx = 0; bx < 2; bx++) {
+          for (yy = 0; yy < 8; yy++) {
+            for (xx = 0; xx < 8; xx++) {
+              du[yy * 8 + xx] =
+                  (float)sample_y(yplane, width, height, y_stride, mx + bx * 8 + xx,
+                                  my + by * 8 + yy) -
+                  128.0f;
+            }
+          }
+          encode_block_q(&j, du, &dc_y, j.quant);
+          if (j.err) {
+            return 0;
+          }
+        }
+      }
+      /* Cb then Cr (8x8 covering 16x16) */
+      for (yy = 0; yy < 8; yy++) {
+        for (xx = 0; xx < 8; xx++) {
+          uint8_t u, v;
+          sample_uv(uvplane, width, height, uv_stride, mx + xx * 2, my + yy * 2, &u, &v);
+          du[yy * 8 + xx] = (float)u - 128.0f;
+        }
+      }
+      encode_block_q(&j, du, &dc_u, j.quant_c);
+      if (j.err) {
+        return 0;
+      }
+      for (yy = 0; yy < 8; yy++) {
+        for (xx = 0; xx < 8; xx++) {
+          uint8_t u, v;
+          sample_uv(uvplane, width, height, uv_stride, mx + xx * 2, my + yy * 2, &u, &v);
+          du[yy * 8 + xx] = (float)v - 128.0f;
+        }
+      }
+      encode_block_q(&j, du, &dc_v, j.quant_c);
+      if (j.err) {
+        return 0;
+      }
+    }
+  }
+  flush_bits(&j);
+  put_byte(&j, 0xff);
+  put_byte(&j, 0xd9);
+  return j.err ? 0 : j.len;
+}
+
+size_t jpeg_write_nv12(const uint8_t *nv12, int width, int height, int y_stride, int y_rows,
+                       uint8_t *out, size_t out_cap, int quality)
+{
+  if (!nv12 || y_rows < height) {
+    return 0;
+  }
+  return jpeg_write_nv12_planes(nv12, nv12 + y_stride * y_rows, width, height, y_stride, y_stride,
+                                out, out_cap, quality);
 }

@@ -214,5 +214,269 @@
   - 构建：www ≈746KB（gzip JS≈188KB）；已可部署硬刷验证
 - 下一步：T7.2 预览抓图/全屏；T7.5 画框+7×24；T7.6 录像计划；全部基本功能后再开 M6 AOV
 
+## 2026-07-27 session 25 — T5.3 一周挂机结论
+- 采样时间：约 2026-07-17 ~ 2026-07-27；系统 `uptime ≈ 9d22h`；`ipc_app` PID **3345** 全程未换（watchdog 未拉起重启）
+- 当前仍可用：登录 OK；`/system/info` OK；`uptime_sec≈856671`；TF 挂载 exFAT，空闲约 98%
+- 内存：`VmRSS≈7.4MB`（soak 首日均值≈7.6MB，末段≈7.9MB）— **无明显泄漏**
+- soak.csv（仅首日 24h，`DURATION_SEC=86400`）：1439 点，`http_ok` **0 失败**；pid 1316→3345（部署换进程）
+- 日志：
+  - **2026-07-17 13:00 之后 ERROR = 0**（此前 ERROR 几乎全是双实例抢 8080 `listen failed`，属开发期）
+  - WARN 主因：每小时 NTP（`ntpdate`/`busybox ntpd -q` rc=32512，板内无此二进制；系统已有 `/usr/sbin/ntpd`）
+  - MOTION：7/17 手测 1054 次 + 7/25 16 次；抓图 `media snapshot`≈960；卡上 records≈63 段 / snapshots≈434 / alarms.log 1070 行
+- Loadavg 常驻 ≈10 但 `top` 显示 **CPU 100% idle**，`ipc_app` 0%CPU — 属内核/D 态任务假负载，非应用忙环
+- `/userdata` 占用偏高（≈84%，日志 5.6MB）— 二期注意日志轮转
+- **判定：T5.3 长稳 PASS**，可进二期 M6 AOV；并行可修 NTP 调用与日志轮转
+- 下一步：产出 `docs/design/aov.md` + M6 todolist；M7 剩余 UI（画框/计划）可与 AOV 调研并行
+
+## 2026-07-27 session 26 — M6 T6.1 设计定稿
+- 产出：
+  - `docs/design/aov.md`：目标/现状/SDK 机制/状态机/模块落点/API 草案/风险/指标/决策点
+  - `docs/07-todolist-aov.md`：T6.1–T6.6 可执行细项
+  - 修正架构表述：定时唤醒主路径为 **HPMCU 寄存器（`0xff300048`）**，Linux RTC alarm **不作 MVP**
+- SDK 依据：`rkadk_aov.c`（`echo mem` + `io -4 0xff300048`）、`rkadk_aov_record_test.c`（睡前 umount/unbind TF）
+- **待用户确认 D1–D6**（尤其 D1：是否允许改内核/刷固件）后进入 T6.2 探针
+
+## 2026-07-27 session 27 — D1–D6 确认 + T6.2 探针
+- 用户确认：
+  - D1=允许改固件；D2=1000ms；D3=网口可不保持（Type‑C adb）；D4=预览互斥；D5=重启进程；D6=无 PIR
+- 探针（现 Buildroot 内核）：
+  - `/sys/power/state` 空；`echo mem` → `Function not implemented`
+  - SDK `luckfox_rv1106_linux_defconfig`：`# CONFIG_SUSPEND is not set`
+  - `io`/`devmem` 已存在；`ipc_app` 探针后仍存活
+- **结论：现固件无法 AOV → 进入 T6.3**：为 Max 板级增加 `RK_KERNEL_DEFCONFIG_FRAGMENT="rv1106-pm.config"` 后重编/刷内核
+- 记录：`docs/design/aov-probe-notes.md`
+
+## 2026-07-27 session 28 — T6.3 内核 SUSPEND 上板（摄像头已恢复）
+- 坑：
+  1. **只刷 boot、不换匹配 `.ko`** → `Can't find GRF syscon`，无 `/dev/video*`（`CONFIG_PM_SLEEP` 与 OEM 旧模块 ABI 不兼容）
+  2. 首次「备份」`boot-backup-pre-aov.img` 实际已是 SUSPEND 内核，不能当原厂回滚
+  3. 坏内核上 `reboot`/`reboot -f` 会挂死；可用 `io -4 -w 0xff3b0c08 0xfdb9`（CRU `GLB_SRST_FST`）硬软复位
+- 回滚路径：重编无 fragment 的 `boot-stock-no-suspend.img`（`# CONFIG_SUSPEND is not set`）→ 摄像头恢复
+- Go 路径：
+  - BoardConfig：`RK_KERNEL_DEFCONFIG_FRAGMENT="rv1106-pm.config"`
+  - fragment 追加 `CONFIG_ROCKCHIP_GRF=y`
+  - `./build.sh kernel` + `make -C sysdrv drv`，同步媒体相关 `.ko` 到 `/oem/usr/ko`
+  - 刷 `mtd3`：先 push 再 `flash_erase` + `nandwrite -p`
+- **板上现状（验证通过）**：
+  - 内核 `#1 Mon Jul 27 13:25:38 CST 2026`
+  - `/sys/power/state` = `freeze mem`；`CONFIG_SUSPEND=y` / `ROCKCHIP_SUSPEND_MODE=y` / `ROCKCHIP_GRF=y`
+  - CSI probe OK，`/dev/video0` 存在；`ipc_app --web` 在跑
+- 产物：`build/firmware/boot-aov-pm.img`、`boot-stock-no-suspend.img`、`ko-aov-pm/`；TF 上同名 + `oem-ko-backup-pre-aov/`
+- 下一步：T6.3.4 / T6.2.4（`io` 写 `0xff300048` + `echo mem` 唤醒循环）；然后 T6.4 `aov_service`
+
+## 2026-07-27 session 29 — T6.3.4 唤醒探针 FAIL
+- 单次：`io -4 0xff300048 96000`（3s）+ `echo mem` → **能睡，不能自动醒**（adb 断 >2min）
+- 寄存器可写可读（`0xff300048` → `0x17700`）
+- 根因：当前内核 **`# CONFIG_RV1106_PMU_WAKEUP_TIMEOUT is not set`**
+  - SDK `rv1106-pm.config` 只有 SUSPEND；超时唤醒在 `rv1106-wakeup.config`（`CONFIG_RV1106_PMU_WAKEUP_TIMEOUT=y`）
+  - 内核 `rv1106_pm.c` 仅在该 config 下置位 `PMU_WAKEUP_TIMEOUT_EN`
+- 板上 `hpmcu_wrap.bin`（4KB）是 ISP wrap 用；AOV 另有 `rv1106_hpmcu_wakeup_v1.00.bin`（109KB）— 是否替换待 PMU timeout 验证后再定
+- 处理：往 `rv1106-pm.config` 追加 `CONFIG_RV1106_PMU_WAKEUP_TIMEOUT=y` 后重编/刷 boot
+- **板子又卡在 suspend，需用户断电上电**
+
+## 2026-07-27 session 30 — PMU timeout 内核仍不能自动醒
+- 已刷：`#1 Mon Jul 27 15:55:04 CST 2026`，`CONFIG_RV1106_PMU_WAKEUP_TIMEOUT=y` + CSI OK
+- 复测：`io -4 0xff300048 96000` + `echo mem` → adb 断，**3min 未回**
+- 说明：仅开 PMU timeout **不够**；下一步候选：
+  1. 加载 `rv1106_hpmcu_wakeup_v1.00.bin`→`0x40000`（RKTRUST WAKEUP.ini；与 wrap@`0xff6fe000` 不同）
+  2. 查 32K/OSC（`PMU_OSC_DIS_ENA`）：无 32K 则超时永不触发
+  3. 串口看 suspend/resume 日志；或 GPIO wakeup 验证 resume 路径
+- **板子再次卡死，需断电上电**
+
+## 2026-07-27 session 31 — freeze 也断 adb；怀疑 USB 不恢复
+- 板上：`clk_rtc_32k` 存在（32768）但 **enable_count=0**
+- `echo freeze` 同样导致 adb 丢失（freeze 本不该依赖 PMU timeout）
+- 新假设：**系统可能已 resume，但 USB gadget/adb 未恢复** → 主机侧表现为“死机”
+- 验证法：suspend 前后写 TF 日志 `/mnt/sdcard/aov_resume_probe.log`；断电后读卡判断是否有 `RESUME_OK`
+- TF 探针结果（16:28:56）：仅有 `before_mem up=64`，**无 `RESUME_OK`**
+- freeze 探针（16:47:31）：仅有 `before_freeze up=72`，**同样无 RESUME_OK**
+- 上板计划：见 `docs/design/aov-hpmcu-wakeup-plan.md`（Trust `RV1106TOS_WAKEUP.ini` + DTS `aov-reserved`）
+
+## 2026-07-27 session 31 — DTS `aov-reserved` + boot 刷写
+- 改 SDK：`rv1106-luckfox-pico-pro-max-ipc.dtsi` → `&rkcif_mipi_lvds { aov-reserved; }`
+- 重编/刷 `boot-aov-pm.img`（md5 `46f4e8f…`）；TF 备份 `boot-backup-pre-aov-reserved.img`
+- 板上：`rkcif-mipi-lvds/aov-reserved` 存在；CSI OK
+- **未再跑 suspend 探针**（避免卡死）；下一步：idblock/uboot + `RV1106TOS_WAKEUP.ini`
+
+## 2026-07-27 session 32 — idblock/uboot + `RV1106TOS_WAKEUP.ini`
+- SDK 新增 `luckfox_rv1106-wakeup.config`：`CONFIG_TRUST_INI="RV1106TOS_WAKEUP.ini"`
+- BoardConfig：`RK_UBOOT_DEFCONFIG_FRAGMENT="rk-sfc.config luckfox_rv1106-wakeup.config"`
+- `./build.sh uboot` 成功；FIT 含 `mcu1` @ `0x00040000`（hpmcu_wakeup）
+- 产物：`build/firmware/idblock-wakeup.img`（md5 `53a15488…`）、`uboot-wakeup.img`（md5 `5ebd18f4…`）
+- TF 备份：`idblock-backup-pre-wakeup.img`、`uboot-backup-pre-wakeup.img`（刷前 md5 与 mtd 一致）
+- 已刷 mtd1+mtd2；CRU 复位后 **正常启动**；`/dev/video0`、`aov-reserved` OK
+- 跑 `test_aov_resume_probe.sh mem 3000` → adb 丢失，**45s 未回**（与改前类似）
+- **需用户断电上电** 后读 `/mnt/sdcard/aov_resume_probe.log` 确认是否有 `RESUME_OK`
+
+## 2026-07-27 session 33 — WAKEUP trust 后 mem 探针仍 FAIL
+- 用户断电上电后读 TF 日志（18:08:22 探针）：
+  - `before_mem up=120` — **有**
+  - `after_mem` / `RESUME_OK` / `aov_resume_ok.flag` — **均无**
+- 结论：**不是 USB 假死**，系统仍未从 mem 恢复；`RV1106TOS_WAKEUP.ini` 单独不足
+- 板上内核仍缺 `CONFIG_VIDEO_CAM_SLEEP_WAKEUP`；debugfs 未挂载，32K 待查
+- 下一步候选（按风险递增）：
+  1. 内核 fragment 加 `CONFIG_VIDEO_CAM_SLEEP_WAKEUP=y`（仅 boot.img）
+  2. suspend 前读/写 PMU `0xff300000` 域（32K/OSC enable）
+  3. GPIO 唤醒探针（验证 resume 路径是否通）
+  4. 串口抓 suspend/resume 日志
+
+## 2026-07-27 session 34 — 无 rockit 探针（跳过 insmod rockit）
+- **运行时 `rmmod rockit` 会卡死**（refcnt 变 -1），无法用卸载方式去掉 wrap 固件
+- 改 `/oem/usr/ko/insmod_ko.sh` 注释 `__insmod rockit` 行 → 重启后 `lsmod` **无 rockit**（`hpmcu_wrap` 未加载）
+- 备份：`/userdata/insmod_ko.sh.bak`；恢复：`cp /userdata/insmod_ko.sh.bak /oem/usr/ko/insmod_ko.sh`
+- 无 rockit 下跑 mem 3s → adb 仍断，**待断电读 TF 日志**（应有 `before_mem_no_rockit` 行）
+
+## 2026-07-28 session 35 — 无 rockit 探针结论：仍 FAIL
+- TF 日志：`before_mem_no_rockit Mon Jul 27 21:55:53` — **有**；无 `RESUME_OK` / 无 flag
+- **排除**「`hpmcu_wrap` 与 wakeup 固件冲突」假说
+- 已恢复 `/oem/usr/ko/insmod_ko.sh`（从 `/userdata/insmod_ko.sh.bak`）；需重启才加载 rockit
+- 下一步优先：内核 `CONFIG_VIDEO_CAM_SLEEP_WAKEUP=y`（仅 boot）或 PMU 32K / GPIO 唤醒探针
+
+## 2026-07-28 session 36 — `CONFIG_VIDEO_CAM_SLEEP_WAKEUP=y`
+- `rv1106-pm.config` 追加 `CONFIG_VIDEO_CAM_SLEEP_WAKEUP=y`；`./build.sh kernel` OK
+- 刷 `boot-aov-pm.img`（md5 `fb37dfda…`）；内核 `#2 Tue Jul 28 10:20:07 CST 2026`
+- 板上：`CONFIG_VIDEO_CAM_SLEEP_WAKEUP=y`；`/dev/video0` OK；rockit 已恢复
+- 注意：SDK 中该开关主要给 SC*/imx415 传感器 sleep/wake；**MIS5001 驱动未引用**
+- 已跑 mem 3s 探针 → adb 断；**待断电读 TF 日志**
+
+## 2026-07-28 session 39 — FE-PHY 关断进睡（官方 AOV 贴士）
+- 贴士：申请 `Rockchip_RV1106_Developer_Guide_Linux_AOV_CN.pdf`；`echo mem` 前须关断内部 FE-PHY
+- 实现：`network_prepare_aov_suspend()` = wakeup disabled + eth0 down + **unbind rk_gmac-dwmac**
+  （驱动 `rk_gmac_powerdown` → `RV1106 FEPHY SHUTDOWN`）
+- 脚本：`scripts/test_aov_fephy_off_mem.sh`；文档：`aov.md` §3.1、`aov-resume-blockers.md` §6
+- 待板上复测 mem 探针是否出现 `RESUME_OK`
+
+## 2026-07-28 session 39b — FE-PHY off 后 mem 探针仍挂起
+- 已执行 `test_aov_fephy_off_mem.sh 3000`（unbind gmac 已在板上验证可回绑）
+- adb 再次丢失，**短时未回** → FE-PHY 关断是必要步骤，但**不足以单独打通 resume**
+- 待用户断电读 TF：应有 `before_mem_fephy_off`；有无 `RESUME_OK` 决定下一步（串口/32K/MIS5001 MCU）
+
+## 2026-07-28 session 40 — FE-PHY FAIL 确认 + deep suspend 根因
+- 用户 TF：`gmac_unbound` + `before_mem_fephy_off`；**无** `RESUME_OK` / `aov_resume_ok.flag`
+- 官方 PDF：`docs/Rockchip_RV1106_Developer_Guide_Linux_AOV_CN.pdf`
+- **根因**：`/sys/power/mem_sleep` 仅 `[s2idle]`；`echo deep` 无效
+  - 板级 `compatible` 只有 `rv1103g-…` / `rv1106g3`，**无** `"rockchip,rv1106"`
+  - `mach-rockchip` `DT_MACHINE` 不匹配 → `rockchip_suspend_init` 未跑 → 无 deep ops
+  - EVB 均为 `…, "rockchip,rv1106"`
+- SDK 已改：`rv1106g-luckfox-pico-pro-max.dts` 追加 `"rockchip,rv1106"`  
+  备份：`*.dts.bak-before-rv1106-compat`
+- `./build.sh kernel` OK；产物 `build/firmware/boot-aov-deep-compat.img`  
+  md5 `46ddd28208d28348e567478dde9c9fe8`；已 push 到板上 `/mnt/sdcard/boot-aov-deep-compat.img`
+- **待刷** mtd3（需确认）：
+  ```bash
+  nanddump -f /mnt/sdcard/boot-backup-pre-deep-compat.img /dev/mtd3
+  flash_erase /dev/mtd3 0 0 && nandwrite -p /dev/mtd3 /mnt/sdcard/boot-aov-deep-compat.img && sync
+  reboot
+  ```
+  启动后先验：`cat /sys/power/mem_sleep` 应含 `deep`；`strings`/`hexdump` 根 compatible 含 `rockchip,rv1106`；dmesg 有 `rv1106_suspend_init map`
+  再跑：`sh /mnt/sdcard/...` 或 `test_aov_fephy_off_mem.sh 3000`
+
+## 2026-07-28 session 40b — 已刷 deep-compat boot
+- TF 备份：`boot-backup-pre-deep-compat.img`；刷写 `boot-aov-deep-compat.img` → mtd3 → `FLASH_OK` → reboot
+- 板上验证：
+  - `compatible` 含 `rockchip,rv1106`
+  - `/sys/power/mem_sleep` = `s2idle [deep]`（**deep 已注册且为默认**）
+- 下一步：跑 `test_aov_fephy_off_mem.sh 3000`，断电读 TF 是否有 `RESUME_OK`
+
+## 2026-07-28 session 41 — mem resume 首通
+- FE-PHY off + `echo mem`（deep）：**RESUME_OK**
+  - 13:17:25→28、13:18:43→47、13:21:56→59、13:31:02→05（共 4 次）
+  - `suspend_stats/success=4 fail=0`
+  - dmesg：`PM: suspend entry (deep)` / `suspend exit`
+- 进睡前仍须：gmac wakeup disabled + eth0 down + unbind + 写 `0xff300048`
+- 脚本：`test_aov_fephy_off_mem.sh`；soak：`test_aov_fephy_soak10.sh` + `launch_fephy_soak.sh`
+- 说明：前台 adb 会在进睡时断 USB 杀掉多轮循环；单次探针可验证，长 soak 需板上 detach
+- 下一步：用户态打开 `aov.allow_mem_suspend` 短循环；并行评估 MIS5001 HPMCU 看场
+
+## 2026-07-28 session 42 — detach soak ≥10
+- BusyBox `setsid` 无 `-f`；改用 `nohup` 启动（`launch_fephy_soak.sh`）
+- **soak12：`done ok=12 fail=0`**；`suspend_stats/success=16`（此前 4 + 本轮 12）
+- 末条：`soak10 #12 OK` @ 13:39:45–48；总 `RESUME_OK` 计数 16
+- 判据「连续 ≥10」已达成；可开用户态短循环 / 再冲 100 次
+
+## 2026-07-28 session 43 — 用户态 allow_mem_suspend 短循环
+- 板上旧 `ipc_app`(7/17) 无 `--aov`；重编部署；`userdata` 曾满（core dump），已清并恢复 `ipc_config.json`
+- 配置：`aov.allow_mem_suspend=true`，`suspend_ms=3000`
+- 修：`umount -l` 回退；AOV 周期内保持 gmac unbound；`probe_once` 结束 `leave` 再 bind；避免 wake 后 udhcpc 卡死
+- **短循环 5/5 PASS**：`done ok=5 fail=0`；`wake_ms≈3070`；`LAPSE_1FPS wake=timer`
+- 启动：`nohup sh /mnt/sdcard/run_aov_soak.sh 5 >/tmp/aov_userspace_soak.out 2>&1 &`
+- 注意：无 AIQ 时 ISP single-frame 仅 warn（CLI probe 未启 media）
+
+## 2026-07-28 session 44 — 进程内 lapse 循环 `loop`
+- 新增 `aov_run_lapse_loop(N)`：`enter` 一次 → N 次 `enter_sleep` → `leave`（周期内 FE-PHY 保持 off）
+- CLI：`ipc_app --aov loop 5`；可选 `--media` 写 `/mnt/sdcard/aov_lapse/lapse_*.jpg`
+- 板上：`loop 5` → `lapse_loop cycle 5/5 ok wake_ms=3071`；`suspend_stats` 24→29
+- `run_aov_soak.sh` 改为调用 `loop`（不再每轮 fork probe）
+
+## 2026-07-30 session 45 — T6.5.3 事件 MP4 闭环 PASS
+- 根因：VENC `GetStream` 回调内同步 `rkmuxer_write` 堵住 `ReleaseStream`；空预录清 `waiting_key` 导致非关键帧入 muxer
+- 修复：保持 motion arm；空 flush 保留 waiting_key；**独立 mux 写线程 + /tmp staging 再 promote 到 TF**
+- 验收：`loop 4 --media` + `debug_motion_interval=4` → `frames=302`，`20260730_102054.mp4` ~2.5MB **可播**
+- 下一步：media+motion 长 soak（→ T6.6）；MCU md_flag 仍缺 MIS5001 wakeup FW
+
+## 2026-07-30 session 46 — media+motion soak50 PASS
+- `done ok=50 fail=0`；约 12 次 `FULL_RECORD`，每段 `frames≈190–240`，TF 多段 1.5–3.6MB MP4（末段更大）
+- 下一步：阶梯加长 soak（200→更长）迈向 T6.6.1 24h；并行可测功耗
+
+## 2026-07-30 session 47 — media+motion soak200 PASS
+- `done ok=200 fail=0`；`FULL_RECORD`×50（interval=4）；当日 records 共 64 个 mp4
+- 下一步：启动 ~2000 周期 soak（约一夜量级）冲 T6.6.1
+
+## 2026-07-31 session 48 — media+motion soak2000 PASS
+- `done ok=2000 fail=0`；`FULL_RECORD`×500；`FAIL|sleep_fail|force stop|stuck` 无匹配
+- 变帧率闭环 + 长稳用户态路径成立（debug_motion 模拟 MCU MD）
+- 下一步：T6.6.2 功耗对比；可选真 24h；T6.5.2 仍待 MIS5001 wakeup FW
+
+## 2026-07-31 session 49 — T6.6.3 关 AOV 回归 Phase 1
+- soak 后新进程 `leave` 不会 rebind（`g_gmac_unbound` 进程内）；修：`eth0` 缺失时 force bind
+- 回归：`aov.enabled=false`；`--record 8` → 230f MP4；`--detect 25` → **PASSED**（IVS=4, 470f）
+- 残留：T6.6.2 功耗表；T6.5.2 MCU md_flag / MIS5001 FW
+
+## 2026-07-31 session 50 — M7 T7.2 预览工具条 + 抓图
+- 前端：重连 / 抓图 / 全屏 / 适应|填充|16:9|4:3
+- 后端：`POST /api/v1/preview/snapshot` → snapshots JPEG；下载复用 alarm/snapshot
+- 已部署 www + ipc_app `--web`；下一步 T7.5 侦测区域画框
+
+## 2026-07-31 session 51 — M7 T7.5 事件产品化
+- 抓图改硬件 VENC JPEG combo（子码流 master）；软 NV12 花屏已弃用
+- T7.5.1–5：最多 4 区域软过滤；`schedule.grid` 7×24；`link.record/snapshot`
+- UI：`RegionDrawCanvas` + `ScheduleGrid`；告警表 Dialog 看图
+- www≈768KB；下一步 T7.6 录像计划
+
+## 2026-07-31 session 52 — M7 T7.6 录像计划
+- `GET|POST /api/v1/record`：mode motion|continuous|schedule + grid + 预录/延录/回收%
+- continuous/schedule：`policy_hold` 无预览客户端仍保持媒体；schedule 按小时启停连续录
+- UI：`RecordPlanView` + 菜单「录像计划」；StorageView 回收水位
+- 下一步：T7.8 文档验收收尾 / 可选增强
+
+## 2026-07-31 session 53 — 连续录像分段时长显示偏长
+- 现象：`segment_sec=30` 墙钟切段正确，播放器显示 ~50–60s
+- 根因：sensor~30fps 全进 mux；rkmuxer 按 `frame_rate=15` 每帧 +1/15s → duration≈frames/15≈60s
+- 修复：VENC `Src=30 Dst=cfg`；录像侧按 `main_fps` 软件限帧（rkmuxer 忽略精细 PTS）
+- 板上验证：30s 段 `frames=450`，`duration=30.0s`；已部署 `/userdata/ipc_app`
+
+## 2026-07-31 session 54 — M7 T7.8 文档与验收收尾
+- `scripts/pack_www.sh`：www **773416 B**（<1.5MB）；gzip JS≈195KB / CSS≈28KB；产物 `index-21JUkFwJ.js`
+- 板端：`/userdata/www` 硬刷；`scripts/smoke_m7_web.sh` → 首页+JS+API 1001 门控 PASS（板密已改，登录用参数传入）
+- 文档：`03` M7=完成；`06` T7.8 全勾；`ui-vigi-gap` E3/E6/A3/A5 已有
+- 已知未做（可选，不挡 M7）：主/子预览切换、数字缩放、日志 tail API、OSD、设备名可写、定时重启
+- 下一步：T5.4 README/review；或上述可选增强
+
+## 2026-07-31 session 55 — 六项可选增强 + T5.4
+- 预览：主预览 VENC3 H.264（≤720p）+ `?stream=`；数字缩放
+- 系统：设备名 POST、日志 `tail`、定时重启 schedule
+- OSD：RGN BGRA5551 烧录主/子；`/api/v1/video/osd`
+- README / 03 T5.4 / 05-api / 06 todolist 同步；pack+部署
+
+## 2026-07-31 session 56 — 主预览/OSD/侦测/流畅度修复
+- **主预览无图**：RV1106 ISP 仅 3 路；改为 VI2→VENC3；无人看 main 时 StopRecv（idle）
+- **预览卡顿**：勿双路同时 fMP4；主预览降到 ~10fps/800kbps；前端追直播丢积压
+- **连续录像无侦测事件**：continuous/schedule 也起 IVS；`link.record` 仅 motion 策略生效
+- **OSD**：中文 FreeType + `assets/fonts/simsun_cn_3000.ttf`；`pos_x/pos_y` **16 对齐**（Y 失效根因）；改位置重建 RGN
+- 文档：`01` 视频链路、`05` API、本 worklog；板上验证 MOTION + OSD pos=0/64/160/320
+
+## 2026-07-31 session 57 — 文档同步并入库
+- README / 架构 / API / UI todolist / detect 设计对齐 session 56 行为
+- 入库：M7 增强 + AOV 用户态 + OSD 字体；排除根目录 smoke 媒体与官方 AOV PDF
 
 

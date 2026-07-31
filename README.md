@@ -1,52 +1,91 @@
 # rv1106-aov-ipc
 
-RV1106 AOV IPC project.
+基于 **Luckfox Pico Max（RV1106G3）+ MIS5001** 的 AOV 智能 IPC：移动侦测录像、TF 卡分段 MP4、Web 管理、可选变帧率 AOV。
 
-### 开发文档（agent 必读，按顺序）
-1. [docs/01-architecture.md](docs/01-architecture.md) — 系统架构与技术方案
-2. [docs/02-dev-process.md](docs/02-dev-process.md) — 开发流程、规范与持续迭代方法
-3. [docs/03-todolist.md](docs/03-todolist.md) — 任务清单与进度（单一事实源）
+## 文档（按顺序）
+
+1. [docs/01-architecture.md](docs/01-architecture.md) — 架构
+2. [docs/02-dev-process.md](docs/02-dev-process.md) — 开发流程
+3. [docs/03-todolist.md](docs/03-todolist.md) — 任务进度
 4. [docs/04-worklog.md](docs/04-worklog.md) — 工作日志
-5. [docs/05-api.md](docs/05-api.md) — REST API 契约
+5. [docs/05-api.md](docs/05-api.md) — REST API
+6. [docs/06-todolist-ui.md](docs/06-todolist-ui.md) — Web UI（M7）
+7. [docs/env.md](docs/env.md) — 本机环境实况
 
-### 硬件环境
-1. luckfox pico Max 开发板
-    芯片	RV1106G3
-    处理器	Cortex A7 1.2GHz
-    NPU	1TOPS,支持int4、in8、int16
-    ISP	最大输入5M @30fps
-    内存  256MB DDR3L
-    Wi-Fi+蓝牙	无
-    摄像头接口	MIPI CSI 2-lane
-    DPI接口	无
-    POE接口	无
-    喇叭接口 无
-    USB	USB 2.0 Host/Device
-    GPIO	26 个 GPIO 引脚
-    网口	10/100M Ethernet controller and embedded PHY
-    默认存储介质	SPI NAND FLASH(256MB)
-2. 该开发板已经连接 MIS5001 5MP Camera
-3. 该开发板已经插上 tf 卡64GB
-4. 该开发板带了纽扣电池且已连接
-5. 该开发板通过 adb 已经与电脑连接,可以直接通过adb进行操控
-### 软件环境
-1. 开发板的开发资料可以参考：https://wiki.luckfox.com/Luckfox-Pico-RV1106 
-2. 开发板的下载参考资料可以参考: https://github.com/LuckfoxTECH/Luckfox-Pico-docs
-3. 当前开发电脑是windows，已经安装了ubuntu 的子系统，可以进入该进行搭建编译环境，登录用户名 user 密码 12345678
-4. 如果当前系统不满足开发，可以把代码clone到 ubuntu的子系统，边修改边编译边review再提交
-### 功能目标
-1. 该ipc具备移动物体检测并自动快起进行录像
-2. 文件系统使用用户插上tf卡就能够从pc访问录像文件，录像文件格式是mp4格式，按照录像时长参数进行分段录制和按照存储空间进行周期覆盖
-3. 该ipc具备一个web管理功能，如果通过网口访问网关以后能够打开ipc的web管理界面，该管理界面具备以下基本功能
-   3.1 基本的登录和注销
-   3.2 实时画面预览
-   3.3 网络参数配置
-   3.4 图像和视频流参数配置
-   3.5 存储与回放配置
-   3.6 告警与智能分析
-   3.7 系统管理和安全
-4.具备rtc校时功能
-### 开发要求
-1. 所有的文档资料都放到docs目录
-2. 先设计再开发，开发过程持久化自身进度，开发完成以后要review代码功能
-3. 涉及到高危操作要征求我的同意
+## 功能概览
+
+| 能力 | 说明 |
+|---|---|
+| 双码流 | 主 H.265 录像；子 H.264 预览；另有 ≤1280×720 H.264 主预览通道 |
+| 录像 | 事件 / 连续 / 周计划；分段 MP4；低水位循环覆盖 |
+| 侦测 | Rockit IVS + 多区域软过滤 + 7×24 布防 |
+| Web | Element Plus；预览 MSE（子/主）；图像/OSD（中文+位置）/存储/告警/系统 |
+| AOV | 用户态变帧率主线可用；MCU 睡时 MD / 功耗表暂搁 |
+
+**不做**：PTZ、音频对讲、真卡 mkfs、在线升级、ONVIF 等。
+
+板端 OSD 字体：部署 `assets/fonts/simsun_cn_3000.ttf` → `/userdata/fonts/`（或配置 `video.osd.font_path`）。
+
+## 编译（WSL）
+
+```bash
+# 依赖：Luckfox SDK + 交叉工具链（见 docs/env.md）
+cd /mnt/d/CodeProject/rv1106-aov-ipc
+./scripts/build.sh
+# 产物：build/ipc_app
+```
+
+前端：
+
+```bash
+./scripts/pack_www.sh   # npm build → www/（需 <1.5MB）
+```
+
+## 部署（adb）
+
+```powershell
+# 二进制（userdata 空间紧，可经 TF 中转）
+adb push build/ipc_app /mnt/sdcard/ipc_app_new
+adb shell "killall ipc_app; cp /mnt/sdcard/ipc_app_new /userdata/ipc_app; chmod +x /userdata/ipc_app"
+
+# www（BusyBox tar 无 -z，用未压缩 tar）
+# WSL: tar -C www -cf /tmp/www.tar .
+adb push \\wsl$\Ubuntu\tmp\www.tar /mnt/sdcard/www.tar
+adb shell "rm -rf /userdata/www; mkdir -p /userdata/www; tar -C /userdata/www -xf /mnt/sdcard/www.tar"
+
+adb shell "export LD_LIBRARY_PATH=/oem/usr/lib:/usr/lib; nohup /userdata/ipc_app --web >/tmp/ipc_app.log 2>&1 &"
+```
+
+开机自启：`scripts/S99ipc_app` + `ipc_watchdog.sh`（见 T5.2）。
+
+## 使用
+
+1. 浏览器打开 `http://<板IP>:8080`
+2. 默认账号 **admin / admin**（首登强制改密）
+3. 预览：子码流 / 主预览切换；滚轮或滑条数字缩放；抓图
+4. 录像计划：事件 / 连续 / 定时；存储页回收水位
+5. 摄像机 → OSD：时间与通道名 RGN 烧录
+6. 系统：设备名、定时重启、日志尾部预览与下载
+
+配置：`/userdata/ipc_config.json`（合并 `default_config.json`）。  
+录像/抓图：`/mnt/sdcard/records|snapshots|alarms`。
+
+## 常用 CLI
+
+```text
+ipc_app --web
+ipc_app --record 30
+ipc_app --detect 25
+ipc_app --aov status|enter|leave|loop N [--media]
+```
+
+## 已知限制
+
+- 主预览为辅助 **H.264**，不是录像用的 H.265 裸流 MSE
+- 主预览分辨率上限约 1280×720（省内存）
+- 无 PTZ / 音频 / Wi‑Fi / 人形 NPU（T3.4 延后）
+- AOV：`allow_mem_suspend` 默认可关；MCU wakeup FW 待板级
+
+## 硬件摘要
+
+Luckfox Pico Max：RV1106G3、256MB DDR、MIS5001 MIPI、64GB TF、有线网、RTC 纽扣电池、ADB。

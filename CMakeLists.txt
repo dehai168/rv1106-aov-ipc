@@ -13,6 +13,8 @@ else()
 endif()
 
 set(RK_MEDIA_OUT "${LUCKFOX_SDK}/media/out")
+set(RK_THIRD_LIBS "${LUCKFOX_SDK}/project/app/component/third_libs")
+set(RK_FREETYPE_LIBDIR "${RK_THIRD_LIBS}/lib/arm-rockchip830-linux-uclibcgnueabihf")
 
 add_executable(ipc_app
   src/main/main.c
@@ -25,8 +27,10 @@ add_executable(ipc_app
   src/system/network_service.c
   src/system/system_service.c
   src/media/media_service.c
+  src/media/media_osd.c
   src/record/record_service.c
   src/detect/detect_service.c
+  src/aov/aov_service.c
   src/web/web_service.c
   src/web/fmp4_mux.c
   third_party/cJSON/cJSON.c
@@ -47,6 +51,8 @@ target_include_directories(ipc_app PRIVATE
   ${RK_MEDIA_OUT}/include/rkaiq/iq_parser
   ${RK_MEDIA_OUT}/include/rkaiq/iq_parser_v2
   ${RK_MEDIA_OUT}/include/rkaiq/smartIr
+  ${RK_THIRD_LIBS}/include
+  ${RK_THIRD_LIBS}/include/freetype2
 )
 
 target_compile_options(ipc_app PRIVATE -Wall -Wextra -Werror)
@@ -57,9 +63,13 @@ target_compile_definitions(ipc_app PRIVATE
   RV1106_RV1103
 )
 
-target_link_directories(ipc_app PRIVATE ${RK_MEDIA_OUT}/lib)
+target_link_directories(ipc_app PRIVATE
+  ${RK_MEDIA_OUT}/lib
+  ${RK_FREETYPE_LIBDIR}
+)
 target_link_options(ipc_app PRIVATE
   "-Wl,-rpath-link,${RK_MEDIA_OUT}/lib"
+  "-Wl,-rpath-link,${RK_FREETYPE_LIBDIR}"
 )
 target_link_libraries(ipc_app PRIVATE
   rockit
@@ -67,6 +77,7 @@ target_link_libraries(ipc_app PRIVATE
   rga
   rkaiq
   rkmuxer
+  freetype
   pthread
   m
   stdc++

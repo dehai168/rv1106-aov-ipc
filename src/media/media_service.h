@@ -3,6 +3,8 @@
 
 #include <stdint.h>
 
+#include "media/media_osd.h"
+
 #ifdef __cplusplus
 extern "C" {
 #endif
@@ -25,7 +27,7 @@ typedef struct {
   int sub_fps;
   int sub_bitrate_kbps;
   int sub_gop;
-  int detect_w; /* VI ch2; 0 = disabled */
+  int detect_w; /* >0 enables IVS on VI2; runtime size follows VI2 (preview-main) */
   int detect_h;
   const char *iq_dir;
 } MediaEncodeConfig;
@@ -44,14 +46,20 @@ int media_encode_raw(const MediaEncodeConfig *cfg, const char *out_dir, int seco
 
 /* Persistent dual-stream session (T1.3). Optional VI ch2 when detect_w/h > 0. */
 int media_stream_start(const MediaEncodeConfig *cfg);
+int media_stream_reinit(const MediaEncodeConfig *cfg); /* stop + start (AOV recovery) */
 int media_stream_apply(const MediaEncodeConfig *cfg); /* rebuild VI/VENC as needed */
 void media_stream_stop(void);
 int media_stream_is_up(void);
+int media_stream_pack_count_main(void);
 int media_stream_request_idr(int chn);
 
 int media_stream_detect_enabled(void);
 int media_stream_detect_width(void);
 int media_stream_detect_height(void);
+
+/* Start/stop preview-main VENC3 encode (VI2). Off by default to save ISP/CPU. */
+int media_stream_preview_main_set_active(int on);
+int media_stream_preview_main_active(void);
 
 /* Optional raw dump while stream is up (NULL path disables that chn dump). */
 int media_stream_set_dump(const char *main_path, const char *sub_path);
@@ -75,8 +83,17 @@ typedef struct {
 int media_image_get(MediaImageConfig *out);
 int media_image_set(const MediaImageConfig *in, int apply);
 
-/* Capture one JPEG (grayscale from VI sub Y plane) while stream is up. */
+int media_osd_get(MediaOsdConfig *out);
+int media_osd_set(const MediaOsdConfig *in, int apply);
+
+/* One-shot hardware JPEG via VENC combo (master = sub H.264). Requires stream up. */
 int media_snapshot_jpeg(const char *path);
+
+/* AOV: ISP single-frame (pause AIQ) / multi-frame (resume AIQ). */
+int media_isp_single_frame(void);
+int media_isp_multi_frame(void);
+/* Apply main encode fps for event recording (best-effort stream_apply). */
+int media_aov_apply_event_fps(int fps);
 
 #ifdef __cplusplus
 }

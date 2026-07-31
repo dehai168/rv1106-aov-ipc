@@ -19,6 +19,15 @@
       "mirror": 0,
       "flip": 0
     },
+    "osd": {
+      "enabled": false,
+      "show_time": true,
+      "show_name": true,
+      "pos_x": 16,
+      "pos_y": 16,
+      "name": "",
+      "font_path": "/userdata/fonts/simsun_cn_3000.ttf"
+    },
     "encode": {
       "main_w": 1920,
       "main_h": 1080,
@@ -37,10 +46,15 @@
     "mount": "/mnt/sdcard"
   },
   "record": {
+    "mode": "motion",
     "segment_sec": 30,
     "recycle_free_percent": 10,
     "pre_record_sec": 4,
-    "quiet_sec": 30
+    "quiet_sec": 30,
+    "schedule": {
+      "enabled": false,
+      "grid": "111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111"
+    }
   },
   "detect": {
     "enabled": true,
@@ -56,11 +70,20 @@
       "w": 0,
       "h": 0
     },
+    "region0": { "enabled": false, "x": 0, "y": 0, "w": 0, "h": 0 },
+    "region1": { "enabled": false, "x": 0, "y": 0, "w": 0, "h": 0 },
+    "region2": { "enabled": false, "x": 0, "y": 0, "w": 0, "h": 0 },
+    "region3": { "enabled": false, "x": 0, "y": 0, "w": 0, "h": 0 },
     "schedule": {
       "enabled": false,
       "start_min": 0,
       "end_min": 1440,
-      "days": 127
+      "days": 127,
+      "grid": "111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111"
+    },
+    "link": {
+      "record": true,
+      "snapshot": true
     }
   },
   "network": {
@@ -78,12 +101,29 @@
       "enabled": false,
       "server": "pool.ntp.org",
       "interval_min": 60
+    },
+    "reboot_schedule": {
+      "enabled": false,
+      "hour": 3,
+      "minute": 30,
+      "days": "1111111"
     }
   },
   "web": {
     "port": 8080,
     "www_root": "/userdata/www",
     "token_ttl_sec": 86400
+  },
+  "aov": {
+    "enabled": false,
+    "suspend_ms": 1000,
+    "event_fps": 25,
+    "quiet_sec": 30,
+    "event_record_sec": 10,
+    "max_cycles_before_reinit": 40,
+    "down_eth": true,
+    "allow_mem_suspend": false,
+    "debug_motion_interval": 4
   },
   "auth": {
     "username": "admin",

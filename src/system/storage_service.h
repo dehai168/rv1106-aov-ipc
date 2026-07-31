@@ -40,6 +40,10 @@ const char *storage_mount_path(void);
 const char *storage_records_path(void);
 const char *storage_snapshots_path(void);
 
+/* AOV: umount TF + unbind SD host before mem; bind + mount after wake. */
+int storage_prepare_suspend(void);
+int storage_resume_from_suspend(void);
+
 #ifdef __cplusplus
 }
 #endif

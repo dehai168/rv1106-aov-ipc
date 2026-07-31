@@ -6,6 +6,7 @@ import PreviewView from './views/PreviewView.vue'
 import NetworkView from './views/NetworkView.vue'
 import VideoView from './views/VideoView.vue'
 import StorageView from './views/StorageView.vue'
+import RecordPlanView from './views/RecordPlanView.vue'
 import AlarmView from './views/AlarmView.vue'
 import SystemView from './views/SystemView.vue'
 import DeviceInfoView from './views/info/DeviceInfoView.vue'
@@ -29,6 +30,7 @@ const router = createRouter({
         { path: 'settings/camera', component: VideoView },
         { path: 'settings/event/motion', component: AlarmView },
         { path: 'settings/storage', component: StorageView },
+        { path: 'settings/storage/plan', component: RecordPlanView },
         { path: 'settings/network', component: NetworkView },
         { path: 'settings/system', component: SystemView },
         { path: 'settings/system/password', component: PasswordView },

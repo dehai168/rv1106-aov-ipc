@@ -20,7 +20,7 @@
 #include "rk_mpi_sys.h"
 
 #define IVS_CHN 0
-#define VI_DETECT_CHN 2
+#define VI_DETECT_CHN 2 /* ISP third path; shared with preview-main VENC3 */
 
 typedef struct {
   int inited;
@@ -86,17 +86,64 @@ static int rect_intersect(int ax, int ay, int aw, int ah, int bx, int by, int bw
   return (ix2 > ix1 && iy2 > iy1) ? 1 : 0;
 }
 
+static int schedule_grid_valid(const char *grid)
+{
+  size_t i;
+  if (!grid || strlen(grid) != DETECT_SCHEDULE_GRID_LEN) {
+    return 0;
+  }
+  for (i = 0; i < DETECT_SCHEDULE_GRID_LEN; i++) {
+    if (grid[i] != '0' && grid[i] != '1') {
+      return 0;
+    }
+  }
+  return 1;
+}
+
+static int schedule_day_index(const struct tm *tm_now)
+{
+  /* tm_wday: 0=Sun..6=Sat → Mon=0 .. Sun=6 */
+  if (tm_now->tm_wday == 0) {
+    return 6;
+  }
+  return tm_now->tm_wday - 1;
+}
+
+void detect_schedule_sync_days_from_grid(DetectConfig *cfg)
+{
+  int d;
+  int h;
+  unsigned days = 0;
+  if (!cfg || !schedule_grid_valid(cfg->schedule_grid)) {
+    return;
+  }
+  for (d = 0; d < 7; d++) {
+    for (h = 0; h < 24; h++) {
+      if (cfg->schedule_grid[d * 24 + h] == '1') {
+        days |= 1u << d;
+        break;
+      }
+    }
+  }
+  cfg->schedule_days = days & 0x7fu;
+}
+
 static int schedule_allows_now(const DetectConfig *cfg)
 {
   time_t now = time(NULL);
   struct tm tm_now;
   int min;
+  int day_idx;
   unsigned day_bit;
   if (!cfg->schedule_enabled) {
     return 1;
   }
   localtime_r(&now, &tm_now);
-  /* tm_wday: 0=Sun..6=Sat → bit0=Mon..bit6=Sun */
+  if (schedule_grid_valid(cfg->schedule_grid)) {
+    day_idx = schedule_day_index(&tm_now);
+    return cfg->schedule_grid[day_idx * 24 + tm_now.tm_hour] == '1' ? 1 : 0;
+  }
+  /* Legacy start/end/days fallback */
   if (tm_now.tm_wday == 0) {
     day_bit = 1u << 6;
   } else {
@@ -118,15 +165,27 @@ static int schedule_allows_now(const DetectConfig *cfg)
 
 static int region_allows(const DetectConfig *cfg, const DetectEvent *ev)
 {
-  if (!cfg->region_enabled || cfg->region_w <= 0 || cfg->region_h <= 0) {
-    return 1;
+  int i;
+  int any = 0;
+  for (i = 0; i < DETECT_MAX_REGIONS; i++) {
+    const DetectRegion *r = &cfg->regions[i];
+    if (!r->enabled || r->w <= 0 || r->h <= 0) {
+      continue;
+    }
+    any = 1;
+    if (ev->rect_w <= 0 || ev->rect_h <= 0) {
+      /* no bbox from IVS: allow (area-based hit already passed) */
+      return 1;
+    }
+    if (rect_intersect(ev->rect_x, ev->rect_y, ev->rect_w, ev->rect_h, r->x, r->y, r->w,
+                       r->h)) {
+      return 1;
+    }
   }
-  if (ev->rect_w <= 0 || ev->rect_h <= 0) {
-    /* no bbox from IVS: allow (area-based hit already passed) */
-    return 1;
+  if (!any) {
+    return 1; /* no active ROI => full frame */
   }
-  return rect_intersect(ev->rect_x, ev->rect_y, ev->rect_w, ev->rect_h, cfg->region_x,
-                        cfg->region_y, cfg->region_w, cfg->region_h);
+  return 0;
 }
 
 static void take_snapshot(DetectEvent *ev)
@@ -149,8 +208,16 @@ static void fire_motion(DetectEvent *ev)
   DetectMotionCb cb;
   void *user;
   Event e;
+  int do_snap;
 
-  take_snapshot(ev);
+  pthread_mutex_lock(&g_det.lock);
+  do_snap = g_det.cfg.link_snapshot ? 1 : 0;
+  pthread_mutex_unlock(&g_det.lock);
+  if (do_snap) {
+    take_snapshot(ev);
+  } else {
+    ev->snapshot[0] = '\0';
+  }
 
   pthread_mutex_lock(&g_det.lock);
   g_det.last = *ev;
@@ -358,18 +425,27 @@ int detect_init(const DetectConfig *cfg)
   if (g_det.cfg.hit_frames <= 0) {
     g_det.cfg.hit_frames = 2;
   }
-  if (g_det.cfg.region_x < 0) {
-    g_det.cfg.region_x = 0;
+  {
+    int ri;
+    for (ri = 0; ri < DETECT_MAX_REGIONS; ri++) {
+      DetectRegion *r = &g_det.cfg.regions[ri];
+      if (r->x < 0) {
+        r->x = 0;
+      }
+      if (r->y < 0) {
+        r->y = 0;
+      }
+      if (r->w < 0) {
+        r->w = 0;
+      }
+      if (r->h < 0) {
+        r->h = 0;
+      }
+      r->enabled = r->enabled ? 1 : 0;
+    }
   }
-  if (g_det.cfg.region_y < 0) {
-    g_det.cfg.region_y = 0;
-  }
-  if (g_det.cfg.region_w < 0) {
-    g_det.cfg.region_w = 0;
-  }
-  if (g_det.cfg.region_h < 0) {
-    g_det.cfg.region_h = 0;
-  }
+  g_det.cfg.link_record = g_det.cfg.link_record ? 1 : 0;
+  g_det.cfg.link_snapshot = g_det.cfg.link_snapshot ? 1 : 0;
   if (g_det.cfg.schedule_start_min < 0) {
     g_det.cfg.schedule_start_min = 0;
   }
@@ -474,8 +550,53 @@ int detect_last_event(DetectEvent *out)
   return 0;
 }
 
+static void load_region_slot(int idx, DetectRegion *r)
+{
+  char path[64];
+  snprintf(path, sizeof(path), "detect.region%d.enabled", idx);
+  config_get_bool(path, &r->enabled, 0);
+  snprintf(path, sizeof(path), "detect.region%d.x", idx);
+  config_get_int(path, &r->x, 0);
+  snprintf(path, sizeof(path), "detect.region%d.y", idx);
+  config_get_int(path, &r->y, 0);
+  snprintf(path, sizeof(path), "detect.region%d.w", idx);
+  config_get_int(path, &r->w, 0);
+  snprintf(path, sizeof(path), "detect.region%d.h", idx);
+  config_get_int(path, &r->h, 0);
+}
+
+static int save_region_slot(int idx, const DetectRegion *r)
+{
+  char path[64];
+  if (snprintf(path, sizeof(path), "detect.region%d.enabled", idx) <= 0 ||
+      config_set_bool(path, r->enabled) != 0) {
+    return -1;
+  }
+  snprintf(path, sizeof(path), "detect.region%d.x", idx);
+  if (config_set_int(path, r->x) != 0) {
+    return -1;
+  }
+  snprintf(path, sizeof(path), "detect.region%d.y", idx);
+  if (config_set_int(path, r->y) != 0) {
+    return -1;
+  }
+  snprintf(path, sizeof(path), "detect.region%d.w", idx);
+  if (config_set_int(path, r->w) != 0) {
+    return -1;
+  }
+  snprintf(path, sizeof(path), "detect.region%d.h", idx);
+  if (config_set_int(path, r->h) != 0) {
+    return -1;
+  }
+  return 0;
+}
+
 void detect_config_load(DetectConfig *out)
 {
+  int i;
+  int any_slot = 0;
+  char grid[DETECT_SCHEDULE_GRID_LEN + 8];
+
   if (!out) {
     return;
   }
@@ -484,11 +605,22 @@ void detect_config_load(DetectConfig *out)
   config_get_int("detect.sensitivity", &out->sensitivity, 2);
   config_get_int("detect.square_pct", &out->square_pct, 8);
   config_get_int("detect.hit_frames", &out->hit_frames, 2);
-  config_get_bool("detect.region.enabled", &out->region_enabled, 0);
-  config_get_int("detect.region.x", &out->region_x, 0);
-  config_get_int("detect.region.y", &out->region_y, 0);
-  config_get_int("detect.region.w", &out->region_w, 0);
-  config_get_int("detect.region.h", &out->region_h, 0);
+
+  for (i = 0; i < DETECT_MAX_REGIONS; i++) {
+    load_region_slot(i, &out->regions[i]);
+    if (out->regions[i].enabled || out->regions[i].w > 0 || out->regions[i].h > 0) {
+      any_slot = 1;
+    }
+  }
+  /* Migrate legacy single detect.region.* into region0 when slots unused. */
+  if (!any_slot) {
+    config_get_bool("detect.region.enabled", &out->regions[0].enabled, 0);
+    config_get_int("detect.region.x", &out->regions[0].x, 0);
+    config_get_int("detect.region.y", &out->regions[0].y, 0);
+    config_get_int("detect.region.w", &out->regions[0].w, 0);
+    config_get_int("detect.region.h", &out->regions[0].h, 0);
+  }
+
   config_get_bool("detect.schedule.enabled", &out->schedule_enabled, 0);
   config_get_int("detect.schedule.start_min", &out->schedule_start_min, 0);
   config_get_int("detect.schedule.end_min", &out->schedule_end_min, 1440);
@@ -497,26 +629,57 @@ void detect_config_load(DetectConfig *out)
     config_get_int("detect.schedule.days", &days, 0x7f);
     out->schedule_days = (unsigned)days & 0x7fu;
   }
+  memset(grid, 0, sizeof(grid));
+  config_get_string("detect.schedule.grid", grid, (int)sizeof(grid), "");
+  if (schedule_grid_valid(grid)) {
+    memcpy(out->schedule_grid, grid, DETECT_SCHEDULE_GRID_LEN);
+    out->schedule_grid[DETECT_SCHEDULE_GRID_LEN] = '\0';
+  } else {
+    out->schedule_grid[0] = '\0';
+  }
+
+  config_get_bool("detect.link.record", &out->link_record, 1);
+  config_get_bool("detect.link.snapshot", &out->link_snapshot, 1);
 }
 
 int detect_config_save(const DetectConfig *cfg)
 {
+  int i;
+  DetectConfig tmp;
+
   if (!cfg) {
     return -1;
   }
-  if (config_set_bool("detect.enabled", cfg->enabled) != 0 ||
-      config_set_int("detect.sensitivity", cfg->sensitivity) != 0 ||
-      config_set_int("detect.square_pct", cfg->square_pct) != 0 ||
-      config_set_int("detect.hit_frames", cfg->hit_frames) != 0 ||
-      config_set_bool("detect.region.enabled", cfg->region_enabled) != 0 ||
-      config_set_int("detect.region.x", cfg->region_x) != 0 ||
-      config_set_int("detect.region.y", cfg->region_y) != 0 ||
-      config_set_int("detect.region.w", cfg->region_w) != 0 ||
-      config_set_int("detect.region.h", cfg->region_h) != 0 ||
-      config_set_bool("detect.schedule.enabled", cfg->schedule_enabled) != 0 ||
-      config_set_int("detect.schedule.start_min", cfg->schedule_start_min) != 0 ||
-      config_set_int("detect.schedule.end_min", cfg->schedule_end_min) != 0 ||
-      config_set_int("detect.schedule.days", (int)cfg->schedule_days) != 0 ||
+  tmp = *cfg;
+  if (schedule_grid_valid(tmp.schedule_grid)) {
+    detect_schedule_sync_days_from_grid(&tmp);
+  }
+
+  if (config_set_bool("detect.enabled", tmp.enabled) != 0 ||
+      config_set_int("detect.sensitivity", tmp.sensitivity) != 0 ||
+      config_set_int("detect.square_pct", tmp.square_pct) != 0 ||
+      config_set_int("detect.hit_frames", tmp.hit_frames) != 0) {
+    return -1;
+  }
+  for (i = 0; i < DETECT_MAX_REGIONS; i++) {
+    if (save_region_slot(i, &tmp.regions[i]) != 0) {
+      return -1;
+    }
+  }
+  /* Legacy mirror = region0 */
+  if (config_set_bool("detect.region.enabled", tmp.regions[0].enabled) != 0 ||
+      config_set_int("detect.region.x", tmp.regions[0].x) != 0 ||
+      config_set_int("detect.region.y", tmp.regions[0].y) != 0 ||
+      config_set_int("detect.region.w", tmp.regions[0].w) != 0 ||
+      config_set_int("detect.region.h", tmp.regions[0].h) != 0 ||
+      config_set_bool("detect.schedule.enabled", tmp.schedule_enabled) != 0 ||
+      config_set_int("detect.schedule.start_min", tmp.schedule_start_min) != 0 ||
+      config_set_int("detect.schedule.end_min", tmp.schedule_end_min) != 0 ||
+      config_set_int("detect.schedule.days", (int)tmp.schedule_days) != 0 ||
+      config_set_string("detect.schedule.grid",
+                        schedule_grid_valid(tmp.schedule_grid) ? tmp.schedule_grid : "") != 0 ||
+      config_set_bool("detect.link.record", tmp.link_record) != 0 ||
+      config_set_bool("detect.link.snapshot", tmp.link_snapshot) != 0 ||
       config_save() != 0) {
     return -1;
   }

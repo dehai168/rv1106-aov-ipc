@@ -13,6 +13,7 @@
 | 官方 SDK | `/home/user/work/luckfox-pico`（`LuckfoxTECH/luckfox-pico`，shallow clone） |
 | SDK commit | `824b817f8`（记录于 2026-07-16） |
 | 板型配置 | `BoardConfig-SPI_NAND-Buildroot-RV1106_Luckfox_Pico_Pro_Max-IPC.mk` |
+| 内核 fragment（AOV） | `RK_KERNEL_DEFCONFIG_FRAGMENT="rv1106-pm.config"`（2026-07-27 起启用 SUSPEND） |
 | 说明 | 仓库内板名是 `Pro_Max`，对应硬件 Luckfox Pico Max（SPI NAND + Buildroot） |
 
 ## 交叉编译工具链
@@ -106,4 +107,15 @@ sudo apt-get install -y git ssh make gcc gcc-multilib g++-multilib module-assist
 1. WSL 从 PowerShell 传命令时 `$VAR` 易被展开，复杂操作写成 `scripts/*.sh` 再 `wsl -u user -- bash /mnt/d/.../scripts/xxx.sh`。
 2. `./build.sh` 对 PATH 中空格敏感，交叉编译前用干净 PATH（见上）。
 3. 板上默认 `rkipc` 占用 VI；跑自研/例程前需 `killall rkipc`，测完恢复。
-4. 完整固件烧录属高危操作，T0.1 未做，仅应用层 adb push。
+4. 完整固件烧录属高危操作；AOV 内核刷写见下方。
+
+## AOV 内核刷写（T6.3，2026-07-27）
+
+| 项 | 值 |
+|---|---|
+| 运行内核 | `5.10.160 #1 Mon Jul 27 13:25:38 CST 2026`，`/sys/power/state`=`freeze mem` |
+| fragment | `rv1106-pm.config` + `CONFIG_ROCKCHIP_GRF=y` |
+| boot 分区 | `/dev/mtd3`（`flash_erase` + `nandwrite -p`） |
+| 主机产物 | `build/firmware/boot-aov-pm.img`、`boot-stock-no-suspend.img`、`ko-aov-pm/` |
+| 注意 | **必须同步** `/oem/usr/ko` 媒体相关 `.ko`；否则 CSI 报 `Can't find GRF syscon` |
+| 软复位 | 若 `reboot` 挂死：`io -4 -w 0xff3b0c08 0xfdb9` |

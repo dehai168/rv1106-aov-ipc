@@ -1,3 +1,4 @@
+#include "aov/aov_service.h"
 #include "common/event_bus.h"
 #include "common/log.h"
 #include "detect/detect_service.h"
@@ -259,6 +260,44 @@ static int run_encode(int seconds)
     return 4;
   }
   log_info("main", "encode ok");
+  log_close();
+  return 0;
+}
+
+/* One-shot hardware JPEG via VENC combo (for board verify without Web auth). */
+static int run_snapshot(const char *path)
+{
+  char level_str[32];
+  char iq_dir[256];
+  MediaEncodeConfig ecfg;
+  int ret;
+
+  log_init_ex(LOG_LEVEL_INFO, LOG_DIR);
+  if (app_config_init() != 0) {
+    log_error("main", "config_init failed");
+    return 1;
+  }
+  config_get_string("log.level", level_str, (int)sizeof(level_str), "info");
+  log_set_level(parse_level(level_str));
+  load_encode_cfg(&ecfg, iq_dir, (int)sizeof(iq_dir));
+
+  log_info("main", "snapshot start -> %s", path);
+  if (media_stream_start(&ecfg) != 0) {
+    log_error("main", "stream_start failed");
+    app_config_fini();
+    log_close();
+    return 2;
+  }
+  sleep(2);
+  ret = media_snapshot_jpeg(path);
+  media_stream_stop();
+  app_config_fini();
+  if (ret != 0) {
+    log_error("main", "snapshot failed %d", ret);
+    log_close();
+    return 3;
+  }
+  log_info("main", "snapshot ok -> %s", path);
   log_close();
   return 0;
 }
@@ -664,8 +703,10 @@ static int run_web(int seconds)
     log_close();
     return 1;
   }
+  aov_init();
   if (web_init(&wcfg) != 0 || web_start() != 0) {
     log_error("main", "web start failed");
+    aov_deinit();
     event_bus_deinit();
     app_config_fini();
     log_close();
@@ -684,12 +725,132 @@ static int run_web(int seconds)
   }
 
   web_deinit();
+  aov_deinit();
   event_bus_deinit();
   storage_deinit();
   app_config_fini();
   log_info("main", "web exit");
   log_close();
   return 0;
+}
+
+static int run_aov_cli(int argc, char **argv)
+{
+  AovStatus st;
+  const char *cmd = (argc > 2) ? argv[2] : "status";
+  int loop_n = 5;
+  int with_media = 0;
+  int media_started = 0;
+  int record_started = 0;
+  int rc = 0;
+  char iq_dir[256];
+  MediaEncodeConfig ecfg;
+  RecordConfig rcfg;
+
+  log_init_ex(LOG_LEVEL_INFO, LOG_DIR);
+  if (app_config_init() != 0) {
+    log_error("aov", "config_init failed");
+    return 1;
+  }
+  event_bus_init();
+  storage_init(NULL);
+  aov_init();
+
+  if (strcmp(cmd, "loop") == 0) {
+    if (argc > 3) {
+      loop_n = atoi(argv[3]);
+      if (loop_n <= 0) {
+        loop_n = 5;
+      }
+    }
+    if (argc > 4 && strcmp(argv[4], "--media") == 0) {
+      with_media = 1;
+    }
+    if (with_media) {
+      int event_fps = 25;
+      load_encode_cfg(&ecfg, iq_dir, (int)sizeof(iq_dir));
+      config_get_int("aov.event_fps", &event_fps, 25);
+      /* Keep encode hot at event fps — AOV apply/reinit to bump fps often yields 0 packs. */
+      ecfg.main_fps = event_fps > 0 ? event_fps : 25;
+      ecfg.sub_fps = 15;
+      if (ecfg.main_gop < ecfg.main_fps * 2) {
+        ecfg.main_gop = ecfg.main_fps * 2;
+      }
+      if (media_stream_start(&ecfg) != 0) {
+        log_error("aov", "media_stream_start failed");
+        rc = 1;
+        goto out;
+      }
+      media_started = 1;
+      aov_set_lapse_jpeg(1);
+      memset(&rcfg, 0, sizeof(rcfg));
+      config_get_int("record.segment_sec", &rcfg.segment_sec, 30);
+      config_get_int("record.recycle_free_percent", &rcfg.recycle_free_percent, 10);
+      config_get_int("record.pre_record_sec", &rcfg.pre_record_sec, 4);
+      config_get_int("aov.quiet_sec", &rcfg.quiet_sec, 30);
+      if (rcfg.quiet_sec > 30) {
+        rcfg.quiet_sec = 30;
+      }
+      rcfg.main_w = ecfg.main_w;
+      rcfg.main_h = ecfg.main_h;
+      rcfg.main_fps = ecfg.main_fps;
+      rcfg.main_bitrate_kbps = ecfg.main_bitrate_kbps;
+      if (record_init(&rcfg) != 0 || record_arm_motion() != 0) {
+        log_error("aov", "record arm failed");
+        media_stream_stop();
+        rc = 1;
+        goto out;
+      }
+      record_started = 1;
+      aov_bind_media_loop(&ecfg, &rcfg);
+      log_info("aov", "loop with media (lapse jpg + motion record)");
+    }
+    if (aov_run_lapse_loop(loop_n) != 0) {
+      rc = 1;
+    }
+    if (media_started) {
+      if (record_started) {
+        record_deinit();
+      }
+      media_stream_stop();
+    }
+    goto out;
+  }
+
+  if (strcmp(cmd, "enter") == 0) {
+    if (aov_enter() != 0) {
+      rc = 1;
+    }
+  } else if (strcmp(cmd, "leave") == 0) {
+    if (aov_leave() != 0) {
+      rc = 1;
+    }
+  } else if (strcmp(cmd, "probe") == 0) {
+    if (aov_probe_once() != 0) {
+      log_error("aov", "probe_once failed");
+      aov_get_status(&st);
+      log_info("aov", "state=%s fail=%lu", aov_state_name(st.state), st.sleep_fail);
+      rc = 1;
+    }
+  } else if (strcmp(cmd, "status") != 0) {
+    fprintf(stderr, "usage: ipc_app --aov [status|enter|leave|probe|loop N [--media]]\n");
+    fprintf(stderr, "       ipc_app --aov-probe\n");
+    rc = 1;
+    goto out;
+  }
+
+out:
+  aov_get_status(&st);
+  printf("aov in=%d state=%s wake=%s cycles=%lu lapse=%lu events=%lu fail=%lu reinit=%lu wake_ms=%d\n",
+         st.in_aov, aov_state_name(st.state), aov_wake_name(st.last_wake), st.cycles,
+         st.lapse_frames, st.event_records, st.sleep_fail, st.media_reinit, st.last_wake_ms);
+
+  aov_deinit();
+  storage_deinit();
+  event_bus_deinit();
+  app_config_fini();
+  log_close();
+  return rc;
 }
 
 static int run_normal(void)
@@ -723,6 +884,10 @@ int main(int argc, char **argv)
     }
     return run_encode(seconds);
   }
+  if (argc > 1 && strcmp(argv[1], "--snapshot") == 0) {
+    const char *path = (argc > 2 && argv[2][0]) ? argv[2] : "/mnt/sdcard/snapshots/cli_snap.jpg";
+    return run_snapshot(path);
+  }
   if (argc > 1 && strcmp(argv[1], "--reconfig") == 0) {
     return run_reconfig();
   }
@@ -752,6 +917,13 @@ int main(int argc, char **argv)
       seconds = atoi(argv[2]);
     }
     return run_web(seconds);
+  }
+  if (argc > 1 && (strcmp(argv[1], "--aov") == 0 || strcmp(argv[1], "--aov-probe") == 0)) {
+    if (strcmp(argv[1], "--aov-probe") == 0) {
+      char *fake_argv[] = {argv[0], "--aov", "probe", NULL};
+      return run_aov_cli(3, fake_argv);
+    }
+    return run_aov_cli(argc, argv);
   }
   return run_normal();
 }

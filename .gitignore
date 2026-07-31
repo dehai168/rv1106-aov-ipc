@@ -24,3 +24,9 @@ Thumbs.db
 # Local env
 .env
 .env.*
+
+# Local smoke dumps at repo root
+/*.mp4
+/*.jpg
+/*.jpeg
+/*.png

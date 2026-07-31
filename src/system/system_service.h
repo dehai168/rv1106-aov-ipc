@@ -29,7 +29,17 @@ typedef struct {
   char ntp_server[SYSTEM_NTP_SERVER_MAX];
 } SystemTimeConfig;
 
+#define SYSTEM_REBOOT_DAYS_LEN 7
+
+typedef struct {
+  int enabled;
+  int hour;   /* 0-23 */
+  int minute; /* 0-59 */
+  char days[SYSTEM_REBOOT_DAYS_LEN + 1]; /* Sun..Sat, '0'/'1' */
+} SystemRebootSchedule;
+
 int system_get_info(SystemInfo *out);
+int system_set_device_name(const char *name);
 int system_get_time(SystemTimeConfig *out);
 int system_set_time(const SystemTimeConfig *in, int apply_ntp);
 
@@ -45,6 +55,14 @@ int system_factory_reset(void);
 
 /* Resolve whitelisted log file under log dir. Returns 0 on success. */
 int system_log_path(const char *name, char *out, int out_len);
+
+/* Read last `max_lines` lines into out (NUL-terminated, may truncate). */
+int system_log_tail(const char *name, int max_lines, char *out, int out_len);
+
+int system_reboot_schedule_get(SystemRebootSchedule *out);
+int system_reboot_schedule_set(const SystemRebootSchedule *in);
+/* Poll once per call; triggers reboot at most once per local day when matched. */
+void system_reboot_schedule_tick(void);
 
 #ifdef __cplusplus
 }

@@ -245,6 +245,29 @@ int system_get_info(SystemInfo *out)
   return 0;
 }
 
+int system_set_device_name(const char *name)
+{
+  size_t i;
+  size_t n;
+  if (!name) {
+    return -1;
+  }
+  n = strlen(name);
+  if (n < 1 || n > 32) {
+    return -2;
+  }
+  for (i = 0; i < n; i++) {
+    unsigned char c = (unsigned char)name[i];
+    if (c < 0x20 || c == 0x7f) {
+      return -3;
+    }
+  }
+  if (config_set_string("device.name", name) != 0 || config_save() != 0) {
+    return -4;
+  }
+  return 0;
+}
+
 int system_get_time(SystemTimeConfig *out)
 {
   if (!out) {
@@ -341,4 +364,178 @@ int system_log_path(const char *name, char *out, int out_len)
     return -3;
   }
   return 0;
+}
+
+int system_log_tail(const char *name, int max_lines, char *out, int out_len)
+{
+  char path[512];
+  FILE *fp;
+  long sz;
+  size_t cap;
+  char *buf = NULL;
+  char *p;
+  int lines;
+  int i;
+
+  if (!out || out_len <= 1) {
+    return -1;
+  }
+  out[0] = '\0';
+  if (max_lines <= 0) {
+    max_lines = 100;
+  }
+  if (max_lines > 500) {
+    max_lines = 500;
+  }
+  if (system_log_path(name, path, (int)sizeof(path)) != 0) {
+    return -2;
+  }
+  fp = fopen(path, "rb");
+  if (!fp) {
+    return -3;
+  }
+  if (fseek(fp, 0, SEEK_END) != 0) {
+    fclose(fp);
+    return -4;
+  }
+  sz = ftell(fp);
+  if (sz < 0) {
+    fclose(fp);
+    return -4;
+  }
+  cap = (size_t)sz;
+  if (cap > 256 * 1024) {
+    cap = 256 * 1024;
+  }
+  if (fseek(fp, (long)((size_t)sz > cap ? (size_t)sz - cap : 0), SEEK_SET) != 0) {
+    fclose(fp);
+    return -4;
+  }
+  buf = (char *)malloc(cap + 1);
+  if (!buf) {
+    fclose(fp);
+    return -5;
+  }
+  {
+    size_t nread = fread(buf, 1, cap, fp);
+    fclose(fp);
+    buf[nread] = '\0';
+    cap = nread;
+  }
+  /* Count lines from end; start after first incomplete line if truncated. */
+  p = buf;
+  if ((size_t)sz > cap && cap > 0) {
+    char *nl = strchr(buf, '\n');
+    if (nl) {
+      p = nl + 1;
+    }
+  }
+  lines = 0;
+  for (i = (int)strlen(p) - 1; i >= 0; i--) {
+    if (p[i] == '\n') {
+      lines++;
+      if (lines >= max_lines) {
+        p = &p[i + 1];
+        break;
+      }
+    }
+  }
+  snprintf(out, (size_t)out_len, "%s", p);
+  free(buf);
+  return 0;
+}
+
+static int reboot_days_valid(const char *days)
+{
+  size_t i;
+  if (!days || strlen(days) != SYSTEM_REBOOT_DAYS_LEN) {
+    return 0;
+  }
+  for (i = 0; i < SYSTEM_REBOOT_DAYS_LEN; i++) {
+    if (days[i] != '0' && days[i] != '1') {
+      return 0;
+    }
+  }
+  return 1;
+}
+
+int system_reboot_schedule_get(SystemRebootSchedule *out)
+{
+  char days[16];
+  if (!out) {
+    return -1;
+  }
+  memset(out, 0, sizeof(*out));
+  config_get_bool("system.reboot_schedule.enabled", &out->enabled, 0);
+  config_get_int("system.reboot_schedule.hour", &out->hour, 3);
+  config_get_int("system.reboot_schedule.minute", &out->minute, 30);
+  config_get_string("system.reboot_schedule.days", days, (int)sizeof(days), "1111111");
+  if (!reboot_days_valid(days)) {
+    snprintf(days, sizeof(days), "1111111");
+  }
+  snprintf(out->days, sizeof(out->days), "%.7s", days);
+  if (out->hour < 0 || out->hour > 23) {
+    out->hour = 3;
+  }
+  if (out->minute < 0 || out->minute > 59) {
+    out->minute = 30;
+  }
+  return 0;
+}
+
+int system_reboot_schedule_set(const SystemRebootSchedule *in)
+{
+  SystemRebootSchedule cfg;
+  if (!in) {
+    return -1;
+  }
+  cfg = *in;
+  if (cfg.hour < 0 || cfg.hour > 23 || cfg.minute < 0 || cfg.minute > 59) {
+    return -2;
+  }
+  if (!reboot_days_valid(cfg.days)) {
+    return -3;
+  }
+  if (config_set_bool("system.reboot_schedule.enabled", cfg.enabled ? 1 : 0) != 0 ||
+      config_set_int("system.reboot_schedule.hour", cfg.hour) != 0 ||
+      config_set_int("system.reboot_schedule.minute", cfg.minute) != 0 ||
+      config_set_string("system.reboot_schedule.days", cfg.days) != 0 || config_save() != 0) {
+    return -4;
+  }
+  return 0;
+}
+
+void system_reboot_schedule_tick(void)
+{
+  static int last_ymd = -1;
+  static int fired_ymd = -1;
+  SystemRebootSchedule cfg;
+  time_t now;
+  struct tm tm_now;
+  int ymd;
+  int wday;
+
+  if (system_reboot_schedule_get(&cfg) != 0 || !cfg.enabled) {
+    return;
+  }
+  now = time(NULL);
+  localtime_r(&now, &tm_now);
+  ymd = (tm_now.tm_year + 1900) * 10000 + (tm_now.tm_mon + 1) * 100 + tm_now.tm_mday;
+  if (ymd == last_ymd && tm_now.tm_sec > 5) {
+    /* cheap throttle: only evaluate near minute boundary after first check */
+  }
+  last_ymd = ymd;
+  if (tm_now.tm_hour != cfg.hour || tm_now.tm_min != cfg.minute) {
+    return;
+  }
+  wday = tm_now.tm_wday; /* 0=Sun */
+  if (cfg.days[wday] != '1') {
+    return;
+  }
+  if (fired_ymd == ymd) {
+    return;
+  }
+  fired_ymd = ymd;
+  log_warn("system", "reboot_schedule matched %02d:%02d wday=%d", cfg.hour, cfg.minute, wday);
+  (void)system_reboot();
 }

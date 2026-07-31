@@ -322,10 +322,13 @@ static int apply_cfg(const NetworkConfig *cfg)
   run_cmd(cmd);
 
   if (strcmp(cfg->mode, "dhcp") == 0) {
-    snprintf(cmd, sizeof(cmd), "udhcpc -i %s -n -q -t 5 -A 1", cfg->iface);
+    /* No coreutils timeout on board; background + kill to avoid udhcpc spin. */
+    snprintf(cmd, sizeof(cmd),
+             "udhcpc -i %s -n -q -t 3 -A 1 >/dev/null 2>&1 & pid=$!; "
+             "sleep 4; kill $pid 2>/dev/null; wait $pid 2>/dev/null; true",
+             cfg->iface);
     if (run_cmd(cmd) != 0) {
-      log_warn("network", "udhcpc failed (link may be down)");
-      /* still ok to keep config; cable may be unplugged */
+      log_warn("network", "udhcpc failed/timeout (link may be down)");
     }
   } else {
     pref = mask_to_prefix(cfg->netmask);
@@ -415,4 +418,132 @@ int network_apply(void)
     snprintf(cfg.mode, sizeof(cfg.mode), "dhcp");
   }
   return apply_cfg(&cfg);
+}
+
+int network_set_link_down(const char *iface)
+{
+  char cmd[128];
+  if (!iface || !iface[0]) {
+    iface = IFACE_DEFAULT;
+  }
+  snprintf(cmd, sizeof(cmd), "ip link set %s down", iface);
+  if (system(cmd) != 0) {
+    log_warn("network", "%s failed", cmd);
+    return -1;
+  }
+  log_info("network", "%s down (AOV)", iface);
+  return 0;
+}
+
+#define GMAC_PLAT "ffa80000.ethernet"
+#define GMAC_DRV_UNBIND "/sys/bus/platform/drivers/rk_gmac-dwmac/unbind"
+#define GMAC_DRV_BIND "/sys/bus/platform/drivers/rk_gmac-dwmac/bind"
+#define GMAC_WAKE "/sys/devices/platform/" GMAC_PLAT "/power/wakeup"
+
+static int g_gmac_unbound;
+static int g_gmac_wake_was_enabled;
+
+static int write_sysfs_str(const char *path, const char *val)
+{
+  FILE *fp = fopen(path, "w");
+  if (!fp) {
+    return -1;
+  }
+  if (fputs(val, fp) < 0) {
+    fclose(fp);
+    return -1;
+  }
+  if (fclose(fp) != 0) {
+    return -1;
+  }
+  return 0;
+}
+
+int network_prepare_aov_suspend(void)
+{
+  char wake[32];
+  FILE *fp;
+
+  g_gmac_unbound = 0;
+  g_gmac_wake_was_enabled = 0;
+
+  /* 1) Ensure eth wakeup is off so PM path can power down FE-PHY */
+  fp = fopen(GMAC_WAKE, "r");
+  if (fp) {
+    if (fgets(wake, sizeof(wake), fp)) {
+      if (strncmp(wake, "enabled", 7) == 0) {
+        g_gmac_wake_was_enabled = 1;
+      }
+    }
+    fclose(fp);
+  }
+  if (write_sysfs_str(GMAC_WAKE, "disabled") == 0) {
+    log_info("network", "gmac wakeup disabled (FE-PHY)");
+  }
+
+  /* 2) Link down */
+  network_set_link_down("eth0");
+
+  /* 3) Unbind GMAC → rk_gmac_remove → rk_gmac_powerdown → FEPHY SHUTDOWN */
+  if (access("/sys/bus/platform/drivers/rk_gmac-dwmac/" GMAC_PLAT, F_OK) == 0) {
+    if (write_sysfs_str(GMAC_DRV_UNBIND, GMAC_PLAT) != 0) {
+      log_warn("network", "gmac unbind failed (continue with link down only)");
+      return 0;
+    }
+    g_gmac_unbound = 1;
+    log_info("network", "unbound %s (FE-PHY powered down)", GMAC_PLAT);
+  } else {
+    log_info("network", "gmac already unbound or missing");
+  }
+  return 0;
+}
+
+int network_resume_from_aov(void)
+{
+  /* During AOV sleep cycles keep FE-PHY/gmac unbound.
+   * Rebind + network_apply happen in network_restore_after_aov() on leave. */
+  if (g_gmac_unbound) {
+    log_info("network", "AOV wake: keep gmac unbound (FE-PHY off until leave)");
+  }
+  return 0;
+}
+
+int network_restore_after_aov(void)
+{
+  int i;
+  int need_bind = g_gmac_unbound;
+
+  /* After soak process exit, a new process has g_gmac_unbound=0 but eth0 may
+   * still be missing — detect and rebind anyway. */
+  if (!need_bind && access("/sys/class/net/eth0", F_OK) != 0 &&
+      access("/sys/bus/platform/drivers/rk_gmac-dwmac/" GMAC_PLAT, F_OK) != 0) {
+    need_bind = 1;
+    log_info("network", "eth0 missing after AOV, force gmac bind");
+  }
+
+  if (need_bind) {
+    if (write_sysfs_str(GMAC_DRV_BIND, GMAC_PLAT) != 0) {
+      log_error("network", "gmac bind failed");
+      return -1;
+    }
+    g_gmac_unbound = 0;
+    log_info("network", "bound %s (leave AOV)", GMAC_PLAT);
+    for (i = 0; i < 50; i++) {
+      if (access("/sys/class/net/eth0", F_OK) == 0) {
+        break;
+      }
+      usleep(100 * 1000);
+    }
+  }
+
+  if (g_gmac_wake_was_enabled) {
+    write_sysfs_str(GMAC_WAKE, "enabled");
+    g_gmac_wake_was_enabled = 0;
+  }
+
+  /* Link up only — defer DHCP to explicit network_apply / --web to avoid hang. */
+  if (access("/sys/class/net/eth0", F_OK) == 0) {
+    system("ip link set eth0 up >/dev/null 2>&1");
+  }
+  return 0;
 }

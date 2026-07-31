@@ -143,6 +143,7 @@ function goTop(tab: string) {
               <el-icon><FolderOpened /></el-icon>
               <span>存储</span>
             </template>
+            <el-menu-item index="/settings/storage/plan">录像计划</el-menu-item>
             <el-menu-item index="/settings/storage">存储与回放</el-menu-item>
           </el-sub-menu>
           <el-menu-item index="/settings/network">

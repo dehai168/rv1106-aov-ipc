@@ -3,19 +3,23 @@ import { onMounted, ref } from 'vue'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import {
   formatStorage,
+  getRecordConfig,
   getStorageRecords,
   getStorageStatus,
+  setRecordConfig,
   type StorageRecord,
   type StorageStatus,
 } from '../api'
 
 const loading = ref(true)
 const formatting = ref(false)
+const savingRecycle = ref(false)
 const status = ref<StorageStatus | null>(null)
 const records = ref<StorageRecord[]>([])
 const date = ref('')
 const limit = ref(100)
 const playing = ref<StorageRecord | null>(null)
+const recyclePct = ref(10)
 
 function downloadUrl(relPath: string) {
   return `/api/v1/storage/download?path=${encodeURIComponent(relPath)}`
@@ -24,19 +28,38 @@ function downloadUrl(relPath: string) {
 async function refresh() {
   loading.value = true
   try {
-    const [st, rs] = await Promise.all([
+    const [st, rs, rc] = await Promise.all([
       getStorageStatus(),
       getStorageRecords({ date: date.value || undefined, limit: limit.value }),
+      getRecordConfig(),
     ])
     if (st.code !== 0) throw new Error(st.msg || '读取存储状态失败')
     if (rs.code !== 0) throw new Error(rs.msg || '读取录像列表失败')
     status.value = st.data
     records.value = rs.data.records
     playing.value = records.value[0] ?? null
+    if (rc.code === 0) recyclePct.value = rc.data.recycle_free_percent
   } catch (e) {
     ElMessage.error(String(e))
   } finally {
     loading.value = false
+  }
+}
+
+async function onSaveRecycle() {
+  savingRecycle.value = true
+  try {
+    const r = await setRecordConfig({ recycle_free_percent: recyclePct.value, apply: true })
+    if (r.code !== 0) {
+      ElMessage.error(r.msg || '保存失败')
+      return
+    }
+    recyclePct.value = r.data.recycle_free_percent
+    ElMessage.success('回收水位已保存')
+  } catch (e) {
+    ElMessage.error(String(e))
+  } finally {
+    savingRecycle.value = false
   }
 }
 
@@ -92,8 +115,16 @@ onMounted(refresh)
                 : '-'
             }}
           </p>
+          <el-form label-width="120px" class="recycle-form">
+            <el-form-item label="回收水位(%)">
+              <el-space>
+                <el-input-number v-model="recyclePct" :min="5" :max="90" />
+                <el-button :loading="savingRecycle" @click="onSaveRecycle">保存</el-button>
+              </el-space>
+            </el-form-item>
+          </el-form>
           <el-button type="danger" plain :loading="formatting" @click="onFormat">清空录像/抓图/告警</el-button>
-          <p class="tip">软格式化：删除文件，不执行 mkfs。</p>
+          <p class="tip">软格式化：删除文件，不执行 mkfs。录像模式见「录像计划」。</p>
         </el-card>
       </el-col>
       <el-col :xs="24" :md="12">

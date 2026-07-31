@@ -4,6 +4,7 @@
 
 #include <dirent.h>
 #include <errno.h>
+#include <fcntl.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -20,6 +21,10 @@ static char g_mount[128] = "/mnt/sdcard";
 static char g_records[160] = "/mnt/sdcard/records";
 static char g_snapshots[160] = "/mnt/sdcard/snapshots";
 static int g_ready = 0;
+static int g_suspend_active;
+static char g_sd_dev[64];
+static char g_sd_driver_path[256];
+static char g_sd_device_name[128];
 
 static int ensure_dir(const char *path)
 {
@@ -335,6 +340,202 @@ static int wipe_tree_files(const char *dir, int *deleted)
   }
   closedir(dp);
   return 0;
+}
+
+static int find_sd_bind_info(void)
+{
+  FILE *fp;
+  char line[512];
+  char dev[64], mnt[128], fstype[64];
+  char syspath[256];
+  char link[256];
+  ssize_t n;
+
+  g_sd_dev[0] = '\0';
+  g_sd_driver_path[0] = '\0';
+  g_sd_device_name[0] = '\0';
+
+  fp = fopen("/proc/mounts", "r");
+  if (!fp) {
+    return -1;
+  }
+  while (fgets(line, sizeof(line), fp)) {
+    if (sscanf(line, "%63s %127s %63s", dev, mnt, fstype) != 3) {
+      continue;
+    }
+    if (strcmp(mnt, g_mount) != 0) {
+      continue;
+    }
+    snprintf(g_sd_dev, sizeof(g_sd_dev), "%s", dev);
+    break;
+  }
+  fclose(fp);
+  if (!g_sd_dev[0]) {
+    return -1;
+  }
+
+  /* /dev/mmcblk1p1 -> /sys/class/block/mmcblk1p1 -> ../../devices/.../mmc_host/... */
+  {
+    const char *base = strrchr(g_sd_dev, '/');
+    base = base ? base + 1 : g_sd_dev;
+    snprintf(syspath, sizeof(syspath), "/sys/class/block/%s", base);
+  }
+  n = readlink(syspath, link, sizeof(link) - 1);
+  if (n <= 0) {
+    log_warn("storage", "readlink %s failed", syspath);
+    return 0; /* still allow umount-only */
+  }
+  link[n] = '\0';
+
+  /* Walk up to find platform device bound to dwmmc / sdhci */
+  {
+    char path[512];
+    char *p;
+    snprintf(path, sizeof(path), "/sys/class/block/%s", strrchr(g_sd_dev, '/') + 1);
+    /* Resolve real path via /sys/class/block/mmcblk1 (parent of partition) */
+    {
+      char parent[64];
+      const char *bn = strrchr(g_sd_dev, '/') + 1;
+      snprintf(parent, sizeof(parent), "%s", bn);
+      /* strip partition suffix pN */
+      p = parent;
+      while (*p && !(*p == 'p' && p > parent && p[1] >= '0' && p[1] <= '9')) {
+        p++;
+      }
+      if (*p == 'p') {
+        *p = '\0';
+      }
+      snprintf(syspath, sizeof(syspath), "/sys/block/%s/device", parent);
+      n = readlink(syspath, link, sizeof(link) - 1);
+      if (n > 0) {
+        link[n] = '\0';
+        /* device -> ../../../ffa90000.mmc or similar */
+        p = strrchr(link, '/');
+        if (p) {
+          snprintf(g_sd_device_name, sizeof(g_sd_device_name), "%s", p + 1);
+        }
+      }
+    }
+  }
+
+  if (g_sd_device_name[0]) {
+    /* Prefer dwmmc_rockchip driver unbind path */
+    const char *drivers[] = {
+        "/sys/bus/platform/drivers/dwmmc_rockchip",
+        "/sys/bus/platform/drivers/rockchip-dw-mshc",
+        NULL};
+    int i;
+    for (i = 0; drivers[i]; i++) {
+      char bindpath[320];
+      snprintf(bindpath, sizeof(bindpath), "%s/%s", drivers[i], g_sd_device_name);
+      if (access(bindpath, F_OK) == 0) {
+        snprintf(g_sd_driver_path, sizeof(g_sd_driver_path), "%s", drivers[i]);
+        break;
+      }
+    }
+  }
+  return 0;
+}
+
+static int write_sysfs(const char *path, const char *val)
+{
+  int fd = open(path, O_WRONLY);
+  if (fd < 0) {
+    return -1;
+  }
+  if (write(fd, val, strlen(val)) < 0) {
+    close(fd);
+    return -1;
+  }
+  close(fd);
+  return 0;
+}
+
+int storage_prepare_suspend(void)
+{
+  char cmd[512];
+  StorageStatus st;
+
+  if (!g_ready) {
+    return -1;
+  }
+  if (g_suspend_active) {
+    return 0;
+  }
+
+  find_sd_bind_info();
+  if (storage_get_status(&st) == 0 && st.mounted) {
+    snprintf(cmd, sizeof(cmd), "umount %s", g_mount);
+    if (system(cmd) != 0) {
+      /* Lazy umount if busy (e.g. brief open fds); required for AOV mem path */
+      snprintf(cmd, sizeof(cmd), "umount -l %s", g_mount);
+      if (system(cmd) != 0) {
+        log_error("storage", "umount %s failed", g_mount);
+        return -1;
+      }
+      log_warn("storage", "umount -l %s (was busy)", g_mount);
+    } else {
+      log_info("storage", "umount %s ok", g_mount);
+    }
+  }
+
+  if (g_sd_driver_path[0] && g_sd_device_name[0]) {
+    char unbind[320];
+    snprintf(unbind, sizeof(unbind), "%s/unbind", g_sd_driver_path);
+    if (write_sysfs(unbind, g_sd_device_name) != 0) {
+      log_warn("storage", "unbind %s failed (continue)", g_sd_device_name);
+    } else {
+      log_info("storage", "unbind %s from %s", g_sd_device_name, g_sd_driver_path);
+    }
+  }
+
+  g_suspend_active = 1;
+  return 0;
+}
+
+int storage_resume_from_suspend(void)
+{
+  char cmd[512];
+  StorageStatus st;
+  int i;
+
+  if (!g_ready) {
+    return -1;
+  }
+  if (!g_suspend_active) {
+    /* Idempotent: ensure mounted */
+    if (storage_get_status(&st) == 0 && st.mounted) {
+      return 0;
+    }
+  }
+
+  if (g_sd_driver_path[0] && g_sd_device_name[0]) {
+    char bind[320];
+    snprintf(bind, sizeof(bind), "%s/bind", g_sd_driver_path);
+    write_sysfs(bind, g_sd_device_name);
+    log_info("storage", "bind %s", g_sd_device_name);
+  }
+
+  for (i = 0; i < 30; i++) {
+    if (g_sd_dev[0]) {
+      snprintf(cmd, sizeof(cmd), "mount -t exfat %s %s 2>/dev/null || mount %s %s", g_sd_dev,
+               g_mount, g_sd_dev, g_mount);
+    } else {
+      snprintf(cmd, sizeof(cmd), "mount /dev/mmcblk1p1 %s 2>/dev/null || mount /dev/mmcblk0p1 %s",
+               g_mount, g_mount);
+    }
+    system(cmd);
+    if (storage_get_status(&st) == 0 && st.mounted) {
+      storage_ensure_dirs();
+      g_suspend_active = 0;
+      log_info("storage", "remount %s ok", g_mount);
+      return 0;
+    }
+    usleep(100 * 1000);
+  }
+
+  log_error("storage", "remount %s failed", g_mount);
+  return -1;
 }
 
 int storage_format_clear(void)

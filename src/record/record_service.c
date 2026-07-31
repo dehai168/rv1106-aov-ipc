@@ -3,6 +3,7 @@
 #include "common/event_bus.h"
 #include "common/log.h"
 #include "media/media_service.h"
+#include "system/config_service.h"
 #include "system/storage_service.h"
 
 #include "rkmuxer.h"
@@ -19,6 +20,7 @@
 #define MUXER_ID 0
 #define RING_CAP 96
 #define RING_BYTES_MAX (3 * 1024 * 1024)
+#define WQ_CAP 96
 
 typedef struct {
   uint8_t *data;
@@ -29,19 +31,40 @@ typedef struct {
 } RingPkt;
 
 typedef struct {
+  uint8_t *data;
+  uint32_t len;
+  int key;
+  int64_t pts;
+} WqPkt;
+
+typedef struct {
   int inited;
   RecordMode mode;
   int waiting_key;
   int muxer_open;
+  int mux_closing;
+  int mux_writing;
+  int seg_active;
   int flushing_prerecord;
   RecordConfig cfg;
-  char cur_path[512];
+  char cur_path[512];   /* final destination on TF */
+  char stage_path[512]; /* /tmp staging file while muxing */
   time_t seg_start;
+  int64_t seg_mono_us;  /* pacing clock after open / prerecord flush */
+  int64_t mux_idx;      /* frames accepted into mux queue this segment */
+  int64_t mux_idx_base; /* mux_idx after prerecord; live pacing origin */
   time_t run_deadline;  /* continuous mode */
   time_t quiet_deadline; /* motion mode */
   pthread_mutex_t lock;
+  pthread_cond_t wq_cond;
+  pthread_t writer_th;
+  int writer_run;
+  int writer_started;
+  WqPkt wq[WQ_CAP];
+  int wq_count;
   int segments;
   int frames;
+  int seg_frames;
   int listener_added;
   RingPkt ring[RING_CAP];
   int ring_count;
@@ -50,7 +73,15 @@ typedef struct {
 
 static RecordCtx g_rec = {
     .lock = PTHREAD_MUTEX_INITIALIZER,
+    .wq_cond = PTHREAD_COND_INITIALIZER,
 };
+
+static int64_t mono_us(void)
+{
+  struct timespec ts;
+  clock_gettime(CLOCK_MONOTONIC, &ts);
+  return (int64_t)ts.tv_sec * 1000000LL + (int64_t)ts.tv_nsec / 1000LL;
+}
 
 static int ensure_day_dir(char *day_dir, size_t n, const struct tm *tm)
 {
@@ -146,6 +177,130 @@ static int ring_push_locked(const uint8_t *data, uint32_t len, int key, int64_t 
   return 0;
 }
 
+static void wq_clear_locked(void)
+{
+  int i;
+  for (i = 0; i < g_rec.wq_count; i++) {
+    free(g_rec.wq[i].data);
+    g_rec.wq[i].data = NULL;
+  }
+  g_rec.wq_count = 0;
+}
+
+static int promote_stage_to_final(const char *stage, const char *final_path)
+{
+  FILE *in;
+  FILE *out;
+  char buf[8192];
+  size_t n;
+  int rc = 0;
+
+  in = fopen(stage, "rb");
+  if (!in) {
+    log_error("record", "open stage %s failed", stage);
+    return -1;
+  }
+  out = fopen(final_path, "wb");
+  if (!out) {
+    log_error("record", "open final %s failed", final_path);
+    fclose(in);
+    return -2;
+  }
+  while ((n = fread(buf, 1, sizeof(buf), in)) > 0) {
+    if (fwrite(buf, 1, n, out) != n) {
+      log_error("record", "write final %s failed", final_path);
+      rc = -3;
+      break;
+    }
+  }
+  fclose(in);
+  if (fclose(out) != 0 && rc == 0) {
+    rc = -4;
+  }
+  return rc;
+}
+
+static void mux_wait_idle_unlocked(void)
+{
+  int i;
+  for (i = 0; i < 200; i++) { /* ~2s */
+    pthread_mutex_lock(&g_rec.lock);
+    if (g_rec.wq_count == 0 && !g_rec.mux_writing) {
+      pthread_mutex_unlock(&g_rec.lock);
+      return;
+    }
+    pthread_mutex_unlock(&g_rec.lock);
+    usleep(10 * 1000);
+  }
+  log_warn("record", "mux queue still busy after wait (wq=%d writing=%d)", g_rec.wq_count,
+           g_rec.mux_writing);
+}
+
+static void *mux_writer_thread(void *arg)
+{
+  (void)arg;
+  for (;;) {
+    WqPkt pkt;
+
+    pthread_mutex_lock(&g_rec.lock);
+    while (g_rec.wq_count <= 0 && g_rec.writer_run) {
+      pthread_cond_wait(&g_rec.wq_cond, &g_rec.lock);
+    }
+    if (g_rec.wq_count <= 0 && !g_rec.writer_run) {
+      pthread_mutex_unlock(&g_rec.lock);
+      break;
+    }
+    pkt = g_rec.wq[0];
+    memmove(&g_rec.wq[0], &g_rec.wq[1], (size_t)(g_rec.wq_count - 1) * sizeof(WqPkt));
+    g_rec.wq_count--;
+    /* Always write queued packets; close() stops enqueue first, then drains. */
+    g_rec.mux_writing = 1;
+    pthread_mutex_unlock(&g_rec.lock);
+
+    if (pkt.data && pkt.len > 0) {
+      rkmuxer_write_video_frame(MUXER_ID, pkt.data, pkt.len, pkt.pts, pkt.key);
+    }
+    free(pkt.data);
+
+    pthread_mutex_lock(&g_rec.lock);
+    g_rec.mux_writing = 0;
+    g_rec.frames++;
+    g_rec.seg_frames++;
+    pthread_mutex_unlock(&g_rec.lock);
+  }
+  return NULL;
+}
+
+static int writer_start(void)
+{
+  if (g_rec.writer_started) {
+    return 0;
+  }
+  g_rec.writer_run = 1;
+  if (pthread_create(&g_rec.writer_th, NULL, mux_writer_thread, NULL) != 0) {
+    g_rec.writer_run = 0;
+    return -1;
+  }
+  g_rec.writer_started = 1;
+  return 0;
+}
+
+static void writer_stop(void)
+{
+  if (!g_rec.writer_started) {
+    return;
+  }
+  pthread_mutex_lock(&g_rec.lock);
+  g_rec.writer_run = 0;
+  pthread_cond_signal(&g_rec.wq_cond);
+  pthread_mutex_unlock(&g_rec.lock);
+  pthread_join(g_rec.writer_th, NULL);
+  g_rec.writer_started = 0;
+  pthread_mutex_lock(&g_rec.lock);
+  wq_clear_locked();
+  pthread_mutex_unlock(&g_rec.lock);
+}
+
 static int open_segment_locked(void)
 {
   time_t now = time(NULL);
@@ -161,6 +316,9 @@ static int open_segment_locked(void)
 
   snprintf(g_rec.cur_path, sizeof(g_rec.cur_path), "%s/%04d%02d%02d_%02d%02d%02d.mp4", day_dir,
            tm.tm_year + 1900, tm.tm_mon + 1, tm.tm_mday, tm.tm_hour, tm.tm_min, tm.tm_sec);
+  /* Mux to tmpfs first — direct exFAT write after AOV remount can stall rkmuxer. */
+  snprintf(g_rec.stage_path, sizeof(g_rec.stage_path), "/tmp/ipc_rec_%d_%ld.mp4", g_rec.segments + 1,
+           (long)now);
 
   memset(&vp, 0, sizeof(vp));
   snprintf(vp.format, sizeof(vp.format), "NV12");
@@ -174,20 +332,35 @@ static int open_segment_locked(void)
   vp.frame_rate_den = 1;
 
   if (g_rec.muxer_open) {
+    g_rec.mux_closing = 1;
+    pthread_mutex_unlock(&g_rec.lock);
+    mux_wait_idle_unlocked();
+    pthread_mutex_lock(&g_rec.lock);
     rkmuxer_deinit(MUXER_ID);
     g_rec.muxer_open = 0;
+    if (g_rec.stage_path[0]) {
+      unlink(g_rec.stage_path);
+    }
   }
 
-  ret = rkmuxer_init(MUXER_ID, NULL, g_rec.cur_path, &vp, NULL);
+  g_rec.mux_closing = 0;
+  ret = rkmuxer_init(MUXER_ID, NULL, g_rec.stage_path, &vp, NULL);
   if (ret != 0) {
-    log_error("record", "rkmuxer_init failed %d path=%s", ret, g_rec.cur_path);
+    log_error("record", "rkmuxer_init failed %d path=%s", ret, g_rec.stage_path);
+    g_rec.stage_path[0] = '\0';
     return -2;
   }
   g_rec.muxer_open = 1;
+  g_rec.seg_active = 1;
   g_rec.seg_start = now;
+  g_rec.seg_mono_us = mono_us();
+  g_rec.mux_idx = 0;
+  g_rec.mux_idx_base = 0;
   g_rec.waiting_key = 1;
+  g_rec.seg_frames = 0;
   g_rec.segments++;
-  log_info("record", "segment open #%d %s", g_rec.segments, g_rec.cur_path);
+  log_info("record", "segment open #%d stage=%s -> %s", g_rec.segments, g_rec.stage_path,
+           g_rec.cur_path);
 
   if (storage_free_percent() >= 0 && storage_free_percent() < g_rec.cfg.recycle_free_percent) {
     storage_recycle_oldest(g_rec.cfg.recycle_free_percent);
@@ -197,24 +370,98 @@ static int open_segment_locked(void)
 
 static void close_segment_locked(void)
 {
-  if (g_rec.muxer_open) {
-    rkmuxer_deinit(MUXER_ID);
-    g_rec.muxer_open = 0;
-    log_info("record", "segment close %s", g_rec.cur_path);
+  char final_path[512];
+  char stage_path[512];
+  int empty;
+  int frames;
+
+  if (!g_rec.muxer_open && g_rec.stage_path[0] == '\0') {
+    return;
   }
+  /* Stop enqueue from VENC callback, drain writer, then deinit muxer. */
+  g_rec.muxer_open = 0;
+  snprintf(final_path, sizeof(final_path), "%s", g_rec.cur_path);
+  snprintf(stage_path, sizeof(stage_path), "%s", g_rec.stage_path);
+  pthread_mutex_unlock(&g_rec.lock);
+  mux_wait_idle_unlocked();
+  pthread_mutex_lock(&g_rec.lock);
+  empty = (g_rec.seg_frames <= 0);
+  frames = g_rec.seg_frames;
+  g_rec.mux_closing = 1;
+  pthread_mutex_unlock(&g_rec.lock);
+  rkmuxer_deinit(MUXER_ID);
+  pthread_mutex_lock(&g_rec.lock);
+  g_rec.mux_closing = 0;
+  g_rec.seg_active = 0;
+  g_rec.stage_path[0] = '\0';
+
+  if (empty) {
+    if (stage_path[0]) {
+      unlink(stage_path);
+    }
+    log_warn("record", "segment empty, removed %s", stage_path[0] ? stage_path : final_path);
+    return;
+  }
+  if (promote_stage_to_final(stage_path, final_path) != 0) {
+    log_error("record", "promote failed stage=%s final=%s (keep stage)", stage_path, final_path);
+    log_info("record", "segment close (staged) %s frames=%d", stage_path, frames);
+    return;
+  }
+  unlink(stage_path);
+  log_info("record", "segment close %s frames=%d", final_path, frames);
 }
 
 static void write_frame_locked(const uint8_t *data, uint32_t len, int key, int64_t pts)
 {
-  if (!g_rec.muxer_open) {
+  uint8_t *copy;
+  int fps;
+  int64_t period;
+  int64_t mux_pts;
+  int64_t allowed;
+
+  (void)pts;
+  if (!g_rec.muxer_open || g_rec.mux_closing || !data || len == 0) {
     return;
   }
   if (g_rec.waiting_key && !key) {
     return;
   }
+
+  fps = g_rec.cfg.main_fps > 0 ? g_rec.cfg.main_fps : 15;
+  period = 1000000LL / fps;
+  /*
+   * rkmuxer stamps each written frame at 1/frame_rate regardless of present_time
+   * deltas, so duration ≈ nb_frames / fps. Pace accepts to cfg fps so a 30s
+   * wall segment yields ~30s playback (not ~2× when sensor runs ~30fps).
+   */
+  if (!g_rec.flushing_prerecord) {
+    if (g_rec.seg_mono_us <= 0) {
+      g_rec.seg_mono_us = mono_us();
+    }
+    allowed =
+        g_rec.mux_idx_base + ((mono_us() - g_rec.seg_mono_us) * fps) / 1000000LL + 1;
+    if (g_rec.mux_idx >= allowed && !key) {
+      return;
+    }
+  }
+
+  if (g_rec.wq_count >= WQ_CAP) {
+    return; /* drop — never block VENC GetStream callback */
+  }
+  copy = (uint8_t *)malloc(len);
+  if (!copy) {
+    return;
+  }
+  memcpy(copy, data, len);
+  mux_pts = g_rec.mux_idx * period;
+  g_rec.mux_idx++;
   g_rec.waiting_key = 0;
-  rkmuxer_write_video_frame(MUXER_ID, (unsigned char *)data, len, pts, key);
-  g_rec.frames++;
+  g_rec.wq[g_rec.wq_count].data = copy;
+  g_rec.wq[g_rec.wq_count].len = len;
+  g_rec.wq[g_rec.wq_count].key = key;
+  g_rec.wq[g_rec.wq_count].pts = mux_pts;
+  g_rec.wq_count++;
+  pthread_cond_signal(&g_rec.wq_cond);
 }
 
 static void flush_prerecord_locked(void)
@@ -242,17 +489,27 @@ static void flush_prerecord_locked(void)
   }
 
   g_rec.flushing_prerecord = 1;
-  g_rec.waiting_key = 0;
+  /* Only drop waiting_key if we actually flush from a keyframe. An empty ring
+   * used to clear waiting_key and then feed non-IDR to rkmuxer (can hang). */
+  if (g_rec.ring_count <= 0 || start < 0 || !g_rec.ring[start].key) {
+    g_rec.flushing_prerecord = 0;
+    log_info("record", "flushed prerecord pkts=0 (wait key)");
+    ring_clear();
+    return;
+  }
   for (i = start; i < g_rec.ring_count; i++) {
     if (!g_rec.ring[i].data) {
       continue;
     }
-    rkmuxer_write_video_frame(MUXER_ID, g_rec.ring[i].data, g_rec.ring[i].len, g_rec.ring[i].pts,
-                              g_rec.ring[i].key);
-    g_rec.frames++;
+    write_frame_locked(g_rec.ring[i].data, g_rec.ring[i].len, g_rec.ring[i].key,
+                       g_rec.ring[i].pts);
   }
   g_rec.flushing_prerecord = 0;
-  log_info("record", "flushed prerecord pkts=%d from=%d", g_rec.ring_count - start, start);
+  /* Live pacing continues after prerecord frame count. */
+  g_rec.mux_idx_base = g_rec.mux_idx;
+  g_rec.seg_mono_us = mono_us();
+  log_info("record", "flushed prerecord pkts=%d from=%d frames=%d", g_rec.ring_count - start, start,
+           g_rec.seg_frames);
   ring_clear();
 }
 
@@ -320,6 +577,110 @@ static void on_packet(int chn, const uint8_t *data, uint32_t len, int key_frame,
   pthread_mutex_unlock(&g_rec.lock);
 }
 
+static int schedule_grid_valid(const char *grid)
+{
+  size_t i;
+  if (!grid || strlen(grid) != RECORD_SCHEDULE_GRID_LEN) {
+    return 0;
+  }
+  for (i = 0; i < RECORD_SCHEDULE_GRID_LEN; i++) {
+    if (grid[i] != '0' && grid[i] != '1') {
+      return 0;
+    }
+  }
+  return 1;
+}
+
+void record_config_load(RecordConfig *out)
+{
+  char grid[RECORD_SCHEDULE_GRID_LEN + 8];
+  char mode[32];
+
+  if (!out) {
+    return;
+  }
+  memset(out, 0, sizeof(*out));
+  config_get_int("record.segment_sec", &out->segment_sec, 30);
+  config_get_int("record.recycle_free_percent", &out->recycle_free_percent, 10);
+  config_get_int("record.pre_record_sec", &out->pre_record_sec, 4);
+  config_get_int("record.quiet_sec", &out->quiet_sec, 30);
+  config_get_int("video.encode.main_w", &out->main_w, 1920);
+  config_get_int("video.encode.main_h", &out->main_h, 1080);
+  config_get_int("video.encode.main_fps", &out->main_fps, 15);
+  config_get_int("video.encode.main_bitrate_kbps", &out->main_bitrate_kbps, 2048);
+
+  memset(mode, 0, sizeof(mode));
+  config_get_string("record.mode", mode, (int)sizeof(mode), "motion");
+  if (strcmp(mode, "continuous") == 0) {
+    memcpy(out->mode, "continuous", 11);
+  } else if (strcmp(mode, "schedule") == 0) {
+    memcpy(out->mode, "schedule", 9);
+  } else {
+    memcpy(out->mode, "motion", 7);
+  }
+  config_get_bool("record.schedule.enabled", &out->schedule_enabled, 0);
+  memset(grid, 0, sizeof(grid));
+  config_get_string("record.schedule.grid", grid, (int)sizeof(grid), "");
+  if (schedule_grid_valid(grid)) {
+    memcpy(out->schedule_grid, grid, RECORD_SCHEDULE_GRID_LEN);
+    out->schedule_grid[RECORD_SCHEDULE_GRID_LEN] = '\0';
+  } else {
+    memset(out->schedule_grid, '1', RECORD_SCHEDULE_GRID_LEN);
+    out->schedule_grid[RECORD_SCHEDULE_GRID_LEN] = '\0';
+  }
+}
+
+int record_config_save(const RecordConfig *cfg)
+{
+  const char *mode;
+
+  if (!cfg) {
+    return -1;
+  }
+  mode = cfg->mode[0] ? cfg->mode : "motion";
+  if (strcmp(mode, "continuous") != 0 && strcmp(mode, "schedule") != 0) {
+    mode = "motion";
+  }
+  if (config_set_string("record.mode", mode) != 0 ||
+      config_set_int("record.segment_sec", cfg->segment_sec) != 0 ||
+      config_set_int("record.recycle_free_percent", cfg->recycle_free_percent) != 0 ||
+      config_set_int("record.pre_record_sec", cfg->pre_record_sec) != 0 ||
+      config_set_int("record.quiet_sec", cfg->quiet_sec) != 0 ||
+      config_set_bool("record.schedule.enabled", cfg->schedule_enabled) != 0 ||
+      config_set_string("record.schedule.grid",
+                        schedule_grid_valid(cfg->schedule_grid) ? cfg->schedule_grid
+                                                                : "") != 0 ||
+      config_save() != 0) {
+    return -1;
+  }
+  return 0;
+}
+
+int record_schedule_allows_now(const RecordConfig *cfg)
+{
+  time_t now;
+  struct tm tm_now;
+  int day_idx;
+
+  if (!cfg) {
+    return 1;
+  }
+  if (!cfg->schedule_enabled) {
+    return 1;
+  }
+  if (!schedule_grid_valid(cfg->schedule_grid)) {
+    return 1;
+  }
+  now = time(NULL);
+  localtime_r(&now, &tm_now);
+  if (tm_now.tm_wday == 0) {
+    day_idx = 6;
+  } else {
+    day_idx = tm_now.tm_wday - 1;
+  }
+  return cfg->schedule_grid[day_idx * 24 + tm_now.tm_hour] == '1' ? 1 : 0;
+}
+
 int record_init(const RecordConfig *cfg)
 {
   if (!cfg) {
@@ -338,6 +699,9 @@ int record_init(const RecordConfig *cfg)
   if (g_rec.cfg.quiet_sec <= 0) {
     g_rec.cfg.quiet_sec = 30;
   }
+  if (!g_rec.cfg.mode[0]) {
+    snprintf(g_rec.cfg.mode, sizeof(g_rec.cfg.mode), "motion");
+  }
   if (storage_ensure_dirs() != 0) {
     return -2;
   }
@@ -347,8 +711,15 @@ int record_init(const RecordConfig *cfg)
   g_rec.segments = 0;
   g_rec.frames = 0;
   ring_clear();
+  wq_clear_locked();
+  if (writer_start() != 0) {
+    log_error("record", "mux writer thread start failed");
+    g_rec.inited = 0;
+    return -4;
+  }
   if (!g_rec.listener_added) {
     if (media_stream_add_packet_listener(on_packet, NULL) != 0) {
+      writer_stop();
       return -3;
     }
     g_rec.listener_added = 1;
@@ -365,6 +736,7 @@ void record_deinit(void)
     media_stream_remove_packet_listener(on_packet, NULL);
     g_rec.listener_added = 0;
   }
+  writer_stop();
   ring_clear();
   g_rec.inited = 0;
 }
@@ -413,8 +785,13 @@ int record_stop(void)
 
 int record_is_running(void)
 {
-  return g_rec.mode == RECORD_MODE_CONTINUOUS ||
-         (g_rec.mode == RECORD_MODE_MOTION && g_rec.muxer_open);
+  int running;
+  pthread_mutex_lock(&g_rec.lock);
+  running = g_rec.mode == RECORD_MODE_CONTINUOUS ||
+            (g_rec.mode == RECORD_MODE_MOTION &&
+             (g_rec.muxer_open || g_rec.seg_active || g_rec.wq_count > 0 || g_rec.mux_writing));
+  pthread_mutex_unlock(&g_rec.lock);
+  return running;
 }
 
 RecordMode record_mode(void)
@@ -433,7 +810,7 @@ int record_arm_motion(void)
   g_rec.quiet_deadline = 0;
   close_segment_locked();
   pthread_mutex_unlock(&g_rec.lock);
-  media_stream_request_idr(0);
+  /* Avoid RequestIDR here — it can hang after AOV mem resume on this board. */
   log_info("record", "arm motion mode pre=%ds quiet=%ds", g_rec.cfg.pre_record_sec,
            g_rec.cfg.quiet_sec);
   return 0;
@@ -470,6 +847,64 @@ int record_on_motion(void)
     log_info("record", "motion extend quiet -> %ld", (long)g_rec.quiet_deadline);
   }
   return 0;
+}
+
+int record_extend_recording(int sec)
+{
+  if (!g_rec.inited || sec <= 0) {
+    return -1;
+  }
+  pthread_mutex_lock(&g_rec.lock);
+  g_rec.quiet_deadline = time(NULL) + sec;
+  pthread_mutex_unlock(&g_rec.lock);
+  log_info("record", "extend recording %ds (deadline %ld)", sec, (long)g_rec.quiet_deadline);
+  return 0;
+}
+
+void record_poll_quiet_timeout(void)
+{
+  time_t now;
+  Event e;
+
+  if (!g_rec.inited) {
+    return;
+  }
+  pthread_mutex_lock(&g_rec.lock);
+  if (g_rec.mode != RECORD_MODE_MOTION || !g_rec.muxer_open) {
+    pthread_mutex_unlock(&g_rec.lock);
+    return;
+  }
+  now = time(NULL);
+  if (g_rec.quiet_deadline > 0 && now >= g_rec.quiet_deadline) {
+    close_segment_locked();
+    e.type = EVT_RECORD_STOP;
+    e.data = NULL;
+    e.data_len = 0;
+    pthread_mutex_unlock(&g_rec.lock);
+    event_bus_publish(&e);
+    log_info("record", "motion quiet -> idle (poll)");
+    return;
+  }
+  pthread_mutex_unlock(&g_rec.lock);
+}
+
+int record_frame_count(void)
+{
+  int n;
+  pthread_mutex_lock(&g_rec.lock);
+  n = g_rec.seg_frames > 0 ? g_rec.seg_frames : g_rec.frames;
+  pthread_mutex_unlock(&g_rec.lock);
+  return n;
+}
+
+void record_set_main_fps(int fps)
+{
+  if (!g_rec.inited || fps <= 0) {
+    return;
+  }
+  pthread_mutex_lock(&g_rec.lock);
+  g_rec.cfg.main_fps = fps;
+  pthread_mutex_unlock(&g_rec.lock);
 }
 
 int record_run_for(int seconds)

@@ -93,18 +93,23 @@
 - [x] T5.2 开机自启与守护（依赖 T0.2）— kill-9 拉起 + 断电上电 Web 自启手测 OK
   - 内容：`S99ipc_app` + `ipc_watchdog.sh`（含 `LD_LIBRARY_PATH`）
   - 验收：断电上电后 Web 自动起来（手测）
-- [~] T5.3 长稳测试（依赖 M1–M4 全部）— 准备正式 24h soak（下午/晚间挂机）
+- [x] T5.3 长稳测试（依赖 M1–M4 全部）— 板上连续 ~10 天通过（见 worklog session 25）
   - 内容：连续运行 24h+；监控 RSS/存储/HTTP；可叠加预览/侦测
   - 验收：无重启、RSS 波动 < 10%；结果记 worklog
-- [ ] T5.4 整体代码 review 与文档终稿（依赖 T5.3）
+- [x] T5.4 整体代码 review 与文档终稿（依赖 T5.3）— README 补齐编译/部署/使用；API/UI 可选增强已落地
   - 内容：对照 01/05 文档全量 review 代码；补齐 README（编译/部署/使用说明）
   - 验收：README 按步骤可从零复现部署
 
-## M6 AOV 低功耗（二期，全部依赖 M5 完成）
+## M6 变帧率 AOV（二期，全部依赖 M5 完成）
 
-- [ ] T6.1 AOV 方案调研与设计：研究 SDK/wiki 的 AOV 参考实现（suspend/快起/RTC 唤醒），产出 `docs/design/aov.md`，含功耗目标与用户决策点
-- [ ] T6.2 待机-唤醒-侦测循环：RTC 定时唤醒 → 快起出流 → 单帧侦测 → 无事回眠/有事转录像（涉及内核配置，动固件前征求用户同意）
-- [ ] T6.3 AOV 模式长稳与功耗实测
+- [x] T6.1 方案调研与设计 — 已纠偏为变帧率（1fps↔20~30fps），见 `docs/design/aov.md`；D1–D6 已确认
+- [x] T6.2 板级探针 — No-Go → T6.3（细项 `docs/07-todolist-aov.md`）
+- [x] T6.3 固件/resume — mem deep resume 已通（FE-PHY + deep-compat）
+- [x] T6.4 用户态骨架 — `aov_service` + API/CLI
+- [x] T6.5 变帧率闭环上板 — lapse + 事件 MP4 + soak；**MCU 睡时动检待 MIS5001 wakeup FW（暂搁置）**
+- [~] T6.6 长稳与功耗 — soak2000 PASS；关 AOV 回归 PASS；功耗表暂缓
+
+细项执行清单：`docs/07-todolist-aov.md`。AOV 用户态主线暂保持现状，转其他功能优化。
 
 ---
 
@@ -117,6 +122,6 @@
 | M2 录像与存储 | 完成（T2.1–T2.4；PC 双击播放请用户抽查一段 mp4） |
 | M3 移动侦测 | T3.1–T3.3 完成；T3.4 延后；IVS 实触发阈值仍待光照场景调优 |
 | M4 Web 管理 | **完成**（含 format / 抓图 / 布防区域时间；UI 细节下午再调） |
-| M5 时间与系统完善 | T5.1–T5.2 完成；进行中 T5.3 长稳（晚间挂机） |
-| M6 AOV 低功耗（二期） | 未开始 |
-| M7 Web UI 产品化（Element Plus / VIGI 风格） | **进行中** — T7.0/T7.1 完成；见 `docs/06-todolist-ui.md` |
+| M5 时间与系统完善 | T5.1–T5.4 完成 |
+| M6 变帧率 AOV（二期） | **用户态主线完成**（MCU 睡时 MD / 功耗暂搁） |
+| M7 Web UI 产品化（Element Plus / VIGI 风格） | **完成** — 含可选增强（主预览/缩放/OSD/日志 tail/设备名/定时重启） |

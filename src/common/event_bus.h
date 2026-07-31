@@ -13,7 +13,10 @@ typedef enum {
   EVT_APP_STOP,
   EVT_MOTION_DETECT,
   EVT_RECORD_START,
-  EVT_RECORD_STOP
+  EVT_RECORD_STOP,
+  EVT_AOV_ENTER,
+  EVT_AOV_LEAVE,
+  EVT_AOV_WAKE
 } EventType;
 
 typedef struct {

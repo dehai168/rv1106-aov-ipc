@@ -103,6 +103,26 @@ export function setVideoEncode(body: Partial<VideoEncodeConfig> & { apply?: bool
   })
 }
 
+export type VideoOsdConfig = {
+  enabled: boolean
+  show_time: boolean
+  show_name: boolean
+  pos_x: number
+  pos_y: number
+  name: string
+}
+
+export function getVideoOsd() {
+  return request<VideoOsdConfig>('/api/v1/video/osd')
+}
+
+export function setVideoOsd(body: Partial<VideoOsdConfig> & { apply?: boolean }) {
+  return request<VideoOsdConfig>('/api/v1/video/osd', {
+    method: 'POST',
+    body: JSON.stringify(body),
+  })
+}
+
 export type StorageStatus = {
   mounted: boolean
   mount_path: string
@@ -140,6 +160,41 @@ export function formatStorage() {
   })
 }
 
+export type RecordSchedule = {
+  enabled: boolean
+  grid: string
+}
+
+export type RecordConfig = {
+  mode: 'motion' | 'continuous' | 'schedule' | string
+  segment_sec: number
+  pre_record_sec: number
+  quiet_sec: number
+  recycle_free_percent: number
+  schedule: RecordSchedule
+  runtime_mode?: string
+  running?: boolean
+  policy_hold?: boolean
+}
+
+export function getRecordConfig() {
+  return request<RecordConfig>('/api/v1/record')
+}
+
+export function setRecordConfig(
+  body: Partial<
+    Pick<
+      RecordConfig,
+      'mode' | 'segment_sec' | 'pre_record_sec' | 'quiet_sec' | 'recycle_free_percent' | 'schedule'
+    >
+  > & { apply?: boolean },
+) {
+  return request<RecordConfig>('/api/v1/record', {
+    method: 'POST',
+    body: JSON.stringify(body),
+  })
+}
+
 export type AlarmEvent = {
   ts: number
   square: number
@@ -161,6 +216,13 @@ export type AlarmSchedule = {
   start_min: number
   end_min: number
   days: number
+  /** 168 chars '0'|'1', Mon..Sun x hour0..23 */
+  grid?: string
+}
+
+export type AlarmLink = {
+  record: boolean
+  snapshot: boolean
 }
 
 export type AlarmMotion = {
@@ -169,7 +231,9 @@ export type AlarmMotion = {
   square_pct: number
   hit_frames: number
   region: AlarmRegion
+  regions: AlarmRegion[]
   schedule: AlarmSchedule
+  link: AlarmLink
   running: boolean
   motion_count: number
   last_event: AlarmEvent
@@ -181,7 +245,10 @@ export function getAlarmMotion() {
 
 export function setAlarmMotion(
   body: Partial<
-    Pick<AlarmMotion, 'enabled' | 'sensitivity' | 'square_pct' | 'hit_frames' | 'region' | 'schedule'>
+    Pick<
+      AlarmMotion,
+      'enabled' | 'sensitivity' | 'square_pct' | 'hit_frames' | 'region' | 'regions' | 'schedule' | 'link'
+    >
   > & {
     apply?: boolean
   },
@@ -200,6 +267,13 @@ export function getAlarmEvents(limit: number = 50) {
 
 export function alarmSnapshotUrl(file: string) {
   return `/api/v1/alarm/snapshot?file=${encodeURIComponent(file)}`
+}
+
+export function previewSnapshot() {
+  return request<{ file: string; url: string }>('/api/v1/preview/snapshot', {
+    method: 'POST',
+    body: '{}',
+  })
 }
 
 export type SystemInfo = {
@@ -221,6 +295,13 @@ export type SystemTimeConfig = {
 
 export function getSystemInfo() {
   return request<SystemInfo>('/api/v1/system/info')
+}
+
+export function setSystemInfo(body: { device_name: string }) {
+  return request<SystemInfo>('/api/v1/system/info', {
+    method: 'POST',
+    body: JSON.stringify(body),
+  })
 }
 
 export function getSystemTime() {
@@ -252,4 +333,28 @@ export function resetSystem() {
 
 export function systemLogUrl(file = 'ipc_app.log') {
   return `/api/v1/system/log?file=${encodeURIComponent(file)}`
+}
+
+export function getSystemLogTail(tail = 200, file = 'ipc_app.log') {
+  return request<{ file: string; tail: number; lines: string[] }>(
+    `/api/v1/system/log?file=${encodeURIComponent(file)}&tail=${encodeURIComponent(String(tail))}`,
+  )
+}
+
+export type RebootSchedule = {
+  enabled: boolean
+  hour: number
+  minute: number
+  days: string
+}
+
+export function getRebootSchedule() {
+  return request<RebootSchedule>('/api/v1/system/reboot_schedule')
+}
+
+export function setRebootSchedule(body: Partial<RebootSchedule>) {
+  return request<RebootSchedule>('/api/v1/system/reboot_schedule', {
+    method: 'POST',
+    body: JSON.stringify(body),
+  })
 }
