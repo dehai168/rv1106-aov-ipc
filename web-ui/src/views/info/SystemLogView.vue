@@ -3,6 +3,7 @@ import { onMounted, onUnmounted, ref } from 'vue'
 import { ElMessage } from 'element-plus'
 import { getSystemLogTail, systemLogUrl } from '../../api'
 import { Document, Download, Refresh } from '@element-plus/icons-vue'
+import PageShell from '../../components/PageShell.vue'
 
 const logUrl = systemLogUrl()
 const loading = ref(false)
@@ -46,34 +47,28 @@ onUnmounted(() => {
 </script>
 
 <template>
-  <section class="page">
-    <div>
-      <h2 class="page-title">系统日志</h2>
-      <p class="page-desc">查看 ipc_app.log 尾部，或下载完整日志文件。</p>
+  <PageShell title="系统日志" subtitle="查看 ipc_app.log 尾部，或下载完整日志文件。">
+    <div class="tools">
+      <el-button type="primary" :icon="Refresh" :loading="loading" @click="refresh">刷新尾部</el-button>
+      <el-switch v-model="auto" active-text="每 5s 自动刷新" @change="onAutoChange" />
+      <a :href="logUrl" target="_blank" rel="noopener">
+        <el-button :icon="Download">下载完整日志</el-button>
+      </a>
     </div>
-
-    <el-card shadow="never" class="panel-card">
-      <div class="tools">
-        <el-button type="primary" :icon="Refresh" :loading="loading" @click="refresh">刷新尾部</el-button>
-        <el-switch v-model="auto" active-text="每 5s 自动刷新" @change="onAutoChange" />
-        <a :href="logUrl" target="_blank" rel="noopener">
-          <el-button :icon="Download">下载完整日志</el-button>
-        </a>
-      </div>
-      <el-input
-        v-model="text"
-        type="textarea"
-        :rows="22"
-        readonly
-        class="log-box"
-        placeholder="暂无日志内容"
-      />
-      <p class="hint">
-        <el-icon><Document /></el-icon>
-        最近 {{ lines.length }} 行
-      </p>
-    </el-card>
-  </section>
+    <el-input
+      v-model="text"
+      type="textarea"
+      :rows="32"
+      readonly
+      class="log"
+      resize="vertical"
+      :placeholder="loading ? '加载中…' : '暂无日志'"
+    />
+    <p class="meta">
+      <el-icon><Document /></el-icon>
+      最近 {{ lines.length }} 行
+    </p>
+  </PageShell>
 </template>
 
 <style scoped>
@@ -81,20 +76,26 @@ onUnmounted(() => {
   display: flex;
   flex-wrap: wrap;
   align-items: center;
-  gap: 0.8rem;
-  margin-bottom: 0.8rem;
+  gap: 0.75rem;
+  margin-bottom: 0.85rem;
 }
-.log-box :deep(textarea) {
+.log {
+  min-height: calc(100vh - 260px);
+}
+.log :deep(textarea) {
   font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
   font-size: 12px;
   line-height: 1.45;
+  background: #0f141a;
+  color: #d7dee7;
+  min-height: calc(100vh - 260px);
 }
-.hint {
-  margin-top: 0.5rem;
-  color: var(--ipc-muted);
+.meta {
   display: flex;
   align-items: center;
   gap: 0.35rem;
-  font-size: 13px;
+  margin: 0.5rem 0 0;
+  color: var(--ipc-muted);
+  font-size: 0.85rem;
 }
 </style>

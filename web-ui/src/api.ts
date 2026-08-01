@@ -143,14 +143,23 @@ export function getStorageStatus() {
   return request<StorageStatus>('/api/v1/storage/status')
 }
 
-export function getStorageRecords(params?: { date?: string; limit?: number }) {
+export function getStorageRecords(params?: {
+  date?: string
+  limit?: number
+  offset?: number
+}) {
   const q: string[] = []
   if (params?.date) q.push(`date=${encodeURIComponent(params.date)}`)
   if (params?.limit) q.push(`limit=${encodeURIComponent(String(params.limit))}`)
+  if (params?.offset != null) q.push(`offset=${encodeURIComponent(String(params.offset))}`)
   const qs = q.length ? `?${q.join('&')}` : ''
-  return request<{ records: StorageRecord[]; total: number; count: number }>(
-    `/api/v1/storage/records${qs}`,
-  )
+  return request<{
+    records: StorageRecord[]
+    total: number
+    count: number
+    offset?: number
+    limit?: number
+  }>(`/api/v1/storage/records${qs}`)
 }
 
 export function formatStorage() {
@@ -295,6 +304,11 @@ export type SystemTimeConfig = {
 
 export function getSystemInfo() {
   return request<SystemInfo>('/api/v1/system/info')
+}
+
+/** Public branding name (no auth). */
+export function getDeviceName() {
+  return request<{ device_name: string }>('/api/v1/system/device_name')
 }
 
 export function setSystemInfo(body: { device_name: string }) {

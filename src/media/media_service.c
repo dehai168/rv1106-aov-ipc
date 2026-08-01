@@ -1257,6 +1257,27 @@ static int aiq_to_pct(unsigned int level)
   return (int)((level * 100 + 127) / 255);
 }
 
+static int media_apply_vi_mirror_flip(int mirror, int flip)
+{
+  int chn;
+  int ok = 0;
+  for (chn = 0; chn <= 2; chn++) {
+    VI_CHN_ATTR_S attr;
+    memset(&attr, 0, sizeof(attr));
+    if (RK_MPI_VI_GetChnAttr(0, chn, &attr) != RK_SUCCESS) {
+      continue;
+    }
+    attr.bMirror = mirror ? RK_TRUE : RK_FALSE;
+    attr.bFlip = flip ? RK_TRUE : RK_FALSE;
+    if (RK_MPI_VI_SetChnAttr(0, chn, &attr) != RK_SUCCESS) {
+      log_warn("media", "VI%d SetChnAttr mirror/flip failed", chn);
+      continue;
+    }
+    ok++;
+  }
+  return ok > 0 ? 0 : -1;
+}
+
 static int media_image_apply_cfg(const MediaImageConfig *cfg)
 {
   XCamReturn rc;
@@ -1275,10 +1296,15 @@ static int media_image_apply_cfg(const MediaImageConfig *cfg)
   if (rc != XCAM_RETURN_NO_ERROR) {
     log_warn("media", "setSaturation rc=%d", rc);
   }
-  rc = rk_aiq_uapi2_setMirrorFlip(g_media.aiq_ctx, cfg->mirror != 0, cfg->flip != 0, 0);
+  /* AIQ sensor flip (skip frames like rkipc) + VI channel mirror/flip for preview/record. */
+  rc = rk_aiq_uapi2_setMirrorFlip(g_media.aiq_ctx, cfg->mirror != 0, cfg->flip != 0, 4);
   if (rc != XCAM_RETURN_NO_ERROR) {
     log_warn("media", "setMirrorFlip rc=%d", rc);
   }
+  if (media_apply_vi_mirror_flip(cfg->mirror, cfg->flip) != 0) {
+    log_warn("media", "VI mirror/flip not applied (channels not ready?)");
+  }
+  log_info("media", "image mirror=%d flip=%d applied", cfg->mirror, cfg->flip);
   return 0;
 }
 
@@ -1314,14 +1340,7 @@ int media_image_get(MediaImageConfig *out)
     if (rk_aiq_uapi2_getSaturation(g_media.aiq_ctx, &level) == XCAM_RETURN_NO_ERROR) {
       out->saturation = aiq_to_pct(level);
     }
-    {
-      bool mirror = false;
-      bool flip = false;
-      if (rk_aiq_uapi2_getMirrorFlip(g_media.aiq_ctx, &mirror, &flip) == XCAM_RETURN_NO_ERROR) {
-        out->mirror = mirror ? 1 : 0;
-        out->flip = flip ? 1 : 0;
-      }
-    }
+    /* Prefer saved config for mirror/flip: AIQ get can lag or disagree with VI. */
   }
   return 0;
 }

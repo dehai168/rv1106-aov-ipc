@@ -25,7 +25,7 @@
 
 | 方法 | 路径 | 鉴权 | 说明 |
 |---|---|---|---|
-| POST | `/api/v1/auth/login` | 否 | body: `{username,password}` → `{token,must_change,username}` |
+| POST | `/api/v1/auth/login` | 否 | body: `{username,password}` → `{token,must_change,username}`；失败 `msg`：`请输入用户名和密码` / `用户名或密码错误` |
 | POST | `/api/v1/auth/logout` | 否* | 清除 token/cookie |
 | POST | `/api/v1/auth/password` | 是 | body: `{old_password,new_password}`（new≥6） |
 | GET | `/api/v1/auth/me` | 是 | `{username,must_change}` |
@@ -77,6 +77,7 @@
 | POST | `/api/v1/video/osd` | 是 | 保存并可选 RGN 烧录 apply（主/子/主预览 VENC） |
 
 - image body：`brightness/contrast/saturation`（0–100）、`mirror/flip`（bool）、`apply`（默认 true）
+  - 应用：AIQ `setMirrorFlip(..., skip=4)` + VI 通道 `bMirror/bFlip`（0/1/2）
 - encode body：`main`/`sub` 各含 `w/h/fps/bitrate_kbps/gop`，`apply`（默认 true）
 - osd：`name` 支持中文（FreeType + `/userdata/fonts/simsun_cn_3000.ttf`）；`pos_x/pos_y` 为画面左上角像素，**须 16 对齐**（Rockchip RGN）；`name` 空则用 `device.name`；未起流时仅保存
 - 错误：`2101` 保存失败；`2102` 应用失败（media 未起流时 image/osd 仅保存不报错）
@@ -84,14 +85,16 @@
 ### storage（T4.6）
 - 已实现：
   - `GET /api/v1/storage/status`
-  - `GET /api/v1/storage/records`（可选 `date=YYYYMMDD`，可选 `limit<=200`）
+  - `GET /api/v1/storage/records`（可选 `date=YYYYMMDD`，`limit<=200`，`offset` 分页）
   - `GET /api/v1/storage/download?path=<YYYYMMDD>/<file>.mp4`（直接返回 MP4，可被浏览器 Range 读取）
   - `POST /api/v1/storage/format`：body `{"confirm":true}`，软清空 `records/`、`snapshots/`、`alarms/`（非 mkfs）；会先停 motion 自动化
 - 错误：`2402` 状态/文件失败；`2403` format 失败
 
 - `/records` 返回：
   - `data.records[]`：`{ path, name, mtime, size }`
+  - `data.total` / `data.count` / `data.offset` / `data.limit`
 - `/format` 返回：`data.deleted`（删除文件数）、`data.note`
+- **录像落盘**：mux 先写 `records/.stage/` 再 rename/promote 到日目录；长分段（如 300s）勿依赖 `/tmp`（tmpfs 易写满导致无 `moov`）
 
 ### alarm（T4.7）
 - 已实现：
@@ -111,6 +114,7 @@
 
 ### system（T4.8）
 - 已实现：
+  - `GET /api/v1/system/device_name`：**无需鉴权**，仅返回 `{device_name}`（登录页/品牌展示）
   - `GET /api/v1/system/info`：设备名、主机名、型号、版本、运行时长、内存
   - `POST /api/v1/system/info`：body `{device_name}`（1–32，无控制字符）
   - `GET /api/v1/system/time`：当前 Unix 时间 + 时区/NTP 配置

@@ -115,20 +115,20 @@ function fillWorkdayDaytime() {
 }
 .hour-row, .day-row {
   display: grid;
-  grid-template-columns: 36px repeat(24, 18px);
-  gap: 2px;
-  margin-bottom: 2px;
+  grid-template-columns: 42px repeat(24, 26px);
+  gap: 3px;
+  margin-bottom: 3px;
 }
 .day-lab, .hour-lab {
-  font-size: 11px;
+  font-size: 12px;
   color: var(--ipc-muted, #888);
   display: flex;
   align-items: center;
   justify-content: center;
 }
 .cell {
-  width: 18px;
-  height: 18px;
+  width: 26px;
+  height: 26px;
   padding: 0;
   border: 1px solid var(--ipc-border, #444);
   background: #f0f0f0;

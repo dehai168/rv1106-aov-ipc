@@ -187,6 +187,20 @@ static void wq_clear_locked(void)
   g_rec.wq_count = 0;
 }
 
+static int ensure_stage_dir(char *stage_dir, size_t n)
+{
+  snprintf(stage_dir, n, "%s/.stage", storage_records_path());
+  struct stat st;
+  if (stat(stage_dir, &st) == 0) {
+    return S_ISDIR(st.st_mode) ? 0 : -1;
+  }
+  if (mkdir(stage_dir, 0755) != 0) {
+    log_error("record", "mkdir stage %s failed", stage_dir);
+    return -1;
+  }
+  return 0;
+}
+
 static int promote_stage_to_final(const char *stage, const char *final_path)
 {
   FILE *in;
@@ -194,6 +208,11 @@ static int promote_stage_to_final(const char *stage, const char *final_path)
   char buf[8192];
   size_t n;
   int rc = 0;
+
+  /* Same filesystem: atomic rename is preferred (and cheap on TF). */
+  if (rename(stage, final_path) == 0) {
+    return 0;
+  }
 
   in = fopen(stage, "rb");
   if (!in) {
@@ -223,7 +242,8 @@ static int promote_stage_to_final(const char *stage, const char *final_path)
 static void mux_wait_idle_unlocked(void)
 {
   int i;
-  for (i = 0; i < 200; i++) { /* ~2s */
+  /* Long segments (e.g. 300s) can leave a deep write queue — wait up to ~60s. */
+  for (i = 0; i < 6000; i++) {
     pthread_mutex_lock(&g_rec.lock);
     if (g_rec.wq_count == 0 && !g_rec.mux_writing) {
       pthread_mutex_unlock(&g_rec.lock);
@@ -316,9 +336,18 @@ static int open_segment_locked(void)
 
   snprintf(g_rec.cur_path, sizeof(g_rec.cur_path), "%s/%04d%02d%02d_%02d%02d%02d.mp4", day_dir,
            tm.tm_year + 1900, tm.tm_mon + 1, tm.tm_mday, tm.tm_hour, tm.tm_min, tm.tm_sec);
-  /* Mux to tmpfs first — direct exFAT write after AOV remount can stall rkmuxer. */
-  snprintf(g_rec.stage_path, sizeof(g_rec.stage_path), "/tmp/ipc_rec_%d_%ld.mp4", g_rec.segments + 1,
-           (long)now);
+  /*
+   * Stage on TF card, not /tmp. tmpfs is ~90MB on this board; a 300s 2Mbps
+   * segment needs ~75MB+ and truncates before rkmuxer writes moov → unplayable.
+   */
+  {
+    char stage_dir[256];
+    if (ensure_stage_dir(stage_dir, sizeof(stage_dir)) != 0) {
+      return -1;
+    }
+    snprintf(g_rec.stage_path, sizeof(g_rec.stage_path), "%s/ipc_rec_%d_%ld.mp4", stage_dir,
+             g_rec.segments + 1, (long)now);
+  }
 
   memset(&vp, 0, sizeof(vp));
   snprintf(vp.format, sizeof(vp.format), "NV12");
@@ -407,7 +436,10 @@ static void close_segment_locked(void)
     log_info("record", "segment close (staged) %s frames=%d", stage_path, frames);
     return;
   }
-  unlink(stage_path);
+  /* rename() already moved the file; unlink only needed after copy fallback. */
+  if (access(stage_path, F_OK) == 0) {
+    unlink(stage_path);
+  }
   log_info("record", "segment close %s frames=%d", final_path, frames);
 }
 

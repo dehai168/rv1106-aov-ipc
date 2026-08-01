@@ -1,11 +1,10 @@
 <script setup lang="ts">
-import { computed } from 'vue'
+import { computed, onMounted, watch } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import {
   VideoCamera,
   InfoFilled,
   Setting,
-  Monitor,
   Picture,
   Warning,
   FolderOpened,
@@ -14,12 +13,15 @@ import {
   User,
   SwitchButton,
   Document,
+  Key,
 } from '@element-plus/icons-vue'
 import { ElMessageBox } from 'element-plus'
 import { logout } from '../api'
+import { useDeviceName } from '../composables/useDeviceName'
 
 const route = useRoute()
 const router = useRouter()
+const { deviceName, refreshDeviceName } = useDeviceName()
 
 const topTab = computed(() => {
   const p = route.path
@@ -29,6 +31,7 @@ const topTab = computed(() => {
 })
 
 const settingsActive = computed(() => route.path)
+const isPreview = computed(() => topTab.value === 'preview')
 
 async function onLogout() {
   try {
@@ -49,14 +52,25 @@ function goTop(tab: string) {
   else if (tab === 'info') router.push('/info/device')
   else router.push('/settings/camera')
 }
+
+onMounted(() => {
+  refreshDeviceName(true)
+})
+
+watch(
+  () => route.path,
+  () => {
+    if (!route.path.startsWith('/login')) refreshDeviceName(true)
+  },
+)
 </script>
 
 <template>
   <div class="layout">
     <header class="topbar">
-      <div class="brand">
+      <div class="brand" :title="deviceName">
         <el-icon :size="20"><VideoCamera /></el-icon>
-        <span class="brand-text">AOV IPC</span>
+        <span class="brand-text">{{ deviceName || 'AOV IPC' }}</span>
       </div>
       <nav class="top-tabs">
         <button
@@ -65,7 +79,7 @@ function goTop(tab: string) {
           :class="{ active: topTab === 'preview' }"
           @click="goTop('preview')"
         >
-          <el-icon><Monitor /></el-icon>
+          <el-icon><VideoCamera /></el-icon>
           实时预览
         </button>
         <button
@@ -96,6 +110,7 @@ function goTop(tab: string) {
           <template #dropdown>
             <el-dropdown-menu>
               <el-dropdown-item @click="router.push('/settings/system/password')">
+                <el-icon><Key /></el-icon>
                 修改密码
               </el-dropdown-item>
               <el-dropdown-item divided @click="onLogout">
@@ -112,7 +127,7 @@ function goTop(tab: string) {
       <aside v-if="topTab === 'info'" class="side">
         <el-menu :default-active="settingsActive" router class="side-menu">
           <el-menu-item index="/info/device">
-            <el-icon><Monitor /></el-icon>
+            <el-icon><VideoCamera /></el-icon>
             <span>设备信息</span>
           </el-menu-item>
           <el-menu-item index="/info/log">
@@ -161,7 +176,7 @@ function goTop(tab: string) {
         </el-menu>
       </aside>
 
-      <main class="main">
+      <main class="main" :class="{ preview: isPreview }">
         <router-view />
       </main>
     </div>
@@ -177,7 +192,7 @@ function goTop(tab: string) {
 }
 .topbar {
   display: grid;
-  grid-template-columns: 180px 1fr auto;
+  grid-template-columns: minmax(140px, 220px) 1fr auto;
   align-items: center;
   gap: 1rem;
   padding: 0 1rem;
@@ -191,8 +206,14 @@ function goTop(tab: string) {
   gap: 0.45rem;
   color: var(--ipc-sidebar);
   font-weight: 700;
+  min-width: 0;
 }
-.brand-text { letter-spacing: 0.02em; }
+.brand-text {
+  letter-spacing: 0.02em;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
 .top-tabs { display: flex; gap: 0.35rem; justify-content: center; }
 .top-tab {
   display: inline-flex;
@@ -251,7 +272,12 @@ function goTop(tab: string) {
 .main {
   min-width: 0;
   overflow: auto;
-  padding: 1.1rem 1.35rem 1.5rem;
+  padding: 1rem 1.2rem 1.25rem;
+  background: var(--ipc-bg);
+}
+.main.preview {
+  padding: 0;
+  overflow: hidden;
 }
 @media (max-width: 860px) {
   .topbar { grid-template-columns: 1fr; padding: 0.5rem 0.75rem; gap: 0.5rem; }

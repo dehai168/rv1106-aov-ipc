@@ -1,24 +1,38 @@
 <script setup lang="ts">
-import { ref } from 'vue'
+import { onMounted, ref } from 'vue'
 import { useRouter } from 'vue-router'
 import { ElMessage } from 'element-plus'
 import { VideoCamera } from '@element-plus/icons-vue'
 import { login } from '../api'
+import { useDeviceName } from '../composables/useDeviceName'
 
 const router = useRouter()
-const username = ref('admin')
-const password = ref('admin')
+const { deviceName, refreshDeviceName } = useDeviceName()
+const username = ref('')
+const password = ref('')
 const loading = ref(false)
 
 async function onSubmit() {
+  if (!username.value.trim() || !password.value) {
+    ElMessage.warning('请输入用户名和密码')
+    return
+  }
   loading.value = true
   try {
-    const r = await login(username.value, password.value)
+    const r = await login(username.value.trim(), password.value)
     if (r.code !== 0) {
-      ElMessage.error(r.msg || '登录失败')
+      const msg = r.msg || ''
+      if (/invalid credentials|unauthorized/i.test(msg) || r.code === 1001) {
+        ElMessage.error('用户名或密码错误')
+      } else if (/required|请输入/i.test(msg) || r.code === 1002) {
+        ElMessage.error('请输入用户名和密码')
+      } else {
+        ElMessage.error(msg || '登录失败')
+      }
       return
     }
     ElMessage.success('登录成功')
+    await refreshDeviceName(true)
     await router.replace(r.data.must_change ? '/settings/system/password' : '/preview')
   } catch (e) {
     ElMessage.error(String(e))
@@ -26,6 +40,10 @@ async function onSubmit() {
     loading.value = false
   }
 }
+
+onMounted(() => {
+  refreshDeviceName(false)
+})
 </script>
 
 <template>
@@ -35,13 +53,13 @@ async function onSubmit() {
       <div class="logo">
         <el-icon :size="28" color="var(--ipc-accent)"><VideoCamera /></el-icon>
         <div>
-          <h1>AOV IPC</h1>
+          <h1>{{ deviceName || 'AOV IPC' }}</h1>
           <p>设备管理登录</p>
         </div>
       </div>
       <el-form label-position="top" @submit.prevent="onSubmit">
         <el-form-item label="用户名">
-          <el-input v-model="username" autocomplete="username" clearable />
+          <el-input v-model="username" autocomplete="username" clearable placeholder="请输入用户名" />
         </el-form-item>
         <el-form-item label="密码">
           <el-input
@@ -49,6 +67,7 @@ async function onSubmit() {
             type="password"
             show-password
             autocomplete="current-password"
+            placeholder="请输入密码"
             @keyup.enter="onSubmit"
           />
         </el-form-item>

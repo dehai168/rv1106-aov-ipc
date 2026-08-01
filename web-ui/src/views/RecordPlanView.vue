@@ -2,10 +2,12 @@
 import { computed, onMounted, ref } from 'vue'
 import { ElMessage } from 'element-plus'
 import { getRecordConfig, setRecordConfig, type RecordConfig } from '../api'
+import PageShell from '../components/PageShell.vue'
 import ScheduleGrid from '../components/ScheduleGrid.vue'
 
 const loading = ref(true)
 const saving = ref(false)
+const activeTab = ref('params')
 const cfg = ref<RecordConfig | null>(null)
 
 function emptyGrid() {
@@ -68,73 +70,83 @@ onMounted(refresh)
 </script>
 
 <template>
-  <section class="page">
-    <div>
-      <h2 class="page-title">录像计划</h2>
-      <p class="page-desc">
-        事件录像依赖预览启动侦测；连续/定时模式可在无预览客户端时保持录像。
-      </p>
+  <PageShell title="录像计划" subtitle="配置录像模式、分段参数与定时计划。">
+    <div v-loading="loading">
+      <template v-if="cfg">
+        <div class="runtime">
+          <el-tag :type="cfg.running ? 'success' : 'info'">
+            {{ cfg.running ? '录像中' : '未录像' }}
+          </el-tag>
+          <span class="muted">运行模式 {{ cfg.runtime_mode || '-' }}</span>
+          <el-tag v-if="cfg.policy_hold" size="small" type="warning">媒体常驻</el-tag>
+        </div>
+
+        <el-tabs v-model="activeTab">
+          <el-tab-pane label="录像参数" name="params">
+            <el-form label-width="140px" style="max-width: 560px">
+              <el-form-item label="录像模式">
+                <el-radio-group v-model="cfg.mode">
+                  <el-radio-button label="motion">事件（运动）</el-radio-button>
+                  <el-radio-button label="continuous">连续</el-radio-button>
+                  <el-radio-button label="schedule">定时</el-radio-button>
+                </el-radio-group>
+              </el-form-item>
+              <el-form-item label="分段时长(秒)">
+                <el-input-number v-model="cfg.segment_sec" :min="10" :max="600" />
+              </el-form-item>
+              <el-form-item label="预录(秒)">
+                <el-input-number v-model="cfg.pre_record_sec" :min="1" :max="30" />
+              </el-form-item>
+              <el-form-item label="延录/静音(秒)">
+                <el-input-number v-model="cfg.quiet_sec" :min="5" :max="600" />
+                <div class="hint">事件模式：运动停止后继续录制的时长</div>
+              </el-form-item>
+            </el-form>
+          </el-tab-pane>
+
+          <el-tab-pane label="定时录像计划" name="plan">
+            <el-alert
+              class="mb"
+              title="仅定时模式下生效；关闭格子过滤则定时模式内全天录。"
+              type="info"
+              show-icon
+              :closable="false"
+            />
+            <el-form label-width="140px">
+              <el-form-item label="启用格子过滤">
+                <el-switch
+                  v-model="cfg.schedule.enabled"
+                  :disabled="scheduleDisabled"
+                  active-text="关=定时模式内全天录"
+                />
+              </el-form-item>
+              <el-form-item label-width="0">
+                <ScheduleGrid
+                  v-model="cfg.schedule.grid"
+                  class="full"
+                  :disabled="scheduleDisabled || !cfg.schedule.enabled"
+                />
+              </el-form-item>
+            </el-form>
+          </el-tab-pane>
+        </el-tabs>
+
+        <el-button type="primary" :loading="saving" @click="onSave">保存并应用</el-button>
+      </template>
     </div>
-
-    <el-card v-loading="loading" v-if="cfg" shadow="never" class="panel-card">
-      <el-form label-width="140px">
-        <el-form-item label="录像模式">
-          <el-radio-group v-model="cfg.mode">
-            <el-radio-button label="motion">事件（运动）</el-radio-button>
-            <el-radio-button label="continuous">连续</el-radio-button>
-            <el-radio-button label="schedule">定时</el-radio-button>
-          </el-radio-group>
-        </el-form-item>
-
-        <el-form-item label="分段时长(秒)">
-          <el-input-number v-model="cfg.segment_sec" :min="10" :max="600" />
-        </el-form-item>
-        <el-form-item label="预录(秒)">
-          <el-input-number v-model="cfg.pre_record_sec" :min="1" :max="30" />
-        </el-form-item>
-        <el-form-item label="延录/静音(秒)">
-          <el-input-number v-model="cfg.quiet_sec" :min="5" :max="600" />
-          <div class="hint">事件模式：运动停止后继续录制的时长</div>
-        </el-form-item>
-        <el-form-item label="回收水位(%)">
-          <el-input-number v-model="cfg.recycle_free_percent" :min="5" :max="90" />
-          <div class="hint">空闲低于该值时删除最旧录像</div>
-        </el-form-item>
-
-        <el-divider content-position="left">定时表（仅定时模式）</el-divider>
-        <el-form-item label="启用格子过滤">
-          <el-switch
-            v-model="cfg.schedule.enabled"
-            :disabled="scheduleDisabled"
-            active-text="关=定时模式内全天录"
-          />
-        </el-form-item>
-        <el-form-item label-width="0">
-          <ScheduleGrid
-            v-model="cfg.schedule.grid"
-            class="full"
-            :disabled="scheduleDisabled || !cfg.schedule.enabled"
-          />
-        </el-form-item>
-
-        <el-form-item>
-          <el-button type="primary" :loading="saving" @click="onSave">保存并应用</el-button>
-          <el-button @click="refresh">刷新</el-button>
-        </el-form-item>
-      </el-form>
-
-      <el-descriptions :column="1" border size="small" class="mt">
-        <el-descriptions-item label="运行时">
-          {{ cfg.runtime_mode || '-' }} · {{ cfg.running ? '录像中' : '未录像' }}
-          <span v-if="cfg.policy_hold"> · 媒体常驻</span>
-        </el-descriptions-item>
-      </el-descriptions>
-    </el-card>
-  </section>
+  </PageShell>
 </template>
 
 <style scoped>
-.full { width: 100%; }
+.runtime {
+  display: flex;
+  align-items: center;
+  gap: 0.75rem;
+  margin-bottom: 0.75rem;
+  flex-wrap: wrap;
+}
+.muted { color: var(--ipc-muted); font-size: 0.9rem; }
 .hint { color: var(--ipc-muted); font-size: 0.8rem; margin-left: 0.5rem; }
-.mt { margin-top: 1rem; }
+.full { width: 100%; }
+.mb { margin-bottom: 1rem; }
 </style>

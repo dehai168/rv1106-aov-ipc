@@ -475,8 +475,21 @@
 - **OSD**：中文 FreeType + `assets/fonts/simsun_cn_3000.ttf`；`pos_x/pos_y` **16 对齐**（Y 失效根因）；改位置重建 RGN
 - 文档：`01` 视频链路、`05` API、本 worklog；板上验证 MOTION + OSD pos=0/64/160/320
 
-## 2026-07-31 session 57 — 文档同步并入库
-- README / 架构 / API / UI todolist / detect 设计对齐 session 56 行为
-- 入库：M7 增强 + AOV 用户态 + OSD 字体；排除根目录 smoke 媒体与官方 AOV PDF
+## 2026-08-01 session 58 — Web UI 布局与交互改版
+- 登录：空账号/密码校验；中文错误提示；展示设备名（公开 API `/api/v1/system/device_name`）
+- 壳层：Top/Left/Main；设备名品牌；预览用 VideoCamera；修改密码 Key 图标；PageShell title/subtitle + 白底内容区
+- 实时预览：抽 `LivePreviewPlayer`；满屏；左下 HUD 分辨率/码率/帧率；右侧 icon 工具条；默认箭头光标
+- 图像与码流左右分栏；移动侦测 Tab（检测/区域1-4/布防时间/联动）+ 右侧事件；录像计划/存储/网络/基本设置 Tab 化
+- 存储列表：日期检索、分页、MB、预览弹框；覆盖比例；录像计划不再显示回收水位
+- 后端：登录文案中文；records `offset`；公开 device_name
+
+## 2026-08-01 session 59 — UI  polish + 预览/镜像/长分段
+- 预览：空闲拆管线防抖 2s；MSE 裁旧缓冲，缓解切页/播久黑屏
+- 镜像/翻转：AIQ `skip=4` + VI0/1/2 `bMirror/bFlip`；GET 以配置为准
+- 录像：`segment_sec=300` 时 `/tmp` 写满导致 MP4 无 `moov`；改为 TF `records/.stage/` 暂存 + 延长 mux drain
+- UI：Descriptions 强制边框；灵敏度/滑条/时区偏移/事件分页高度等跟进改版
+
+## 2026-08-01 session 60 — 文档同步入库
+- README / worklog / API 对齐 Web 改版与长分段 staging；排除官方 AOV PDF
 
 

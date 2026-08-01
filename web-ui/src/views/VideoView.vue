@@ -12,6 +12,8 @@ import {
   type VideoImageConfig,
   type VideoOsdConfig,
 } from '../api'
+import PageShell from '../components/PageShell.vue'
+import LivePreviewPlayer from '../components/LivePreviewPlayer.vue'
 
 const loading = ref(true)
 const savingImage = ref(false)
@@ -131,112 +133,147 @@ onMounted(refresh)
 </script>
 
 <template>
-  <section class="page">
-    <div>
-      <h2 class="page-title">图像与码流</h2>
-      <p class="page-desc">调节画面效果、编码参数与 OSD 叠字。</p>
+  <PageShell title="图像与码流" subtitle="左侧调节参数，右侧实时预览效果。">
+    <div v-loading="loading" class="split-page">
+      <div class="split-left">
+        <el-tabs v-model="activeTab">
+          <el-tab-pane label="图像" name="image">
+            <el-form label-width="72px" class="image-form">
+              <el-form-item label="亮度">
+                <div class="slider-row">
+                  <el-slider v-model="image.brightness" :min="0" :max="100" />
+                  <span class="val">{{ image.brightness }}</span>
+                </div>
+              </el-form-item>
+              <el-form-item label="对比度">
+                <div class="slider-row">
+                  <el-slider v-model="image.contrast" :min="0" :max="100" />
+                  <span class="val">{{ image.contrast }}</span>
+                </div>
+              </el-form-item>
+              <el-form-item label="饱和度">
+                <div class="slider-row">
+                  <el-slider v-model="image.saturation" :min="0" :max="100" />
+                  <span class="val">{{ image.saturation }}</span>
+                </div>
+              </el-form-item>
+              <el-form-item label="镜像/翻转" label-width="80px">
+                <el-space>
+                  <el-switch v-model="image.mirror" active-text="水平镜像" />
+                  <el-switch v-model="image.flip" active-text="垂直翻转" />
+                </el-space>
+              </el-form-item>
+              <el-form-item>
+                <el-button type="primary" :loading="savingImage" @click="onSaveImage">应用图像参数</el-button>
+              </el-form-item>
+            </el-form>
+          </el-tab-pane>
+
+          <el-tab-pane label="码流" name="stream">
+            <el-alert
+              class="mb"
+              :title="`流状态：${encode.stream_up ? '运行中' : '未起流'}`"
+              :type="encode.stream_up ? 'success' : 'info'"
+              show-icon
+              :closable="false"
+            />
+            <el-row :gutter="12">
+              <el-col :xs="24" :md="12">
+                <h3 class="sub">主码流 (H.265)</h3>
+                <el-form label-width="72px" size="small">
+                  <el-form-item label="宽"><el-input-number v-model="encode.main.w" :min="320" :step="16" /></el-form-item>
+                  <el-form-item label="高"><el-input-number v-model="encode.main.h" :min="240" :step="16" /></el-form-item>
+                  <el-form-item label="帧率"><el-input-number v-model="encode.main.fps" :min="1" :max="30" /></el-form-item>
+                  <el-form-item label="码率"><el-input-number v-model="encode.main.bitrate_kbps" :min="64" :step="64" /></el-form-item>
+                  <el-form-item label="GOP"><el-input-number v-model="encode.main.gop" :min="1" /></el-form-item>
+                </el-form>
+              </el-col>
+              <el-col :xs="24" :md="12">
+                <h3 class="sub">子码流 (H.264)</h3>
+                <el-form label-width="72px" size="small">
+                  <el-form-item label="宽"><el-input-number v-model="encode.sub.w" :min="320" :step="16" /></el-form-item>
+                  <el-form-item label="高"><el-input-number v-model="encode.sub.h" :min="240" :step="16" /></el-form-item>
+                  <el-form-item label="帧率"><el-input-number v-model="encode.sub.fps" :min="1" :max="30" /></el-form-item>
+                  <el-form-item label="码率"><el-input-number v-model="encode.sub.bitrate_kbps" :min="64" :step="64" /></el-form-item>
+                  <el-form-item label="GOP"><el-input-number v-model="encode.sub.gop" :min="1" /></el-form-item>
+                </el-form>
+              </el-col>
+            </el-row>
+            <el-button type="primary" :loading="savingEncode" @click="onSaveEncode">保存并应用码流</el-button>
+          </el-tab-pane>
+
+          <el-tab-pane label="OSD" name="osd">
+            <el-alert
+              class="mb"
+              title="OSD 烧录到画面。位置 X/Y 须为 16 的倍数。"
+              type="info"
+              show-icon
+              :closable="false"
+            />
+            <el-form label-width="100px">
+              <el-form-item label="启用 OSD">
+                <el-switch v-model="osd.enabled" />
+              </el-form-item>
+              <el-form-item label="显示时间">
+                <el-switch v-model="osd.show_time" :disabled="!osd.enabled" />
+              </el-form-item>
+              <el-form-item label="显示名称">
+                <el-switch v-model="osd.show_name" :disabled="!osd.enabled" />
+              </el-form-item>
+              <el-form-item label="通道名">
+                <el-input
+                  v-model="osd.name"
+                  class="osd-name"
+                  maxlength="32"
+                  show-word-limit
+                  :disabled="!osd.enabled || !osd.show_name"
+                  placeholder="默认设备名，支持中文"
+                />
+              </el-form-item>
+              <el-form-item label="位置 X">
+                <el-input-number v-model="osd.pos_x" :min="0" :max="1920" :step="16" :disabled="!osd.enabled" />
+              </el-form-item>
+              <el-form-item label="位置 Y">
+                <el-input-number v-model="osd.pos_y" :min="0" :max="1080" :step="16" :disabled="!osd.enabled" />
+              </el-form-item>
+              <el-form-item>
+                <el-button type="primary" :loading="savingOsd" @click="onSaveOsd">保存 OSD</el-button>
+              </el-form-item>
+            </el-form>
+          </el-tab-pane>
+        </el-tabs>
+      </div>
+      <div class="split-right">
+        <div class="split-preview">
+          <LivePreviewPlayer compact />
+        </div>
+      </div>
     </div>
-
-    <el-card v-loading="loading" shadow="never" class="panel-card">
-      <el-tabs v-model="activeTab">
-        <el-tab-pane label="图像" name="image">
-          <el-form label-width="100px" style="max-width: 520px">
-            <el-form-item :label="`亮度 ${image.brightness}`">
-              <el-slider v-model="image.brightness" :min="0" :max="100" />
-            </el-form-item>
-            <el-form-item :label="`对比度 ${image.contrast}`">
-              <el-slider v-model="image.contrast" :min="0" :max="100" />
-            </el-form-item>
-            <el-form-item :label="`饱和度 ${image.saturation}`">
-              <el-slider v-model="image.saturation" :min="0" :max="100" />
-            </el-form-item>
-            <el-form-item label="镜像/翻转">
-              <el-space>
-                <el-switch v-model="image.mirror" active-text="水平镜像" />
-                <el-switch v-model="image.flip" active-text="垂直翻转" />
-              </el-space>
-            </el-form-item>
-            <el-form-item>
-              <el-button type="primary" :loading="savingImage" @click="onSaveImage">应用图像参数</el-button>
-            </el-form-item>
-          </el-form>
-        </el-tab-pane>
-
-        <el-tab-pane label="码流" name="stream">
-          <el-alert
-            class="mb"
-            :title="`流状态：${encode.stream_up ? '运行中' : '未起流'}`"
-            :type="encode.stream_up ? 'success' : 'info'"
-            show-icon
-            :closable="false"
-          />
-          <el-row :gutter="16">
-            <el-col :xs="24" :md="12">
-              <h3 class="sub">主码流 (H.265)</h3>
-              <el-form label-width="90px">
-                <el-form-item label="宽"><el-input-number v-model="encode.main.w" :min="320" :step="16" /></el-form-item>
-                <el-form-item label="高"><el-input-number v-model="encode.main.h" :min="240" :step="16" /></el-form-item>
-                <el-form-item label="帧率"><el-input-number v-model="encode.main.fps" :min="1" :max="30" /></el-form-item>
-                <el-form-item label="码率"><el-input-number v-model="encode.main.bitrate_kbps" :min="64" :step="64" /> <span class="unit">kbps</span></el-form-item>
-                <el-form-item label="GOP"><el-input-number v-model="encode.main.gop" :min="1" /></el-form-item>
-              </el-form>
-            </el-col>
-            <el-col :xs="24" :md="12">
-              <h3 class="sub">子码流 (H.264 / 预览)</h3>
-              <el-form label-width="90px">
-                <el-form-item label="宽"><el-input-number v-model="encode.sub.w" :min="320" :step="16" /></el-form-item>
-                <el-form-item label="高"><el-input-number v-model="encode.sub.h" :min="240" :step="16" /></el-form-item>
-                <el-form-item label="帧率"><el-input-number v-model="encode.sub.fps" :min="1" :max="30" /></el-form-item>
-                <el-form-item label="码率"><el-input-number v-model="encode.sub.bitrate_kbps" :min="64" :step="64" /> <span class="unit">kbps</span></el-form-item>
-                <el-form-item label="GOP"><el-input-number v-model="encode.sub.gop" :min="1" /></el-form-item>
-              </el-form>
-            </el-col>
-          </el-row>
-          <el-button type="primary" :loading="savingEncode" @click="onSaveEncode">保存并应用码流</el-button>
-          <el-button @click="refresh">刷新</el-button>
-        </el-tab-pane>
-
-        <el-tab-pane label="OSD" name="osd">
-          <el-alert
-            class="mb"
-            title="OSD 通过 RGN 烧录到主/子/主预览画面。位置为画面左上角像素，X/Y 须为 16 的倍数（Rockchip 硬件要求）。"
-            type="info"
-            show-icon
-            :closable="false"
-          />
-          <el-form label-width="100px" style="max-width: 520px">
-            <el-form-item label="启用 OSD">
-              <el-switch v-model="osd.enabled" />
-            </el-form-item>
-            <el-form-item label="显示时间">
-              <el-switch v-model="osd.show_time" :disabled="!osd.enabled" />
-            </el-form-item>
-            <el-form-item label="显示名称">
-              <el-switch v-model="osd.show_name" :disabled="!osd.enabled" />
-            </el-form-item>
-            <el-form-item label="通道名">
-              <el-input v-model="osd.name" maxlength="32" show-word-limit :disabled="!osd.enabled || !osd.show_name" placeholder="默认 device.name，支持中文" />
-            </el-form-item>
-            <el-form-item label="位置 X">
-              <el-input-number v-model="osd.pos_x" :min="0" :max="1920" :step="16" :disabled="!osd.enabled" />
-              <span class="unit">px（16 对齐）</span>
-            </el-form-item>
-            <el-form-item label="位置 Y">
-              <el-input-number v-model="osd.pos_y" :min="0" :max="1080" :step="16" :disabled="!osd.enabled" />
-              <span class="unit">px（16 对齐）</span>
-            </el-form-item>
-            <el-form-item>
-              <el-button type="primary" :loading="savingOsd" @click="onSaveOsd">保存 OSD</el-button>
-            </el-form-item>
-          </el-form>
-        </el-tab-pane>
-      </el-tabs>
-    </el-card>
-  </section>
+  </PageShell>
 </template>
 
 <style scoped>
 .mb { margin-bottom: 1rem; }
 .sub { margin: 0 0 0.75rem; font-size: 0.95rem; color: var(--ipc-muted); }
-.unit { margin-left: 0.35rem; color: var(--ipc-muted); font-size: 0.85rem; }
+.image-form { max-width: 420px; }
+.slider-row {
+  display: flex;
+  align-items: center;
+  gap: 0.75rem;
+  width: 100%;
+}
+.slider-row :deep(.el-slider) {
+  flex: 1;
+  max-width: 220px;
+}
+.val {
+  min-width: 2rem;
+  text-align: right;
+  color: var(--ipc-muted);
+  font-variant-numeric: tabular-nums;
+}
+.osd-name {
+  width: 440px;
+  max-width: 100%;
+}
 </style>

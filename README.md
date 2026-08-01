@@ -19,12 +19,13 @@
 | 双码流 | 主 H.265 录像；子 H.264 预览；另有 ≤1280×720 H.264 主预览通道 |
 | 录像 | 事件 / 连续 / 周计划；分段 MP4；低水位循环覆盖 |
 | 侦测 | Rockit IVS + 多区域软过滤 + 7×24 布防 |
-| Web | Element Plus；预览 MSE（子/主）；图像/OSD（中文+位置）/存储/告警/系统 |
+| Web | Element Plus；顶栏预览/信息/设置；`LivePreviewPlayer` 复用；Tab 化业务页；OSD 中文+位置 |
 | AOV | 用户态变帧率主线可用；MCU 睡时 MD / 功耗表暂搁 |
 
 **不做**：PTZ、音频对讲、真卡 mkfs、在线升级、ONVIF 等。
 
-板端 OSD 字体：部署 `assets/fonts/simsun_cn_3000.ttf` → `/userdata/fonts/`（或配置 `video.osd.font_path`）。
+板端 OSD 字体：部署 `assets/fonts/simsun_cn_3000.ttf` → `/userdata/fonts/`（或配置 `video.osd.font_path`）。  
+录像分段暂存：`/mnt/sdcard/records/.stage/`（勿用 `/tmp`，长分段会缺 moov）。
 
 ## 编译（WSL）
 

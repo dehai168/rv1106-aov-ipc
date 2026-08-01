@@ -105,6 +105,15 @@ static volatile int g_record_policy_hold = 0;
 static volatile int g_schedule_poll_on = 0;
 static char g_record_policy_mode[16] = "motion";
 static time_t g_schedule_last_slot = -1;
+/* Debounce preview teardown across route switches / WS reconnect. */
+static volatile int64_t g_preview_idle_deadline_ms = 0;
+
+static int64_t web_now_ms(void)
+{
+  struct timespec ts;
+  clock_gettime(CLOCK_MONOTONIC, &ts);
+  return (int64_t)ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
+}
 
 static int web_start_motion_automation_if_needed(void);
 static void web_stop_motion_automation(void);
@@ -340,9 +349,9 @@ static void handle_login(struct mg_connection *c, struct mg_http_message *hm)
   }
   user = cJSON_GetStringValue(cJSON_GetObjectItem(body, "username"));
   pass = cJSON_GetStringValue(cJSON_GetObjectItem(body, "password"));
-  if (!user || !pass) {
+  if (!user || !pass || !user[0] || !pass[0]) {
     cJSON_Delete(body);
-    json_reply(c, 1002, "username/password required", NULL);
+    json_reply(c, 1002, "请输入用户名和密码", NULL);
     return;
   }
 
@@ -351,7 +360,7 @@ static void handle_login(struct mg_connection *c, struct mg_http_message *hm)
   if (strcmp(user, g_web.user) != 0 || strcmp(expect, g_web.pass_hash) != 0) {
     pthread_mutex_unlock(&g_web.lock);
     cJSON_Delete(body);
-    json_reply(c, 1001, "invalid credentials", NULL);
+    json_reply(c, 1001, "用户名或密码错误", NULL);
     return;
   }
   pthread_mutex_unlock(&g_web.lock);
@@ -684,12 +693,12 @@ static void handle_video_image_set(struct mg_connection *c, struct mg_http_messa
     img.saturation = item->valueint;
   }
   item = cJSON_GetObjectItem(root, "mirror");
-  if (cJSON_IsBool(item)) {
-    img.mirror = cJSON_IsTrue(item) ? 1 : 0;
+  if (cJSON_IsBool(item) || cJSON_IsNumber(item)) {
+    img.mirror = cJSON_IsTrue(item) || (cJSON_IsNumber(item) && item->valueint) ? 1 : 0;
   }
   item = cJSON_GetObjectItem(root, "flip");
-  if (cJSON_IsBool(item)) {
-    img.flip = cJSON_IsTrue(item) ? 1 : 0;
+  if (cJSON_IsBool(item) || cJSON_IsNumber(item)) {
+    img.flip = cJSON_IsTrue(item) || (cJSON_IsNumber(item) && item->valueint) ? 1 : 0;
   }
   item = cJSON_GetObjectItem(root, "apply");
   if (cJSON_IsBool(item)) {
@@ -1063,6 +1072,7 @@ static void handle_storage_records(struct mg_connection *c, struct mg_http_messa
   char date[9];
   char limit_s[16];
   int limit;
+  int offset;
   int have_date;
   StorageRecord *arr;
   int n, cap;
@@ -1077,6 +1087,7 @@ static void handle_storage_records(struct mg_connection *c, struct mg_http_messa
   memset(limit_s, 0, sizeof(limit_s));
   have_date = 0;
   limit = 100;
+  offset = 0;
   if (mg_http_get_var(&hm->query, "date", date, sizeof(date)) > 0 && is_date8(date)) {
     have_date = 1;
   }
@@ -1084,6 +1095,16 @@ static void handle_storage_records(struct mg_connection *c, struct mg_http_messa
     int v = atoi(limit_s);
     if (v > 0 && v <= 200) {
       limit = v;
+    }
+  }
+  {
+    char offset_s[16];
+    memset(offset_s, 0, sizeof(offset_s));
+    if (mg_http_get_var(&hm->query, "offset", offset_s, sizeof(offset_s)) > 0) {
+      int v = atoi(offset_s);
+      if (v > 0) {
+        offset = v;
+      }
     }
   }
 
@@ -1125,25 +1146,35 @@ static void handle_storage_records(struct mg_connection *c, struct mg_http_messa
   }
 
   {
-    int out_n = n;
-    if (out_n > limit) {
-      out_n = limit;
-    }
+    int start = offset;
+    int out_n = 0;
     cJSON *data = cJSON_CreateObject();
     cJSON *records = cJSON_CreateArray();
     int i;
+    if (start < 0) {
+      start = 0;
+    }
+    if (start > n) {
+      start = n;
+    }
+    out_n = n - start;
+    if (out_n > limit) {
+      out_n = limit;
+    }
     cJSON_AddStringToObject(data, "base", base);
     cJSON_AddNumberToObject(data, "total", (double)n);
     cJSON_AddNumberToObject(data, "count", (double)out_n);
+    cJSON_AddNumberToObject(data, "offset", (double)start);
+    cJSON_AddNumberToObject(data, "limit", (double)limit);
     if (have_date) {
       cJSON_AddStringToObject(data, "date", date);
     }
     for (i = 0; i < out_n; i++) {
       cJSON *it = cJSON_CreateObject();
-      cJSON_AddStringToObject(it, "path", arr[i].rel_path);
-      cJSON_AddStringToObject(it, "name", arr[i].name);
-      cJSON_AddNumberToObject(it, "mtime", (double)arr[i].mtime);
-      cJSON_AddNumberToObject(it, "size", (double)arr[i].size);
+      cJSON_AddStringToObject(it, "path", arr[start + i].rel_path);
+      cJSON_AddStringToObject(it, "name", arr[start + i].name);
+      cJSON_AddNumberToObject(it, "mtime", (double)arr[start + i].mtime);
+      cJSON_AddNumberToObject(it, "size", (double)arr[start + i].size);
       cJSON_AddItemToArray(records, it);
     }
     cJSON_AddItemToObject(data, "records", records);
@@ -2228,6 +2259,21 @@ static void handle_system_info(struct mg_connection *c, struct mg_http_message *
   json_reply(c, 0, "ok", system_info_to_json(&info));
 }
 
+/* Public device name for login / branding (no secrets). */
+static void handle_system_device_name(struct mg_connection *c, struct mg_http_message *hm)
+{
+  SystemInfo info;
+  cJSON *data;
+  (void)hm;
+  if (system_get_info(&info) != 0) {
+    json_reply(c, 2502, "system info failed", NULL);
+    return;
+  }
+  data = cJSON_CreateObject();
+  cJSON_AddStringToObject(data, "device_name", info.device_name);
+  json_reply(c, 0, "ok", data);
+}
+
 static void handle_system_info_set(struct mg_connection *c, struct mg_http_message *hm)
 {
   cJSON *root;
@@ -2822,6 +2868,7 @@ static int preview_add_client(struct mg_connection *c, int stream)
   g_prev.nclients++;
   c->data[0] = PREVIEW_MARK;
   pthread_mutex_unlock(&g_prev.lock);
+  g_preview_idle_deadline_ms = 0;
 
   if (preview_ensure_pipeline() != 0) {
     pthread_mutex_lock(&g_prev.lock);
@@ -2862,8 +2909,8 @@ static void preview_remove_client(struct mg_connection *c)
   pthread_mutex_unlock(&g_prev.lock);
   preview_sync_main_encode();
   if (empty) {
-    preview_shutdown_pipeline();
-    log_info("web", "preview idle (media stopped)");
+    /* Keep mux alive briefly so route switch / WS reconnect does not black-screen. */
+    g_preview_idle_deadline_ms = web_now_ms() + 2000;
   }
 }
 
@@ -2902,6 +2949,7 @@ static void preview_poll_client(PreviewClient *pc)
 static void preview_on_poll(void)
 {
   int i;
+  int64_t deadline;
   pthread_mutex_lock(&g_prev.lock);
   for (i = 0; i < PREVIEW_MAX_CLIENTS; i++) {
     if (g_prev.clients[i].used) {
@@ -2909,6 +2957,20 @@ static void preview_on_poll(void)
     }
   }
   pthread_mutex_unlock(&g_prev.lock);
+
+  deadline = g_preview_idle_deadline_ms;
+  if (deadline > 0 && web_now_ms() >= deadline) {
+    int empty;
+    pthread_mutex_lock(&g_prev.lock);
+    empty = (g_prev.nclients == 0);
+    pthread_mutex_unlock(&g_prev.lock);
+    g_preview_idle_deadline_ms = 0;
+    if (empty) {
+      preview_shutdown_pipeline();
+      log_info("web", "preview idle%s",
+               g_record_policy_hold ? " (mux reset, media held)" : " (media stopped)");
+    }
+  }
 }
 
 static void handle_preview_ws(struct mg_connection *c, struct mg_http_message *hm)
@@ -3142,6 +3204,11 @@ static void ev_handler(struct mg_connection *c, int ev, void *ev_data)
     return;
   }
 
+  if (mg_match(hm->uri, mg_str("/api/v1/system/device_name"), NULL) &&
+      mg_strcmp(hm->method, mg_str("GET")) == 0) {
+    handle_system_device_name(c, hm);
+    return;
+  }
   if (mg_match(hm->uri, mg_str("/api/v1/system/info"), NULL) &&
       mg_strcmp(hm->method, mg_str("GET")) == 0) {
     handle_system_info(c, hm);

@@ -9,11 +9,14 @@ const props = withDefaults(
     logicW?: number
     logicH?: number
     max?: number
+    /** When >= 0, only edit this region index. */
+    activeIndex?: number
   }>(),
   {
     logicW: 640,
     logicH: 360,
     max: 4,
+    activeIndex: -1,
   },
 )
 
@@ -121,20 +124,22 @@ function paint() {
   const sx = cssW / props.logicW
   const sy = cssH / props.logicH
   regions.value.forEach((r, i) => {
+    if (props.activeIndex >= 0 && i !== props.activeIndex) return
     if (!r.enabled || r.w <= 0 || r.h <= 0) return
     const x = r.x * sx
     const y = r.y * sy
     const w = r.w * sx
     const h = r.h * sy
-    ctx.strokeStyle = i === selected.value ? '#ff6b35' : '#3d8bfd'
-    ctx.lineWidth = i === selected.value ? 2.5 : 2
+    const focus = i === selected.value || props.activeIndex === i
+    ctx.strokeStyle = focus ? '#ff6b35' : '#3d8bfd'
+    ctx.lineWidth = focus ? 2.5 : 2
     ctx.strokeRect(x, y, w, h)
-    ctx.fillStyle = i === selected.value ? 'rgba(255,107,53,0.15)' : 'rgba(61,139,253,0.12)'
+    ctx.fillStyle = focus ? 'rgba(255,107,53,0.15)' : 'rgba(61,139,253,0.12)'
     ctx.fillRect(x, y, w, h)
     ctx.fillStyle = ctx.strokeStyle
     ctx.font = '12px sans-serif'
-    ctx.fillText(`R${i + 1}`, x + 4, y + 14)
-    if (i === selected.value) {
+    ctx.fillText(`区域${i + 1}`, x + 4, y + 14)
+    if (focus) {
       const hs = 6
       ;[
         [x, y],
@@ -156,6 +161,40 @@ function onPointerDown(e: PointerEvent) {
   const hit = hitTest(x, y)
   startLx = x
   startLy = y
+  const locked = props.activeIndex >= 0 ? props.activeIndex : -1
+  if (locked >= 0) {
+    const r = regions.value[locked]
+    if (r && r.enabled && r.w > 0 && r.h > 0) {
+      const pad = 8 * (props.logicW / Math.max(1, canvas.clientWidth || props.logicW))
+      const corners: [string, number, number][] = [
+        ['nw', r.x, r.y],
+        ['ne', r.x + r.w, r.y],
+        ['sw', r.x, r.y + r.h],
+        ['se', r.x + r.w, r.y + r.h],
+      ]
+      for (const [name, cx, cy] of corners) {
+        if (Math.abs(x - cx) <= pad && Math.abs(y - cy) <= pad) {
+          selected.value = locked
+          dragMode = 'resize'
+          resizeCorner = name
+          orig = { ...r }
+          paint()
+          return
+        }
+      }
+      if (x >= r.x && x <= r.x + r.w && y >= r.y && y <= r.y + r.h) {
+        selected.value = locked
+        dragMode = 'move'
+        orig = { ...r }
+        paint()
+        return
+      }
+    }
+    selected.value = locked
+    dragMode = 'draw'
+    paint()
+    return
+  }
   if (hit.idx >= 0 && hit.corner) {
     selected.value = hit.idx
     dragMode = 'resize'
@@ -185,8 +224,11 @@ function onPointerMove(e: PointerEvent) {
   const list = regions.value.map((r) => ({ ...r }))
   if (dragMode === 'draw') {
     const rect = normRect(startLx, startLy, x - startLx, y - startLy)
-    const emptyIdx = list.findIndex((r) => !r.enabled || r.w <= 0 || r.h <= 0)
-    const idx = emptyIdx >= 0 ? emptyIdx : list.length < props.max ? list.length : -1
+    let idx =
+      props.activeIndex >= 0
+        ? props.activeIndex
+        : list.findIndex((r) => !r.enabled || r.w <= 0 || r.h <= 0)
+    if (idx < 0) idx = list.length < props.max ? list.length : -1
     if (idx < 0) return
     while (list.length <= idx) list.push({ enabled: false, x: 0, y: 0, w: 0, h: 0 })
     list[idx] = rect
@@ -219,13 +261,22 @@ function onPointerUp() {
 }
 
 function clearSelected() {
-  if (selected.value < 0) return
+  const idx = props.activeIndex >= 0 ? props.activeIndex : selected.value
+  if (idx < 0) return
   const list = regions.value.map((r) => ({ ...r }))
-  list[selected.value] = { enabled: false, x: 0, y: 0, w: 0, h: 0 }
+  list[idx] = { enabled: false, x: 0, y: 0, w: 0, h: 0 }
   regions.value = list
   selected.value = -1
   paint()
 }
+
+watch(
+  () => props.activeIndex,
+  (idx) => {
+    selected.value = idx >= 0 ? idx : -1
+    paint()
+  },
+)
 
 function clearAll() {
   regions.value = Array.from({ length: props.max }, () => ({
@@ -293,9 +344,17 @@ defineExpose({ clearSelected, clearAll, selected })
       />
     </div>
     <div class="toolbar">
-      <el-button size="small" :disabled="selected < 0" @click="clearSelected">删除选中</el-button>
-      <el-button size="small" @click="clearAll">清空全部</el-button>
-      <span class="hint">最多 {{ max }} 区 · 拖拽画框 · 选中后可移动/缩放</span>
+      <el-button size="small" @click="clearSelected">
+        {{ activeIndex >= 0 ? `清除区域${activeIndex + 1}` : '删除选中' }}
+      </el-button>
+      <el-button v-if="activeIndex < 0" size="small" @click="clearAll">清空全部</el-button>
+      <span class="hint">
+        {{
+          activeIndex >= 0
+            ? `正在编辑区域${activeIndex + 1} · 拖拽画框 / 移动 / 缩放`
+            : `最多 ${max} 区 · 拖拽画框 · 选中后可移动/缩放`
+        }}
+      </span>
     </div>
   </div>
 </template>
