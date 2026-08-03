@@ -19,8 +19,17 @@ wait_sdcard() {
   return 1
 }
 
-start() {
+# Never call RkLunch-stop.sh here — it loops forever if rkipc ignores SIGTERM.
+stop_oem_camera() {
+  killall rk_mpi_ao_test 2>/dev/null || true
   killall rkipc 2>/dev/null || true
+  sleep 1
+  killall -9 rkipc rk_mpi_ao_test 2>/dev/null || true
+  rm -f /tmp/aiq0.lock 2>/dev/null || true
+}
+
+start() {
+  stop_oem_camera
   mkdir -p /userdata/log /var/run
   if pidof ipc_app >/dev/null 2>&1; then
     echo "ipc_app already running"
@@ -35,6 +44,9 @@ start() {
     echo "missing $DAEMON"
     return 1
   fi
+  # Catch late RkLunch post_chk that starts rkipc after we return.
+  (sleep 8; stop_oem_camera) >/dev/null 2>&1 &
+  (sleep 20; stop_oem_camera) >/dev/null 2>&1 &
   echo "ipc_app started"
 }
 
