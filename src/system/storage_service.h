@@ -19,7 +19,7 @@ int storage_init(const char *mount_path); /* default /mnt/sdcard */
 void storage_deinit(void);
 
 int storage_get_status(StorageStatus *st);
-int storage_ensure_dirs(void); /* records/ snapshots/ */
+int storage_ensure_dirs(void); /* records/ snapshots/ faces/ */
 int storage_cleanup_bad_files(void);
 
 /* Free space ratio in [0,100]. Returns -1 on error. */
@@ -30,6 +30,9 @@ int storage_free_percent(void);
  */
 int storage_recycle_oldest(int target_free_percent);
 
+/* Keep faces/ total size <= quota_percent of TF capacity; delete oldest .jpg. */
+int storage_recycle_faces(int quota_percent);
+
 /* Delete up to `count` oldest mp4 files (for tests / forced cleanup). */
 int storage_delete_oldest(int count);
 
@@ -39,6 +42,7 @@ int storage_format_clear(void);
 const char *storage_mount_path(void);
 const char *storage_records_path(void);
 const char *storage_snapshots_path(void);
+const char *storage_faces_path(void);
 
 /* AOV: umount TF + unbind SD host before mem; bind + mount after wake. */
 int storage_prepare_suspend(void);

@@ -86,6 +86,36 @@
       "snapshot": true
     }
   },
+  "face": {
+    "enabled": false,
+    "model": "yunet_320",
+    "model_path": "/mnt/sdcard/models/yunet_320.rknn",
+    "trigger": "motion_gate",
+    "sensitivity": "normal",
+    "interval_ms": 500,
+    "hold_ms": 2000,
+    "cooldown_ms": 3000,
+    "confirm_frames": 2,
+    "min_face_px": 40,
+    "max_faces": 8,
+    "max_snap_per_frame": 2,
+    "face_jpeg_side": 320,
+    "score_thr_x100": 55,
+    "margin_x100": 140,
+    "save_scene": true,
+    "link_record": true,
+    "link_alarm": true,
+    "quota_percent": 5,
+    "daily_limit": 2000,
+    "schedule": {
+      "enabled": false,
+      "grid": "111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111"
+    },
+    "region0": { "enabled": false, "x": 0, "y": 0, "w": 0, "h": 0 },
+    "region1": { "enabled": false, "x": 0, "y": 0, "w": 0, "h": 0 },
+    "region2": { "enabled": false, "x": 0, "y": 0, "w": 0, "h": 0 },
+    "region3": { "enabled": false, "x": 0, "y": 0, "w": 0, "h": 0 }
+  },
   "network": {
     "iface": "eth0",
     "mode": "dhcp",

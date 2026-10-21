@@ -22,9 +22,13 @@
 #include "rk_debug.h"
 #include "rk_defines.h"
 #include "rk_mpi_mb.h"
+#include "rk_mpi_cal.h"
 #include "rk_mpi_sys.h"
 #include "rk_mpi_venc.h"
 #include "rk_mpi_vi.h"
+
+#include "rga/im2d.h"
+#include "rga/rga.h"
 
 typedef struct {
   int inited;
@@ -496,15 +500,16 @@ static int stream_create_pipeline(const MediaEncodeConfig *cfg)
   int detect_wanted;
 
   /* VI unrestricted; VENC Src=sensor Dst=cfg drops to target fps. */
+  /* VI1 depth>=3: sub VENC + JPEG combo + face GetChnFrame. */
   if (media_vi_chn_init(0, cfg->main_w, cfg->main_h, 0, 0) != 0 ||
-      media_vi_chn_init(1, cfg->sub_w, cfg->sub_h, 2, 0) != 0) {
+      media_vi_chn_init(1, cfg->sub_w, cfg->sub_h, 3, 0) != 0) {
     return -1;
   }
-  /* VI2 = ISP third path: IVS detect + lazy preview-main H.264. */
+  /* VI2 = ISP third path: IVS detect + optional preview-main + face grab (depth>=2). */
   media_preview_main_size(cfg, &pw, &ph);
   detect_wanted = (cfg->detect_w > 0 && cfg->detect_h > 0);
   g_stream.vi2_up = 0;
-  if (media_vi_chn_init(2, pw, ph, 0, 0) != 0) {
+  if (media_vi_chn_init(2, pw, ph, 2, 0) != 0) {
     RK_MPI_VI_DisableChn(0, 0);
     RK_MPI_VI_DisableChn(0, 1);
     return -1;
@@ -1112,12 +1117,12 @@ int media_stream_apply(const MediaEncodeConfig *cfg)
     int ph = 0;
     int detect_wanted = (g_stream.cfg.detect_w > 0 && g_stream.cfg.detect_h > 0);
     if (media_vi_chn_init(0, g_stream.cfg.main_w, g_stream.cfg.main_h, 0, 0) != 0 ||
-        media_vi_chn_init(1, g_stream.cfg.sub_w, g_stream.cfg.sub_h, 2, 0) != 0) {
+        media_vi_chn_init(1, g_stream.cfg.sub_w, g_stream.cfg.sub_h, 3, 0) != 0) {
       return -2;
     }
     media_preview_main_size(&g_stream.cfg, &pw, &ph);
     g_stream.vi2_up = 0;
-    if (media_vi_chn_init(2, pw, ph, 0, 0) != 0) {
+    if (media_vi_chn_init(2, pw, ph, 2, 0) != 0) {
       return -2;
     }
     g_stream.vi2_up = 1;
@@ -1402,51 +1407,44 @@ int media_osd_set(const MediaOsdConfig *in, int apply)
   return 0;
 }
 
-int media_snapshot_jpeg(const char *path)
+int media_snapshot_jpeg_mem(uint8_t **out, size_t *out_len)
 {
   VENC_RECV_PIC_PARAM_S recv;
   VENC_STREAM_S stream;
   VENC_PACK_S pack;
-  FILE *fp;
   void *data;
   size_t len;
+  uint8_t *copy;
   int ret;
-  int rc = 0;
 
-  if (!path || !path[0] || !g_stream.up || !g_stream.jpeg_up) {
-    return -1;
-  }
+  if (!out || !out_len || !g_stream.up || !g_stream.jpeg_up) return -1;
+  *out = NULL;
+  *out_len = 0;
 
   pthread_mutex_lock(&g_snap_lock);
-
   memset(&stream, 0, sizeof(stream));
   memset(&pack, 0, sizeof(pack));
   stream.pstPack = &pack;
   while (RK_MPI_VENC_GetStream(MEDIA_JPEG_VENC_CHN, &stream, 0) == RK_SUCCESS) {
     RK_MPI_VENC_ReleaseStream(MEDIA_JPEG_VENC_CHN, &stream);
   }
-
   RK_MPI_VENC_StopRecvFrame(MEDIA_JPEG_VENC_CHN);
   memset(&recv, 0, sizeof(recv));
   recv.s32RecvPicNum = 1;
   ret = RK_MPI_VENC_StartRecvFrame(MEDIA_JPEG_VENC_CHN, &recv);
   if (ret != RK_SUCCESS) {
-    log_warn("media", "snapshot StartRecvFrame fail %x", ret);
     pthread_mutex_unlock(&g_snap_lock);
     return -2;
   }
-
   memset(&stream, 0, sizeof(stream));
   memset(&pack, 0, sizeof(pack));
   stream.pstPack = &pack;
   ret = RK_MPI_VENC_GetStream(MEDIA_JPEG_VENC_CHN, &stream, 3000);
   if (ret != RK_SUCCESS) {
-    log_warn("media", "snapshot GetStream fail %x", ret);
     RK_MPI_VENC_StopRecvFrame(MEDIA_JPEG_VENC_CHN);
     pthread_mutex_unlock(&g_snap_lock);
     return -3;
   }
-
   data = RK_MPI_MB_Handle2VirAddr(pack.pMbBlk);
   len = (size_t)pack.u32Len;
   if (!data || len == 0) {
@@ -1455,28 +1453,246 @@ int media_snapshot_jpeg(const char *path)
     pthread_mutex_unlock(&g_snap_lock);
     return -4;
   }
-
-  fp = fopen(path, "wb");
-  if (!fp) {
+  copy = (uint8_t *)malloc(len);
+  if (!copy) {
     RK_MPI_VENC_ReleaseStream(MEDIA_JPEG_VENC_CHN, &stream);
     RK_MPI_VENC_StopRecvFrame(MEDIA_JPEG_VENC_CHN);
     pthread_mutex_unlock(&g_snap_lock);
     return -5;
   }
-  if (fwrite(data, 1, len, fp) != len) {
-    fclose(fp);
-    unlink(path);
-    rc = -6;
-  } else {
-    fclose(fp);
-    log_info("media", "snapshot %s (%zu bytes jpeg-hw %dx%d)", path, len, g_stream.cfg.sub_w,
-             g_stream.cfg.sub_h);
-  }
-
+  memcpy(copy, data, len);
   RK_MPI_VENC_ReleaseStream(MEDIA_JPEG_VENC_CHN, &stream);
   RK_MPI_VENC_StopRecvFrame(MEDIA_JPEG_VENC_CHN);
   pthread_mutex_unlock(&g_snap_lock);
-  return rc;
+  *out = copy;
+  *out_len = len;
+  return 0;
+}
+
+int media_snapshot_jpeg(const char *path)
+{
+  uint8_t *buf = NULL;
+  size_t len = 0;
+  FILE *fp;
+  int rc;
+
+  if (!path || !path[0]) return -1;
+  rc = media_snapshot_jpeg_mem(&buf, &len);
+  if (rc != 0) return rc;
+  fp = fopen(path, "wb");
+  if (!fp) {
+    free(buf);
+    return -5;
+  }
+  if (fwrite(buf, 1, len, fp) != len) {
+    fclose(fp);
+    unlink(path);
+    free(buf);
+    return -6;
+  }
+  fclose(fp);
+  free(buf);
+  log_info("media", "snapshot %s (%zu bytes jpeg-hw %dx%d)", path, len, g_stream.cfg.sub_w,
+           g_stream.cfg.sub_h);
+  return 0;
+}
+
+int media_stream_sub_width(void)
+{
+  return g_stream.up ? g_stream.cfg.sub_w : 0;
+}
+
+int media_stream_sub_height(void)
+{
+  return g_stream.up ? g_stream.cfg.sub_h : 0;
+}
+
+/* RGA-copy VI → MMZ NV12 for CPU/RKNN.
+ * Use importbuffer_fd (not bare wrapbuffer_fd) — rkipc pattern; VI1 preferred. */
+typedef struct {
+  MB_BLK blk;
+  uint8_t *vir;
+  size_t size;
+} MediaNv12Owned;
+
+static pthread_mutex_t g_rga_lock = PTHREAD_MUTEX_INITIALIZER;
+
+static int media_export_vi_nv12(MediaNv12Frame *out, VIDEO_FRAME_INFO_S *frame, int vi_chn)
+{
+  int w, h, vw, vh, hor, src_fd, dst_fd, rc;
+  size_t need;
+  MB_BLK dst_blk = MB_INVALID_HANDLE;
+  uint8_t *dst_vir;
+  rga_buffer_t src, dstb;
+  rga_buffer_handle_t src_h = 0, dst_h = 0;
+  im_handle_param_t spar, dpar;
+  IM_STATUS st;
+  MediaNv12Owned *owned;
+  RK_U64 phy;
+  unsigned ysum = 0;
+  int yi;
+
+  if (!out || !frame) return -1;
+  w = (int)frame->stVFrame.u32Width;
+  h = (int)frame->stVFrame.u32Height;
+  vw = (int)frame->stVFrame.u32VirWidth;
+  vh = (int)frame->stVFrame.u32VirHeight;
+  if (vw <= 0) vw = w;
+  if (vh <= 0) vh = h;
+  if (w <= 0 || h <= 0 || vw < w || vh < h) return -1;
+
+  hor = (int)RK_MPI_CAL_COMM_GetHorStride((RK_U32)vw, RK_FMT_YUV420SP);
+  if (hor < w) hor = vw;
+
+  src_fd = RK_MPI_MB_Handle2Fd(frame->stVFrame.pMbBlk);
+  phy = RK_MPI_MB_Handle2PhysAddr(frame->stVFrame.pMbBlk);
+  if (src_fd < 0 && phy == 0) return -2;
+
+  need = (size_t)w * (size_t)h * 3 / 2;
+  need = (need + 4095u) & ~4095u;
+  rc = RK_MPI_SYS_MmzAlloc_Cached(&dst_blk, "face_nv12", RK_NULL, (RK_U32)need);
+  if (rc != RK_SUCCESS || !dst_blk) {
+    log_warn("media", "MmzAlloc face_nv12 fail rc=%x need=%u", rc, (unsigned)need);
+    return -3;
+  }
+  dst_vir = (uint8_t *)RK_MPI_MB_Handle2VirAddr(dst_blk);
+  dst_fd = RK_MPI_MB_Handle2Fd(dst_blk);
+  if (!dst_vir || dst_fd < 0) {
+    RK_MPI_SYS_MmzFree(dst_blk);
+    return -3;
+  }
+
+  memset(&spar, 0, sizeof(spar));
+  spar.width = (uint32_t)hor;
+  spar.height = (uint32_t)vh;
+  spar.format = RK_FORMAT_YCbCr_420_SP;
+  memset(&dpar, 0, sizeof(dpar));
+  dpar.width = (uint32_t)w;
+  dpar.height = (uint32_t)h;
+  dpar.format = RK_FORMAT_YCbCr_420_SP;
+
+  pthread_mutex_lock(&g_rga_lock);
+  if (src_fd >= 0) src_h = importbuffer_fd(src_fd, &spar);
+  if (!src_h && phy) src_h = importbuffer_physicaladdr(phy, &spar);
+  dst_h = importbuffer_fd(dst_fd, &dpar);
+  if (!src_h || !dst_h) {
+    pthread_mutex_unlock(&g_rga_lock);
+    if (src_h) releasebuffer_handle(src_h);
+    if (dst_h) releasebuffer_handle(dst_h);
+    RK_MPI_SYS_MmzFree(dst_blk);
+    log_warn("media", "rga import fail vi%d src_h=%d dst_h=%d fd=%d phy=%llx", vi_chn, (int)src_h,
+             (int)dst_h, src_fd, (unsigned long long)phy);
+    return -4;
+  }
+  src = wrapbuffer_handle(src_h, w, h, RK_FORMAT_YCbCr_420_SP, hor, vh);
+  dstb = wrapbuffer_handle(dst_h, w, h, RK_FORMAT_YCbCr_420_SP, w, h);
+  st = imcopy(src, dstb);
+  releasebuffer_handle(src_h);
+  releasebuffer_handle(dst_h);
+  pthread_mutex_unlock(&g_rga_lock);
+
+  if (st != IM_STATUS_SUCCESS) {
+    log_warn("media", "rga imcopy fail vi%d st=%d", vi_chn, (int)st);
+    RK_MPI_SYS_MmzFree(dst_blk);
+    return -4;
+  }
+  (void)RK_MPI_SYS_MmzFlushCache(dst_blk, RK_FALSE);
+
+  for (yi = 0; yi < 256 && yi < w * h; yi++) ysum += dst_vir[yi];
+  if (ysum < 16 * 256 || ysum > 250 * 256) {
+    static int bad_logged;
+    if (!bad_logged) {
+      bad_logged = 1;
+      log_warn("media", "vi%d nv12 Y sanity fail mean~%u (comp=%d)", vi_chn, ysum / 256,
+               (int)frame->stVFrame.enCompressMode);
+    }
+  }
+
+  owned = (MediaNv12Owned *)calloc(1, sizeof(*owned));
+  if (!owned) {
+    RK_MPI_SYS_MmzFree(dst_blk);
+    return -3;
+  }
+  owned->blk = dst_blk;
+  owned->vir = dst_vir;
+  owned->size = need;
+
+  {
+    static int logged;
+    if (!logged) {
+      logged = 1;
+      log_info("media",
+               "grab vi%d rga+mmz ok %dx%d hor=%d src_fd=%d phy=%llx ymean~%u comp=%d", vi_chn, w, h,
+               hor, src_fd, (unsigned long long)phy, ysum / 256,
+               (int)frame->stVFrame.enCompressMode);
+    }
+  }
+
+  out->width = w;
+  out->height = h;
+  out->vir_width = w;
+  out->vir_height = h;
+  out->y_stride = w;
+  out->uv_stride = w;
+  out->y = dst_vir;
+  out->uv = dst_vir + (size_t)w * (size_t)h;
+  out->nv12_size = (size_t)w * (size_t)h * 3 / 2;
+  out->priv = owned;
+  out->vi_chn = vi_chn;
+  return 0;
+}
+
+int media_grab_sub_nv12(MediaNv12Frame *out, int timeout_ms)
+{
+  VIDEO_FRAME_INFO_S frame;
+  int ret;
+  if (!out || !g_stream.up) return -1;
+  memset(out, 0, sizeof(*out));
+  memset(&frame, 0, sizeof(frame));
+  ret = RK_MPI_VI_GetChnFrame(0, 1, &frame, timeout_ms > 0 ? timeout_ms : 200);
+  if (ret != RK_SUCCESS) return -3;
+  ret = media_export_vi_nv12(out, &frame, 1);
+  RK_MPI_VI_ReleaseChnFrame(0, 1, &frame);
+  if (ret != 0) {
+    memset(out, 0, sizeof(*out));
+    return -4;
+  }
+  return 0;
+}
+
+void media_release_sub_nv12(MediaNv12Frame *frame)
+{
+  MediaNv12Owned *owned;
+  if (!frame) return;
+  owned = (MediaNv12Owned *)frame->priv;
+  if (owned) {
+    if (owned->blk) RK_MPI_SYS_MmzFree(owned->blk);
+    free(owned);
+  }
+  memset(frame, 0, sizeof(*frame));
+}
+
+int media_grab_detect_nv12(MediaNv12Frame *out, int timeout_ms)
+{
+  VIDEO_FRAME_INFO_S frame;
+  int ret;
+  if (!out || !g_stream.up || !g_stream.vi2_up) return -1;
+  memset(out, 0, sizeof(*out));
+  memset(&frame, 0, sizeof(frame));
+  ret = RK_MPI_VI_GetChnFrame(0, 2, &frame, timeout_ms > 0 ? timeout_ms : 200);
+  if (ret != RK_SUCCESS) return -3;
+  ret = media_export_vi_nv12(out, &frame, 2);
+  RK_MPI_VI_ReleaseChnFrame(0, 2, &frame);
+  if (ret != 0) {
+    memset(out, 0, sizeof(*out));
+    return -4;
+  }
+  return 0;
+}
+
+void media_release_detect_nv12(MediaNv12Frame *frame)
+{
+  media_release_sub_nv12(frame);
 }
 
 int media_isp_single_frame(void)

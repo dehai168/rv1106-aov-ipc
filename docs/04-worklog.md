@@ -492,4 +492,90 @@
 ## 2026-08-01 session 60 — 文档同步入库
 - README / worklog / API 对齐 Web 改版与长分段 staging；排除官方 AOV PDF
 
+## 2026-08-05 session 61 — 人脸抓拍 F2/F3
+- F2：`/api/v1/alarm/face` GET/POST + events/image/DELETE；配置持久化；`api.ts` 客户端；`05-api.md`
+- F3：`FaceCaptureView` 三 Tab（侦测 / 区域与布防 / 抓拍记录）；侧栏「事件 → 人脸抓拍」
+- 板上：新 `ipc_app` 已推；face 路由未鉴权返回 1001；完整 curl 冒烟需有效 `IPC_PASS`（当前非 admin/admin1）
+- 下一步：F4 区域/配额生效与真机调参；浏览器登录验 UI
+
+## 2026-08-05 session 62 — 人脸抓拍 F4
+- 区域：`region_allows` 改为 640×360（与 RegionDrawCanvas 一致）；误用 /1000 已修
+- 配额：`storage_recycle_faces`；落盘前按 `face.quota_percent` 删最旧 jpg
+- Web：日上限 / 存储配额%；POST clamp
+- 待现场：启用抓拍 + 画区域验「区外不抓」；走动验灵敏度
+
+## 2026-08-05 session 63 — 预览黑屏修复
+- 现象：开人脸后实时预览无画面；IVS getResults timeout；snapshot GetStream fail
+- 根因：预览起流后立刻 `face_init` 加载 RKNN 常驻 CMA，挤占 VI/VENC；且人脸从 VI1 GetChnFrame 与子码流争用
+- 修复：RKNN 懒加载（首次运动门控才 load）；改从 VI2 取帧（depth=2）；门控需真实 motion notify
+- 板上暂保持 `face.enabled=false` 便于验预览
+
+## 2026-08-05 session 64 — 人脸 JPEG 一片红
+- 根因：VI GetChnFrame 误信 `pVirAddr[1]`，UV 指针错误 → 色度垃圾呈暗红块
+- 修复：一律 `MbBlk`+`MmzFlushCache`，UV=`base + VirWidth*VirHeight`
+
+## 2026-08-05 session 65 — 人脸 JPEG 仍偏红（hor_stride + vir_height）
+- 根因①：NV12 行步长须 `GetHorStride(VirWidth)`，不能当 `width`
+- 根因②：Rockchip NV12 UV 在 `hor_stride × vir_height`，不是 `hor_stride × height`；拷贝到工作缓冲时误用 `fh` 导致右半 UV 错位偏红
+- 修复：全程用 `vir_height` 定位/拷贝 UV；`MediaNv12Frame` 增加 `vir_width/vir_height`
+
+## 2026-08-05 session 66 — 人脸 JPEG 仍红（编译错误 + 落盘路径）
+- 中间误改引用了 SDK 不存在的 `u32Stride/u32Offset`，本地已编不过；板子仍跑旧二进制
+- 修复：`pVirAddr[1]` 仅在 offset∈{hor×h, hor×vh} 时采用，否则 `y+hor×vh`
+- 抓帧后压成 stride=width 紧凑 NV12；人脸裁剪改 NV12→RGB→`jpeg_write_rgb`（绕开裁剪 NV12 编码）
+- 首次推理前落盘 `/mnt/sdcard/faces/_dbg_y.jpg` + `_dbg_nv12.jpg` 便于对照
+
+## 2026-08-05 session 67 — 诊断：非 UV，是 cache
+- 同刻场景 HW JPEG 正常；`_dbg_y`/`_dbg_nv12` 全是花屏 → VI GetChnFrame 软件读到的就是垃圾
+- UV 偏移已正确（`uv-y = hor×vh = 921600`，src=hor*vh）
+- 根因：`MmzFlushCache(..., RK_TRUE)` 方向错；设备写后 CPU 读须 `RK_FALSE`（invalidate）
+- 人脸 score≈0.55 疑似花屏误检；修 cache 后应同时改善检测与落盘
+
+## 2026-08-05 session 68 — cache 仍无效，改 RGA 导出
+- 17:16 复测：场景 JPEG 正常，人脸/`_dbg_*` 仍花屏；`MmzFlushCache(RK_FALSE)` 无效
+- 根因：RV1106 VI DMABUF 的 `Handle2VirAddr` 对 CPU 不可靠
+- 修复：`media_grab_*_nv12` 经 RGA `imcopy(fd→virtualaddr)` 拷成 CPU 紧凑 NV12 后再推理/落盘
+
+## 2026-08-05 session 69 — RGA/malloc 打挂整机，先保 Web
+- 现象：上电后一会儿 Web 挂死，ADB 也丢；人脸开着会周期性 RGA
+- 根因：`imcopy` 目标用了普通 `malloc`，RGA DMA 写非 MMZ → 系统级 hang
+- 处置：暂时禁用 CPU NV12 export（grab 直接失败）；预览/录像/硬件 JPEG 不受影响
+- 人脸抓拍暂不可用，待 MmzAlloc 安全路径验证后再开
+
+## 2026-08-06 session 70 — 人脸抓拍：RGA + MmzAlloc
+- `media_export_vi_nv12`：VI fd → RGA imcopy → `MmzAlloc_Cached` 目标；release 时 `MmzFree`
+- 加 `g_rga_lock`；拷贝后 `MmzFlushCache(RK_FALSE)` 再给 CPU/RKNN
+- 已重新开启 `face.enabled` 部署验证
+
+## 2026-08-06 session 71 — VI2+RGA 仍花屏，改 VI1+importbuffer
+- 09:53：`rga+mmz ok` 但 `_dbg_y` 仍花屏；同刻场景 HW JPEG 正常
+- 改：`importbuffer_fd/physicaladdr` + `wrapbuffer_handle`；人脸改抓 **VI1**（与预览/JPEG 同路）；VI1 depth=3
+
+## 2026-08-06 session 72 — 放弃 VI NV12，改 HW JPEG 全链路
+- VI1 RGA 仍花屏（ymean~247）；判定 GetChnFrame 软件可读 NV12 不可用
+- 人脸：`media_snapshot_jpeg_mem` → NanoJPEG 解码 RGB → YuNet → `jpeg_write_rgb` 裁剪
+- 场景图复用同一帧 JPEG 落盘；不再调用 VI grab/RGA
+
+## 2026-08-06 session 73 — 红脸真因：自研 `jpeg_write_rgb` 色偏
+- `_dbg_scene.jpg` / 场景 HW JPEG 正常；裁剪框区域 RGB 正常；NanoJPEG 解码正常
+- 坏图 `20260806_101841_390_1.jpg` 几乎纯红（mean≈70,0,1）→ 编码坏
+- 主机复现：源 (92,96,107) → 旧编码器出 (0,5,35)
+- 修复：`jpeg_write_rgb` 改用 `stb_image_write`；板测 `--face 45` snaps=25，新图 center≈(148,144,143)
+- 部署注意：`/userdata` 空间紧，先清 log 再 `cp`，避免截断二进制
+
+## 2026-08-06 session 74 — 人脸裁剪只有 1/4（框偏嘴鼻）
+- 场景标注：检测框落在嘴/鼻，不是整脸；颜色链路已正常
+- 根因：YuNet 框回归偏紧 + 旧 distance 解码；裁剪未上扩
+- 尝试：OpenCV 解码 / 关键点 / 上扩 / 恒 sigmoid / 28px 过滤 → 板上几乎抓不到脸（更差）
+- **回退**：恢复 distance 解码（去掉 OpenCV/关键点/28px/恒 sigmoid）；保留 stb 颜色修复
+- 裁剪仅小改：中心上移 0.45×h、宽×1.25 / 高×1.8（不改检测）
+- Web 已 nohup 拉起；请打开预览对着镜头复测新抓拍
+
+## 2026-08-06 session 75 — 有推理无抓拍
+- 现象：UI infer 增加但 `faces/` 无新图；日志多见 `boxes=0`；旧抓拍目录曾被清空
+- 原因①：cls/obj 未做 sigmoid（logits 落在 0~1 被当成概率）→ 真脸分不够
+- 原因②：letterbox 顶边细条误检映射成 h≈0，裁剪 `ch<8` 静默失败
+- 修复：恒 sigmoid + 模型侧 min 16px；跳过 pad 区框；正方形裁剪；confirm=1；crop 失败打日志
+- 已部署，Web 200；请开预览对人脸验证
+
 

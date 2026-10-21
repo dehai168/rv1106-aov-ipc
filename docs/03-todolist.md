@@ -111,6 +111,28 @@
 
 细项执行清单：`docs/07-todolist-aov.md`。AOV 用户态主线暂保持现状，转其他功能优化。
 
+## M8 人脸抓拍（方案已定稿 `docs/design/face-capture.md`）
+
+> 决策锁定：YuNet 320 INT8；仅运动门控；联动录像默认开；全景引用 `snapshots/`；无预览画框；无调试开关。
+
+- [x] F0 RKNN + YuNet 320 上板冒烟 — **PASS**：YuNet 50× avg **7.51 ms**；模型 `/mnt/sdcard/models/yunet_320.rknn`；见 `docs/08-todolist-face.md`
+  - 内容：RKNN runtime 链接、YuNet 320 `.rknn` 部署、`face_rknn_smoke` 推理；记录耗时与 RSS
+  - 验收：板上单次/连续推理成功；文档记录模型路径与耗时
+- [x] F1 `face_service`（依赖 F0）— **PASS**：`--face` PIPELINE_OK（grab+infer）；运动门控+落盘链路已接；真人脸抓拍待现场验
+  - 内容：motion_gate + 去重/冷却 + 人脸 JPEG 落盘 + 引用 snapshot + 联动录像
+  - 验收：走动触发人脸文件与 `type=face` 告警；静止不刷 NPU
+- [x] F2 API + 配置（依赖 F1）— **PASS**：路由已上板（未鉴权 1001）；`face_cfg` GET/POST/events/image/delete；编译通过
+  - 内容：`GET/POST /api/v1/alarm/face`、events/image；`face.*` 持久化
+  - 验收：curl 开关/列表/下载通过
+- [x] F3 Web 三 Tab（依赖 F2）— **PASS**：侧栏「人脸抓拍」+ `FaceCaptureView` 侦测/区域布防/抓拍记录
+  - 内容：侧栏「人脸抓拍」+ 侦测/区域布防/抓拍记录
+  - 验收：浏览器配置生效，记录可预览下载
+- [x] F4 区域/布防/配额调参（依赖 F3）— **代码 PASS**：区域 640×360；schedule 门控；`storage_recycle_faces`；UI 配额项；真机灵敏度待现场
+  - 内容：regions + 7×24、配额回收、真机灵敏度调优
+  - 验收：区域外不抓；配额回收；室内 2–5m 可用
+
+细项与冒烟记录：`docs/08-todolist-face.md`。
+
 ---
 
 ## 进度速览
@@ -125,3 +147,4 @@
 | M5 时间与系统完善 | T5.1–T5.4 完成 |
 | M6 变帧率 AOV（二期） | **用户态主线完成**（MCU 睡时 MD / 功耗暂搁） |
 | M7 Web UI 产品化（Element Plus / VIGI 风格） | **完成** — 含可选增强（主预览/缩放/OSD/日志 tail/设备名/定时重启） |
+| M8 人脸抓拍 | **F0–F4 代码完成**；真机区域/抓拍/灵敏度待现场验收 |

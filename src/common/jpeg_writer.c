@@ -656,3 +656,5 @@ size_t jpeg_write_nv12(const uint8_t *nv12, int width, int height, int y_stride,
   return jpeg_write_nv12_planes(nv12, nv12 + y_stride * y_rows, width, height, y_stride, y_stride,
                                 out, out_cap, quality);
 }
+
+/* jpeg_write_rgb is implemented in jpeg_write_rgb.c (stb_image_write). */

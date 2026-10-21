@@ -8,6 +8,7 @@ import VideoView from './views/VideoView.vue'
 import StorageView from './views/StorageView.vue'
 import RecordPlanView from './views/RecordPlanView.vue'
 import AlarmView from './views/AlarmView.vue'
+import FaceCaptureView from './views/FaceCaptureView.vue'
 import SystemView from './views/SystemView.vue'
 import DeviceInfoView from './views/info/DeviceInfoView.vue'
 import SystemLogView from './views/info/SystemLogView.vue'
@@ -29,6 +30,7 @@ const router = createRouter({
         { path: 'settings', redirect: '/settings/camera' },
         { path: 'settings/camera', component: VideoView },
         { path: 'settings/event/motion', component: AlarmView },
+        { path: 'settings/event/face', component: FaceCaptureView },
         { path: 'settings/storage', component: StorageView },
         { path: 'settings/storage/plan', component: RecordPlanView },
         { path: 'settings/network', component: NetworkView },
