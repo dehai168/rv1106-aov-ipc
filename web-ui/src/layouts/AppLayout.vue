@@ -152,6 +152,7 @@ watch(
               <span>事件</span>
             </template>
             <el-menu-item index="/settings/event/motion">移动侦测</el-menu-item>
+            <el-menu-item index="/settings/event/face">人脸抓拍</el-menu-item>
           </el-sub-menu>
           <el-sub-menu index="storage">
             <template #title>

@@ -9,6 +9,7 @@
 #include "system/storage_service.h"
 #include "system/system_service.h"
 #include "detect/detect_service.h"
+#include "face/face_service.h"
 #include "record/record_service.h"
 #include "web/fmp4_mux.h"
 
@@ -144,7 +145,7 @@ static void schedule_motion_automation(void)
 {
   pthread_t th;
   int gen;
-  /* Motion policy: defer IVS until preview settles.
+  /* Motion policy: defer IVS a few seconds so AE/VI settle (cold-start safety).
    * Continuous/schedule: detect is started from web_apply_record_policy. */
   if (strcmp(g_record_policy_mode, "motion") != 0) {
     return;
@@ -1331,6 +1332,20 @@ static int web_start_detect_runtime_if_needed(void)
   }
   log_info("web", "detect runtime on (%dx%d)", media_stream_detect_width(),
            media_stream_detect_height());
+  {
+    FaceConfig fcfg;
+    int face_en = 0;
+    face_config_load(&fcfg);
+    config_get_bool("face.enabled", &face_en, 0);
+    fcfg.enabled = face_en;
+    if (face_en) {
+      if (face_init(&fcfg) == 0) {
+        face_start();
+      } else {
+        log_warn("web", "face init failed (disabled until fixed)");
+      }
+    }
+  }
   return 0;
 }
 
@@ -1478,20 +1493,27 @@ int web_apply_record_policy(void)
     return 0;
   }
 
-  /* motion: release hold; preview clients may restart automation */
-  g_record_policy_hold = 0;
-  if (!media_stream_is_up()) {
-    /* idle until preview opens */
-    log_info("web", "record policy=motion (preview-gated)");
-    return 0;
+  /* motion: hold media + start IVS/record when detect.enabled (not preview-gated). */
+  {
+    int detect_en = 1;
+    config_get_bool("detect.enabled", &detect_en, 1);
+    if (detect_en) {
+      g_record_policy_hold = 1;
+      if (web_ensure_media_for_policy() != 0) {
+        g_record_policy_hold = 0;
+        log_error("web", "record policy=motion media start failed");
+        return -1;
+      }
+      schedule_motion_automation();
+      log_info("web", "record policy=motion (hold media+detect)");
+      return 0;
+    }
   }
-  if (g_prev.nclients > 0) {
-    schedule_motion_automation();
-  } else {
-    /* media left from previous hold — stop if no preview */
+  g_record_policy_hold = 0;
+  if (g_prev.nclients == 0 && media_stream_is_up()) {
     media_stream_stop();
   }
-  log_info("web", "record policy=motion");
+  log_info("web", "record policy=motion (detect disabled)");
   return 0;
 }
 
@@ -1933,13 +1955,20 @@ static void handle_alarm_motion_set(struct mg_connection *c, struct mg_http_mess
     g_motion_automation_on = 0;
     if (cfg.enabled) {
       if (strcmp(g_record_policy_mode, "motion") == 0) {
-        if (web_start_motion_automation_if_needed() != 0) {
-          json_reply(c, 2402, "apply failed (open preview or ensure detect VI)", NULL);
+        g_record_policy_hold = 1;
+        if (web_ensure_media_for_policy() != 0 ||
+            web_start_motion_automation_if_needed() != 0) {
+          json_reply(c, 2402, "apply failed (media/detect VI not ready)", NULL);
           return;
         }
       } else if (web_start_detect_runtime_if_needed() != 0) {
         json_reply(c, 2402, "apply failed (media/detect VI not ready)", NULL);
         return;
+      }
+    } else if (strcmp(g_record_policy_mode, "motion") == 0) {
+      g_record_policy_hold = 0;
+      if (g_prev.nclients == 0 && media_stream_is_up()) {
+        media_stream_stop();
       }
     }
   }
@@ -2014,8 +2043,8 @@ static void handle_alarm_events(struct mg_connection *c, struct mg_http_message 
   char q_limit[16];
   int limit;
   FILE *fp;
-  char line[512];
-  char lines[200][512];
+  char line[768];
+  char lines[200][768];
   int stored;
   int pos;
   int i;
@@ -2042,6 +2071,7 @@ static void handle_alarm_events(struct mg_connection *c, struct mg_http_message 
     data = cJSON_CreateObject();
     records = cJSON_CreateArray();
     cJSON_AddItemToObject(data, "events", records);
+    cJSON_AddNumberToObject(data, "count", 0);
     json_reply(c, 0, "ok", data);
     return;
   }
@@ -2056,6 +2086,10 @@ static void handle_alarm_events(struct mg_connection *c, struct mg_http_message 
     if (n == 0) {
       continue;
     }
+    /* Face events share alarms.log; motion UI only wants detect rows. */
+    if (strstr(line, "\"type\":\"face\"")) {
+      continue;
+    }
     if (stored < limit) {
       snprintf(lines[stored], sizeof(lines[stored]), "%s", line);
       stored++;
@@ -2068,12 +2102,13 @@ static void handle_alarm_events(struct mg_connection *c, struct mg_http_message 
 
   records = cJSON_CreateArray();
   data = cJSON_CreateObject();
-  cJSON_AddNumberToObject(data, "count", (double)stored);
+  cJSON_AddNumberToObject(data, "count", (double)(stored < limit ? stored : limit));
 
   {
     int out_n = stored < limit ? stored : limit;
     int start = (stored < limit) ? 0 : pos;
-    for (i = 0; i < out_n; i++) {
+    /* Newest first for the live event pane. */
+    for (i = out_n - 1; i >= 0; i--) {
       int idx = (start + i) % limit;
       cJSON *obj = cJSON_ParseWithLength(lines[idx], strlen(lines[idx]));
       if (obj) {
@@ -2086,7 +2121,436 @@ static void handle_alarm_events(struct mg_connection *c, struct mg_http_message 
   json_reply(c, 0, "ok", data);
 }
 
-/* ---- system (T4.8) ---- */
+/* ---- face capture (F2) ---- */
+
+static cJSON *face_cfg_to_json(const FaceConfig *cfg)
+{
+  cJSON *data = cJSON_CreateObject();
+  cJSON *regions;
+  cJSON *schedule;
+  cJSON *link;
+  cJSON *last;
+  FaceEvent ev;
+  int i;
+
+  cJSON_AddBoolToObject(data, "enabled", cfg->enabled ? 1 : 0);
+  cJSON_AddStringToObject(data, "model", "yunet_320");
+  cJSON_AddStringToObject(data, "trigger", "motion_gate");
+  cJSON_AddStringToObject(data, "model_path", cfg->model_path);
+  cJSON_AddStringToObject(data, "sensitivity", cfg->sensitivity);
+  cJSON_AddNumberToObject(data, "interval_ms", cfg->interval_ms);
+  cJSON_AddNumberToObject(data, "hold_ms", cfg->hold_ms);
+  cJSON_AddNumberToObject(data, "cooldown_ms", cfg->cooldown_ms);
+  cJSON_AddNumberToObject(data, "confirm_frames", cfg->confirm_frames);
+  cJSON_AddNumberToObject(data, "min_face_px", cfg->min_face_px);
+  cJSON_AddNumberToObject(data, "max_faces", cfg->max_faces);
+  cJSON_AddNumberToObject(data, "max_snap_per_frame", cfg->max_snap_per_frame);
+  cJSON_AddNumberToObject(data, "face_jpeg_side", cfg->face_jpeg_side);
+  cJSON_AddNumberToObject(data, "score_thr_x100", (int)(cfg->score_thr * 100.f + 0.5f));
+  cJSON_AddNumberToObject(data, "margin_x100", (int)(cfg->margin * 100.f + 0.5f));
+  cJSON_AddBoolToObject(data, "save_scene", cfg->save_scene ? 1 : 0);
+
+  regions = cJSON_CreateArray();
+  for (i = 0; i < FACE_MAX_REGIONS; i++) {
+    cJSON *r = cJSON_CreateObject();
+    cJSON_AddBoolToObject(r, "enabled", cfg->regions[i].enabled ? 1 : 0);
+    cJSON_AddNumberToObject(r, "x", cfg->regions[i].x);
+    cJSON_AddNumberToObject(r, "y", cfg->regions[i].y);
+    cJSON_AddNumberToObject(r, "w", cfg->regions[i].w);
+    cJSON_AddNumberToObject(r, "h", cfg->regions[i].h);
+    cJSON_AddItemToArray(regions, r);
+  }
+  cJSON_AddItemToObject(data, "regions", regions);
+
+  schedule = cJSON_CreateObject();
+  cJSON_AddBoolToObject(schedule, "enabled", cfg->schedule_enabled ? 1 : 0);
+  cJSON_AddStringToObject(schedule, "grid", cfg->schedule_grid);
+  cJSON_AddItemToObject(data, "schedule", schedule);
+
+  link = cJSON_CreateObject();
+  cJSON_AddBoolToObject(link, "record", cfg->link_record ? 1 : 0);
+  cJSON_AddBoolToObject(link, "snapshot", cfg->save_scene ? 1 : 0);
+  cJSON_AddBoolToObject(link, "alarm", cfg->link_alarm ? 1 : 0);
+  cJSON_AddItemToObject(data, "link", link);
+
+  cJSON_AddNumberToObject(data, "quota_percent", cfg->quota_percent);
+  cJSON_AddNumberToObject(data, "daily_limit", cfg->daily_limit);
+  cJSON_AddBoolToObject(data, "running", face_is_running() ? 1 : 0);
+  cJSON_AddNumberToObject(data, "snap_count", face_snap_count());
+  cJSON_AddNumberToObject(data, "infer_count", face_infer_count());
+
+  last = cJSON_CreateObject();
+  if (face_last_event(&ev) == 0) {
+    cJSON_AddNumberToObject(last, "ts", (double)ev.ts);
+    cJSON_AddNumberToObject(last, "score", ev.score);
+    cJSON_AddNumberToObject(last, "x", ev.x);
+    cJSON_AddNumberToObject(last, "y", ev.y);
+    cJSON_AddNumberToObject(last, "w", ev.w);
+    cJSON_AddNumberToObject(last, "h", ev.h);
+    cJSON_AddStringToObject(last, "face_file", ev.face_file);
+    cJSON_AddStringToObject(last, "scene_file", ev.scene_file);
+  }
+  cJSON_AddItemToObject(data, "last_event", last);
+  return data;
+}
+
+static int web_apply_face_runtime(const FaceConfig *cfg)
+{
+  face_stop();
+  face_deinit();
+  if (!cfg->enabled) {
+    return 0;
+  }
+  (void)web_start_detect_runtime_if_needed();
+  if (face_init(cfg) != 0) {
+    return -1;
+  }
+  return face_start();
+}
+
+static void handle_alarm_face_get(struct mg_connection *c, struct mg_http_message *hm)
+{
+  FaceConfig cfg;
+  if (!auth_ok(hm)) {
+    json_reply(c, 1001, "unauthorized", NULL);
+    return;
+  }
+  face_config_load(&cfg);
+  json_reply(c, 0, "ok", face_cfg_to_json(&cfg));
+}
+
+static void handle_alarm_face_set(struct mg_connection *c, struct mg_http_message *hm)
+{
+  FaceConfig cfg;
+  cJSON *root;
+  cJSON *item;
+  cJSON *regions;
+  cJSON *schedule;
+  cJSON *link;
+  int apply = 1;
+  int i;
+
+  if (!auth_ok(hm)) {
+    json_reply(c, 1001, "unauthorized", NULL);
+    return;
+  }
+  face_config_load(&cfg);
+  root = cJSON_ParseWithLength(hm->body.buf, hm->body.len);
+  if (!root) {
+    json_reply(c, 1002, "bad json", NULL);
+    return;
+  }
+
+  (void)json_read_bool(cJSON_GetObjectItem(root, "enabled"), &cfg.enabled);
+  item = cJSON_GetObjectItem(root, "sensitivity");
+  if (cJSON_IsString(item) && item->valuestring) {
+    snprintf(cfg.sensitivity, sizeof(cfg.sensitivity), "%s", item->valuestring);
+  }
+  item = cJSON_GetObjectItem(root, "interval_ms");
+  if (cJSON_IsNumber(item)) cfg.interval_ms = item->valueint;
+  item = cJSON_GetObjectItem(root, "hold_ms");
+  if (cJSON_IsNumber(item)) cfg.hold_ms = item->valueint;
+  item = cJSON_GetObjectItem(root, "cooldown_ms");
+  if (cJSON_IsNumber(item)) cfg.cooldown_ms = item->valueint;
+  item = cJSON_GetObjectItem(root, "confirm_frames");
+  if (cJSON_IsNumber(item)) cfg.confirm_frames = item->valueint;
+  item = cJSON_GetObjectItem(root, "min_face_px");
+  if (cJSON_IsNumber(item)) cfg.min_face_px = item->valueint;
+  item = cJSON_GetObjectItem(root, "max_faces");
+  if (cJSON_IsNumber(item)) cfg.max_faces = item->valueint;
+  item = cJSON_GetObjectItem(root, "max_snap_per_frame");
+  if (cJSON_IsNumber(item)) cfg.max_snap_per_frame = item->valueint;
+  item = cJSON_GetObjectItem(root, "face_jpeg_side");
+  if (cJSON_IsNumber(item)) cfg.face_jpeg_side = item->valueint;
+  item = cJSON_GetObjectItem(root, "score_thr_x100");
+  if (cJSON_IsNumber(item)) cfg.score_thr = item->valueint / 100.f;
+  item = cJSON_GetObjectItem(root, "margin_x100");
+  if (cJSON_IsNumber(item)) cfg.margin = item->valueint / 100.f;
+  item = cJSON_GetObjectItem(root, "quota_percent");
+  if (cJSON_IsNumber(item)) cfg.quota_percent = item->valueint;
+  item = cJSON_GetObjectItem(root, "daily_limit");
+  if (cJSON_IsNumber(item)) cfg.daily_limit = item->valueint;
+  (void)json_read_bool(cJSON_GetObjectItem(root, "save_scene"), &cfg.save_scene);
+
+  regions = cJSON_GetObjectItem(root, "regions");
+  if (cJSON_IsArray(regions)) {
+    int n = cJSON_GetArraySize(regions);
+    if (n > FACE_MAX_REGIONS) n = FACE_MAX_REGIONS;
+    for (i = 0; i < FACE_MAX_REGIONS; i++) memset(&cfg.regions[i], 0, sizeof(cfg.regions[i]));
+    for (i = 0; i < n; i++) {
+      cJSON *r = cJSON_GetArrayItem(regions, i);
+      (void)json_read_bool(cJSON_GetObjectItem(r, "enabled"), &cfg.regions[i].enabled);
+      item = cJSON_GetObjectItem(r, "x");
+      if (cJSON_IsNumber(item)) cfg.regions[i].x = item->valueint;
+      item = cJSON_GetObjectItem(r, "y");
+      if (cJSON_IsNumber(item)) cfg.regions[i].y = item->valueint;
+      item = cJSON_GetObjectItem(r, "w");
+      if (cJSON_IsNumber(item)) cfg.regions[i].w = item->valueint;
+      item = cJSON_GetObjectItem(r, "h");
+      if (cJSON_IsNumber(item)) cfg.regions[i].h = item->valueint;
+    }
+  }
+
+  schedule = cJSON_GetObjectItem(root, "schedule");
+  if (cJSON_IsObject(schedule)) {
+    (void)json_read_bool(cJSON_GetObjectItem(schedule, "enabled"), &cfg.schedule_enabled);
+    item = cJSON_GetObjectItem(schedule, "grid");
+    if (cJSON_IsString(item) && item->valuestring &&
+        strlen(item->valuestring) == FACE_SCHEDULE_GRID_LEN) {
+      memcpy(cfg.schedule_grid, item->valuestring, FACE_SCHEDULE_GRID_LEN);
+      cfg.schedule_grid[FACE_SCHEDULE_GRID_LEN] = '\0';
+    }
+  }
+
+  link = cJSON_GetObjectItem(root, "link");
+  if (cJSON_IsObject(link)) {
+    (void)json_read_bool(cJSON_GetObjectItem(link, "record"), &cfg.link_record);
+    (void)json_read_bool(cJSON_GetObjectItem(link, "snapshot"), &cfg.save_scene);
+    (void)json_read_bool(cJSON_GetObjectItem(link, "alarm"), &cfg.link_alarm);
+  }
+
+  (void)json_read_bool(cJSON_GetObjectItem(root, "apply"), &apply);
+  cJSON_Delete(root);
+
+  face_apply_sensitivity(&cfg);
+  if (cfg.interval_ms < 100) cfg.interval_ms = 100;
+  if (cfg.hold_ms < 500) cfg.hold_ms = 500;
+  if (cfg.cooldown_ms < 500) cfg.cooldown_ms = 500;
+  if (cfg.max_snap_per_frame < 1) cfg.max_snap_per_frame = 1;
+  if (cfg.max_snap_per_frame > 4) cfg.max_snap_per_frame = 4;
+  if (cfg.quota_percent < 1) cfg.quota_percent = 1;
+  if (cfg.quota_percent > 50) cfg.quota_percent = 50;
+  if (cfg.daily_limit < 10) cfg.daily_limit = 10;
+  if (cfg.daily_limit > 20000) cfg.daily_limit = 20000;
+  if (strcmp(cfg.sensitivity, "high") != 0 && strcmp(cfg.sensitivity, "low") != 0) {
+    snprintf(cfg.sensitivity, sizeof(cfg.sensitivity), "normal");
+  }
+  for (i = 0; i < FACE_MAX_REGIONS; i++) {
+    if (cfg.regions[i].x < 0) cfg.regions[i].x = 0;
+    if (cfg.regions[i].y < 0) cfg.regions[i].y = 0;
+    if (cfg.regions[i].w < 0) cfg.regions[i].w = 0;
+    if (cfg.regions[i].h < 0) cfg.regions[i].h = 0;
+    if (cfg.regions[i].x > 639) cfg.regions[i].x = 639;
+    if (cfg.regions[i].y > 359) cfg.regions[i].y = 359;
+    if (cfg.regions[i].w > 640) cfg.regions[i].w = 640;
+    if (cfg.regions[i].h > 360) cfg.regions[i].h = 360;
+    cfg.regions[i].enabled = cfg.regions[i].enabled ? 1 : 0;
+  }
+  snprintf(cfg.model_path, sizeof(cfg.model_path), "/mnt/sdcard/models/yunet_320.rknn");
+
+  if (face_config_save(&cfg) != 0) {
+    json_reply(c, 2301, "save failed", NULL);
+    return;
+  }
+  if (apply) {
+    if (web_apply_face_runtime(&cfg) != 0 && cfg.enabled) {
+      json_reply(c, 2302, "apply failed (open preview / ensure model)", face_cfg_to_json(&cfg));
+      return;
+    }
+  }
+  json_reply(c, 0, "ok", face_cfg_to_json(&cfg));
+}
+
+static int is_face_rel_path(const char *rel)
+{
+  size_t n;
+  size_t i;
+  const char *base;
+  if (!rel || strchr(rel, '\\') || strstr(rel, "..")) return 0;
+  n = strlen(rel);
+  if (n < 28 || n > 80) return 0;
+  if (rel[8] != '/') return 0;
+  for (i = 0; i < 8; i++) {
+    if (!isdigit((unsigned char)rel[i])) return 0;
+  }
+  base = rel + 9;
+  if (strncmp(base, rel, 8) != 0) return 0;
+  if (base[8] != '_') return 0;
+  if (!strstr(base, ".jpg")) return 0;
+  return 1;
+}
+
+static void handle_alarm_face_events(struct mg_connection *c, struct mg_http_message *hm)
+{
+  char date[16];
+  char limit_s[16];
+  char offset_s[16];
+  char dir[320];
+  DIR *dp;
+  struct dirent *de;
+  int limit = 50;
+  int offset = 0;
+  int total = 0;
+  int emitted = 0;
+  cJSON *data;
+  cJSON *arr;
+  char names[256][96];
+  int nnames = 0;
+  int i;
+
+  if (!auth_ok(hm)) {
+    json_reply(c, 1001, "unauthorized", NULL);
+    return;
+  }
+  memset(date, 0, sizeof(date));
+  memset(limit_s, 0, sizeof(limit_s));
+  memset(offset_s, 0, sizeof(offset_s));
+  if (mg_http_get_var(&hm->query, "date", date, sizeof(date)) <= 0 || !is_date8(date)) {
+    time_t t = time(NULL);
+    struct tm tm;
+    localtime_r(&t, &tm);
+    strftime(date, sizeof(date), "%Y%m%d", &tm);
+  }
+  if (mg_http_get_var(&hm->query, "limit", limit_s, sizeof(limit_s)) > 0) {
+    int v = atoi(limit_s);
+    if (v > 0 && v <= 200) limit = v;
+  }
+  if (mg_http_get_var(&hm->query, "offset", offset_s, sizeof(offset_s)) > 0) {
+    int v = atoi(offset_s);
+    if (v >= 0) offset = v;
+  }
+
+  snprintf(dir, sizeof(dir), "%s/%s", storage_faces_path(), date);
+  dp = opendir(dir);
+  data = cJSON_CreateObject();
+  arr = cJSON_CreateArray();
+  cJSON_AddStringToObject(data, "date", date);
+  if (!dp) {
+    cJSON_AddNumberToObject(data, "total", 0);
+    cJSON_AddNumberToObject(data, "count", 0);
+    cJSON_AddItemToObject(data, "events", arr);
+    json_reply(c, 0, "ok", data);
+    return;
+  }
+  while ((de = readdir(dp)) != NULL && nnames < 256) {
+    size_t ln;
+    if (de->d_name[0] == '.') continue;
+    ln = strlen(de->d_name);
+    if (ln < 10 || ln >= sizeof(names[0]) || strcmp(de->d_name + ln - 4, ".jpg") != 0) continue;
+    memcpy(names[nnames], de->d_name, ln + 1);
+    nnames++;
+  }
+  closedir(dp);
+
+  for (i = 0; i < nnames / 2; i++) {
+    char tmp[96];
+    memcpy(tmp, names[i], sizeof(tmp));
+    memcpy(names[i], names[nnames - 1 - i], sizeof(names[i]));
+    memcpy(names[nnames - 1 - i], tmp, sizeof(names[nnames - 1 - i]));
+  }
+
+  total = nnames;
+  for (i = 0; i < nnames; i++) {
+    cJSON *ev;
+    char rel[160];
+    if (i < offset) continue;
+    if (emitted >= limit) break;
+    snprintf(rel, sizeof(rel), "%s/%s", date, names[i]);
+    ev = cJSON_CreateObject();
+    cJSON_AddStringToObject(ev, "type", "face");
+    cJSON_AddStringToObject(ev, "face_file", rel);
+    cJSON_AddStringToObject(ev, "file", names[i]);
+    cJSON_AddItemToArray(arr, ev);
+    emitted++;
+  }
+  cJSON_AddNumberToObject(data, "total", total);
+  cJSON_AddNumberToObject(data, "count", emitted);
+  cJSON_AddNumberToObject(data, "offset", offset);
+  cJSON_AddNumberToObject(data, "limit", limit);
+  cJSON_AddItemToObject(data, "events", arr);
+  json_reply(c, 0, "ok", data);
+}
+
+static void handle_alarm_face_image(struct mg_connection *c, struct mg_http_message *hm)
+{
+  char file[160];
+  char full[400];
+  struct stat st;
+  struct mg_http_serve_opts opts;
+
+  if (!auth_ok(hm)) {
+    json_reply(c, 1001, "unauthorized", NULL);
+    return;
+  }
+  memset(file, 0, sizeof(file));
+  if (mg_http_get_var(&hm->query, "file", file, sizeof(file)) <= 0 || !is_face_rel_path(file)) {
+    json_reply(c, 1002, "bad file", NULL);
+    return;
+  }
+  snprintf(full, sizeof(full), "%s/%s", storage_faces_path(), file);
+  if (stat(full, &st) != 0 || !S_ISREG(st.st_mode)) {
+    json_reply(c, 2303, "not found", NULL);
+    return;
+  }
+  memset(&opts, 0, sizeof(opts));
+  opts.root_dir = "/";
+  opts.extra_headers = "Content-Type: image/jpeg\r\nCache-Control: no-store\r\n";
+  mg_http_serve_file(c, hm, full, &opts);
+}
+
+static void handle_alarm_face_events_delete(struct mg_connection *c, struct mg_http_message *hm)
+{
+  cJSON *root;
+  cJSON *files;
+  cJSON *date_item;
+  int deleted = 0;
+  int i;
+
+  if (!auth_ok(hm)) {
+    json_reply(c, 1001, "unauthorized", NULL);
+    return;
+  }
+  root = cJSON_ParseWithLength(hm->body.buf, hm->body.len);
+  if (!root) {
+    json_reply(c, 1002, "bad json", NULL);
+    return;
+  }
+  files = cJSON_GetObjectItem(root, "files");
+  date_item = cJSON_GetObjectItem(root, "date");
+  if (cJSON_IsArray(files)) {
+    int n = cJSON_GetArraySize(files);
+    for (i = 0; i < n; i++) {
+      cJSON *it = cJSON_GetArrayItem(files, i);
+      char full[400];
+      if (!cJSON_IsString(it) || !it->valuestring || !is_face_rel_path(it->valuestring)) continue;
+      snprintf(full, sizeof(full), "%s/%s", storage_faces_path(), it->valuestring);
+      if (unlink(full) == 0) deleted++;
+    }
+  } else if (cJSON_IsString(date_item) && date_item->valuestring && is_date8(date_item->valuestring)) {
+    char dirpath[320];
+    DIR *dp;
+    struct dirent *de;
+    snprintf(dirpath, sizeof(dirpath), "%s/%s", storage_faces_path(), date_item->valuestring);
+    dp = opendir(dirpath);
+    if (dp) {
+      while ((de = readdir(dp)) != NULL) {
+        char full[640];
+        size_t dlen;
+        size_t dn;
+        if (de->d_name[0] == '.') continue;
+        dn = strlen(de->d_name);
+        dlen = strlen(dirpath);
+        if (dn == 0 || dlen + 1 + dn + 1 > sizeof(full)) continue;
+        memcpy(full, dirpath, dlen);
+        full[dlen] = '/';
+        memcpy(full + dlen + 1, de->d_name, dn + 1);
+        if (unlink(full) == 0) deleted++;
+      }
+      closedir(dp);
+      rmdir(dirpath);
+    }
+  } else {
+    cJSON_Delete(root);
+    json_reply(c, 1002, "files or date required", NULL);
+    return;
+  }
+  cJSON_Delete(root);
+  {
+    cJSON *data = cJSON_CreateObject();
+    cJSON_AddNumberToObject(data, "deleted", deleted);
+    json_reply(c, 0, "ok", data);
+  }
+}
 
 static cJSON *system_info_to_json(const SystemInfo *info)
 {
@@ -2807,9 +3271,9 @@ static void preview_shutdown_pipeline(void)
     media_stream_remove_packet_listener(preview_on_packet, NULL);
   }
   (void)media_stream_preview_main_set_active(0);
-  cancel_motion_automation_schedule();
-  /* Motion policy is preview-gated; continuous/schedule keep detect while media held. */
-  if (strcmp(g_record_policy_mode, "motion") == 0) {
+  /* With policy hold, keep pending/running IVS+record after preview clients leave. */
+  if (strcmp(g_record_policy_mode, "motion") == 0 && !g_record_policy_hold) {
+    cancel_motion_automation_schedule();
     web_stop_motion_automation();
   }
   if (media_owned && !g_record_policy_hold) {
@@ -3158,6 +3622,31 @@ static void ev_handler(struct mg_connection *c, int ev, void *ev_data)
     return;
   }
 
+  if (mg_match(hm->uri, mg_str("/api/v1/alarm/face/events"), NULL) &&
+      mg_strcmp(hm->method, mg_str("GET")) == 0) {
+    handle_alarm_face_events(c, hm);
+    return;
+  }
+  if (mg_match(hm->uri, mg_str("/api/v1/alarm/face/events"), NULL) &&
+      mg_strcmp(hm->method, mg_str("DELETE")) == 0) {
+    handle_alarm_face_events_delete(c, hm);
+    return;
+  }
+  if (mg_match(hm->uri, mg_str("/api/v1/alarm/face/image"), NULL) &&
+      mg_strcmp(hm->method, mg_str("GET")) == 0) {
+    handle_alarm_face_image(c, hm);
+    return;
+  }
+  if (mg_match(hm->uri, mg_str("/api/v1/alarm/face"), NULL) &&
+      mg_strcmp(hm->method, mg_str("GET")) == 0) {
+    handle_alarm_face_get(c, hm);
+    return;
+  }
+  if (mg_match(hm->uri, mg_str("/api/v1/alarm/face"), NULL) &&
+      mg_strcmp(hm->method, mg_str("POST")) == 0) {
+    handle_alarm_face_set(c, hm);
+    return;
+  }
   if (mg_match(hm->uri, mg_str("/api/v1/alarm/motion"), NULL) &&
       mg_strcmp(hm->method, mg_str("GET")) == 0) {
     handle_alarm_motion_get(c, hm);

@@ -2,6 +2,7 @@
 #include "common/event_bus.h"
 #include "common/log.h"
 #include "detect/detect_service.h"
+#include "face/face_service.h"
 #include "media/media_service.h"
 #include "record/record_service.h"
 #include "system/config_service.h"
@@ -661,6 +662,146 @@ static int run_detect(int seconds)
   return 0;
 }
 
+/* F1: motion-gated face capture smoke. Wave / show face to camera. */
+static int run_face(int seconds)
+{
+  FaceConfig fcfg;
+  DetectConfig dcfg;
+  MediaEncodeConfig ecfg;
+  RecordConfig rcfg;
+  char iq_dir[256];
+  char mount[128];
+  char level_str[32];
+  StorageStatus st;
+  int left;
+  int enabled = 1;
+  int snaps;
+
+  log_init_ex(LOG_LEVEL_INFO, LOG_DIR);
+  if (app_config_init() != 0) {
+    log_error("main", "config_init failed");
+    return 1;
+  }
+  config_get_string("log.level", level_str, (int)sizeof(level_str), "info");
+  log_set_level(parse_level(level_str));
+  config_get_string("storage.mount", mount, (int)sizeof(mount), "/mnt/sdcard");
+  load_encode_cfg(&ecfg, iq_dir, (int)sizeof(iq_dir));
+  if (ecfg.detect_w <= 0) {
+    ecfg.detect_w = 640;
+    ecfg.detect_h = 360;
+  }
+
+  if (storage_init(mount) != 0 || event_bus_init() != 0) {
+    app_config_fini();
+    log_close();
+    return 2;
+  }
+  if (storage_get_status(&st) != 0 || !st.mounted) {
+    log_error("main", "TF not mounted");
+    event_bus_deinit();
+    storage_deinit();
+    app_config_fini();
+    log_close();
+    return 3;
+  }
+
+  face_config_load(&fcfg);
+  fcfg.enabled = 1;
+  config_get_bool("detect.enabled", &enabled, 1);
+  memset(&dcfg, 0, sizeof(dcfg));
+  dcfg.enabled = enabled;
+  config_get_int("detect.sensitivity", &dcfg.sensitivity, 2);
+  config_get_int("detect.square_pct", &dcfg.square_pct, 8);
+  config_get_int("detect.hit_frames", &dcfg.hit_frames, 2);
+
+  log_info("main", "face test %ds model=%s", seconds, fcfg.model_path);
+  if (media_stream_start(&ecfg) != 0) {
+    log_error("main", "stream_start failed");
+    event_bus_deinit();
+    storage_deinit();
+    app_config_fini();
+    log_close();
+    return 4;
+  }
+
+  memset(&rcfg, 0, sizeof(rcfg));
+  config_get_int("record.segment_sec", &rcfg.segment_sec, 30);
+  config_get_int("record.pre_record_sec", &rcfg.pre_record_sec, 4);
+  rcfg.quiet_sec = 12;
+  rcfg.main_w = ecfg.main_w;
+  rcfg.main_h = ecfg.main_h;
+  rcfg.main_fps = ecfg.main_fps;
+  rcfg.main_bitrate_kbps = ecfg.main_bitrate_kbps;
+  record_init(&rcfg);
+  record_arm_motion();
+
+  if (detect_init(&dcfg) != 0 || detect_start() != 0) {
+    log_error("main", "detect start failed");
+    record_deinit();
+    media_stream_stop();
+    event_bus_deinit();
+    storage_deinit();
+    app_config_fini();
+    log_close();
+    return 5;
+  }
+  if (face_init(&fcfg) != 0 || face_start() != 0) {
+    log_error("main", "face start failed");
+    detect_stop();
+    detect_deinit();
+    record_deinit();
+    media_stream_stop();
+    event_bus_deinit();
+    storage_deinit();
+    app_config_fini();
+    log_close();
+    return 6;
+  }
+
+  left = seconds;
+  while (left-- > 0) {
+    sleep(1);
+    /* No live motion: keep gate open so grab/infer path can be verified. */
+    if (detect_motion_count() < 1) {
+      face_notify_motion();
+    }
+    if ((seconds - left) % 5 == 0) {
+      log_info("main", "face tick left=%d motions=%d snaps=%d infers=%d", left,
+               detect_motion_count(), face_snap_count(), face_infer_count());
+    }
+  }
+
+  snaps = face_snap_count();
+  {
+    FaceEvent ev;
+    int infers = face_infer_count();
+    memset(&ev, 0, sizeof(ev));
+    face_last_event(&ev);
+    face_stop();
+    face_deinit();
+    detect_stop();
+    detect_deinit();
+    record_deinit();
+    media_stream_stop();
+    event_bus_deinit();
+    storage_deinit();
+    app_config_fini();
+    if (snaps >= 1) {
+      log_info("main", "face PASSED snaps=%d last=%s", snaps, ev.face_file);
+      log_close();
+      return 0;
+    }
+    if (infers >= 5) {
+      log_info("main", "face PIPELINE_OK infers=%d snaps=0 (no face in view)", infers);
+      log_close();
+      return 0;
+    }
+    log_error("main", "face FAILED snaps=0 infers=%d", infers);
+    log_close();
+    return 7;
+  }
+}
+
 static int run_web(int seconds)
 {
   log_init_ex(LOG_LEVEL_INFO, LOG_DIR);
@@ -910,6 +1051,16 @@ int main(int argc, char **argv)
       }
     }
     return run_detect(seconds);
+  }
+  if (argc > 1 && strcmp(argv[1], "--face") == 0) {
+    int seconds = 60;
+    if (argc > 2) {
+      seconds = atoi(argv[2]);
+      if (seconds <= 0) {
+        seconds = 60;
+      }
+    }
+    return run_face(seconds);
   }
   if (argc > 1 && strcmp(argv[1], "--web") == 0) {
     int seconds = 0;

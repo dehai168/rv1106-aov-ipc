@@ -15,11 +15,13 @@
 typedef struct {
   char path[512];
   time_t mtime;
+  uint64_t size;
 } FileEntry;
 
 static char g_mount[128] = "/mnt/sdcard";
 static char g_records[160] = "/mnt/sdcard/records";
 static char g_snapshots[160] = "/mnt/sdcard/snapshots";
+static char g_faces[160] = "/mnt/sdcard/faces";
 static int g_ready = 0;
 static int g_suspend_active;
 static char g_sd_dev[64];
@@ -46,6 +48,7 @@ int storage_init(const char *mount_path)
   }
   snprintf(g_records, sizeof(g_records), "%s/records", g_mount);
   snprintf(g_snapshots, sizeof(g_snapshots), "%s/snapshots", g_mount);
+  snprintf(g_faces, sizeof(g_faces), "%s/faces", g_mount);
   g_ready = 1;
   return storage_ensure_dirs();
 }
@@ -68,6 +71,11 @@ const char *storage_records_path(void)
 const char *storage_snapshots_path(void)
 {
   return g_snapshots;
+}
+
+const char *storage_faces_path(void)
+{
+  return g_faces;
 }
 
 int storage_get_status(StorageStatus *st)
@@ -112,6 +120,7 @@ int storage_get_status(StorageStatus *st)
 int storage_ensure_dirs(void)
 {
   char snap[160];
+  char faces[160];
   if (ensure_dir(g_mount) != 0) {
     return -1;
   }
@@ -123,6 +132,11 @@ int storage_ensure_dirs(void)
     return -1;
   }
   snprintf(g_snapshots, sizeof(g_snapshots), "%s", snap);
+  snprintf(faces, sizeof(faces), "%s/faces", g_mount);
+  if (ensure_dir(faces) != 0) {
+    return -1;
+  }
+  snprintf(g_faces, sizeof(g_faces), "%s", faces);
   return 0;
 }
 
@@ -226,6 +240,52 @@ static int collect_mp4(const char *dir, FileEntry **list, int *count, int *cap)
     }
     snprintf((*list)[*count].path, sizeof((*list)[*count].path), "%s", path);
     (*list)[*count].mtime = st.st_mtime;
+    (*list)[*count].size = (uint64_t)st.st_size;
+    (*count)++;
+  }
+  closedir(dp);
+  return 0;
+}
+
+static int collect_jpg(const char *dir, FileEntry **list, int *count, int *cap)
+{
+  DIR *dp = opendir(dir);
+  struct dirent *de;
+  if (!dp) {
+    return -1;
+  }
+  while ((de = readdir(dp)) != NULL) {
+    char path[512];
+    struct stat st;
+    size_t n;
+    if (strcmp(de->d_name, ".") == 0 || strcmp(de->d_name, "..") == 0) {
+      continue;
+    }
+    snprintf(path, sizeof(path), "%s/%s", dir, de->d_name);
+    if (stat(path, &st) != 0) {
+      continue;
+    }
+    if (S_ISDIR(st.st_mode)) {
+      collect_jpg(path, list, count, cap);
+      continue;
+    }
+    n = strlen(de->d_name);
+    if (n < 4 || strcmp(de->d_name + n - 4, ".jpg") != 0) {
+      continue;
+    }
+    if (*count >= *cap) {
+      int ncap = (*cap == 0) ? 64 : (*cap * 2);
+      FileEntry *nl = (FileEntry *)realloc(*list, (size_t)ncap * sizeof(FileEntry));
+      if (!nl) {
+        closedir(dp);
+        return -1;
+      }
+      *list = nl;
+      *cap = ncap;
+    }
+    snprintf((*list)[*count].path, sizeof((*list)[*count].path), "%s", path);
+    (*list)[*count].mtime = st.st_mtime;
+    (*list)[*count].size = (uint64_t)st.st_size;
     (*count)++;
   }
   closedir(dp);
@@ -281,6 +341,58 @@ int storage_recycle_oldest(int target_free_percent)
 
   free(list);
   log_info("storage", "recycle removed %d files, free=%d%%", deleted, storage_free_percent());
+  return deleted;
+}
+
+int storage_recycle_faces(int quota_percent)
+{
+  StorageStatus st;
+  FileEntry *list = NULL;
+  int count = 0, cap = 0, deleted = 0, i;
+  uint64_t used = 0;
+  uint64_t limit;
+
+  if (!g_ready || quota_percent <= 0) {
+    return -1;
+  }
+  if (quota_percent > 90) {
+    quota_percent = 90;
+  }
+  if (storage_get_status(&st) != 0 || !st.mounted || st.total_bytes == 0) {
+    return -1;
+  }
+  limit = (st.total_bytes * (uint64_t)quota_percent) / 100ULL;
+  if (limit < (512ULL * 1024ULL)) {
+    limit = 512ULL * 1024ULL;
+  }
+  if (collect_jpg(g_faces, &list, &count, &cap) != 0 || count == 0) {
+    free(list);
+    return 0;
+  }
+  for (i = 0; i < count; i++) {
+    used += list[i].size;
+  }
+  if (used <= limit) {
+    free(list);
+    return 0;
+  }
+  qsort(list, (size_t)count, sizeof(FileEntry), cmp_mtime);
+  for (i = 0; i < count && used > limit; i++) {
+    if (unlink(list[i].path) == 0) {
+      deleted++;
+      used -= list[i].size;
+      log_warn("storage", "face recycle delete: %s", list[i].path);
+      {
+        char *slash = strrchr(list[i].path, '/');
+        if (slash) {
+          *slash = '\0';
+          rmdir(list[i].path);
+        }
+      }
+    }
+  }
+  free(list);
+  log_info("storage", "face recycle removed %d files, quota=%d%%", deleted, quota_percent);
   return deleted;
 }
 
@@ -547,6 +659,7 @@ int storage_format_clear(void)
   }
   wipe_tree_files(g_records, &deleted);
   wipe_tree_files(g_snapshots, &deleted);
+  wipe_tree_files(g_faces, &deleted);
   snprintf(alarms, sizeof(alarms), "%s/alarms", g_mount);
   wipe_tree_files(alarms, &deleted);
   if (storage_ensure_dirs() != 0) {

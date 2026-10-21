@@ -278,6 +278,104 @@ export function alarmSnapshotUrl(file: string) {
   return `/api/v1/alarm/snapshot?file=${encodeURIComponent(file)}`
 }
 
+export type FaceRegion = AlarmRegion
+
+export type FaceConfig = {
+  enabled: boolean
+  model: string
+  trigger: string
+  model_path: string
+  sensitivity: 'high' | 'normal' | 'low' | string
+  interval_ms: number
+  hold_ms: number
+  cooldown_ms: number
+  confirm_frames: number
+  min_face_px: number
+  max_faces: number
+  max_snap_per_frame: number
+  face_jpeg_side: number
+  score_thr_x100: number
+  margin_x100: number
+  save_scene: boolean
+  regions: FaceRegion[]
+  schedule: { enabled: boolean; grid: string }
+  link: { record: boolean; snapshot: boolean; alarm: boolean }
+  quota_percent: number
+  daily_limit: number
+  running: boolean
+  snap_count: number
+  infer_count: number
+  last_event: {
+    ts?: number
+    score?: number
+    x?: number
+    y?: number
+    w?: number
+    h?: number
+    face_file?: string
+    scene_file?: string
+  }
+}
+
+export type FaceEventItem = {
+  type: string
+  face_file: string
+  file: string
+}
+
+export function getFaceConfig() {
+  return request<FaceConfig>('/api/v1/alarm/face')
+}
+
+export function setFaceConfig(
+  body: Partial<
+    Pick<
+      FaceConfig,
+      | 'enabled'
+      | 'sensitivity'
+      | 'interval_ms'
+      | 'hold_ms'
+      | 'cooldown_ms'
+      | 'confirm_frames'
+      | 'min_face_px'
+      | 'max_snap_per_frame'
+      | 'save_scene'
+      | 'regions'
+      | 'schedule'
+      | 'link'
+      | 'quota_percent'
+      | 'daily_limit'
+    >
+  > & { apply?: boolean },
+) {
+  return request<FaceConfig>('/api/v1/alarm/face', {
+    method: 'POST',
+    body: JSON.stringify(body),
+  })
+}
+
+export function getFaceEvents(opts: { date?: string; limit?: number; offset?: number } = {}) {
+  const q = new URLSearchParams()
+  if (opts.date) q.set('date', opts.date)
+  if (opts.limit != null) q.set('limit', String(opts.limit))
+  if (opts.offset != null) q.set('offset', String(opts.offset))
+  const qs = q.toString()
+  return request<{ date: string; total: number; count: number; offset: number; limit: number; events: FaceEventItem[] }>(
+    `/api/v1/alarm/face/events${qs ? `?${qs}` : ''}`,
+  )
+}
+
+export function faceImageUrl(file: string) {
+  return `/api/v1/alarm/face/image?file=${encodeURIComponent(file)}`
+}
+
+export function deleteFaceEvents(body: { files?: string[]; date?: string }) {
+  return request<{ deleted: number }>('/api/v1/alarm/face/events', {
+    method: 'DELETE',
+    body: JSON.stringify(body),
+  })
+}
+
 export function previewSnapshot() {
   return request<{ file: string; url: string }>('/api/v1/preview/snapshot', {
     method: 'POST',

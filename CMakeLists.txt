@@ -22,6 +22,8 @@ add_executable(ipc_app
   src/common/event_bus.c
   src/common/sha256.c
   src/common/jpeg_writer.c
+  src/common/jpeg_write_rgb.c
+  src/common/jpeg_reader.c
   src/system/config_service.c
   src/system/storage_service.c
   src/system/network_service.c
@@ -30,6 +32,8 @@ add_executable(ipc_app
   src/media/media_osd.c
   src/record/record_service.c
   src/detect/detect_service.c
+  src/face/rknn_face.c
+  src/face/face_service.c
   src/aov/aov_service.c
   src/web/web_service.c
   src/web/fmp4_mux.c
@@ -42,6 +46,7 @@ target_include_directories(ipc_app PRIVATE
   ${CMAKE_CURRENT_SOURCE_DIR}/third_party/cJSON
   ${CMAKE_CURRENT_SOURCE_DIR}/third_party/rkmuxer
   ${CMAKE_CURRENT_SOURCE_DIR}/third_party/mongoose
+  ${CMAKE_CURRENT_SOURCE_DIR}/third_party/rknn
   ${RK_MEDIA_OUT}/include
   ${RK_MEDIA_OUT}/include/rkaiq
   ${RK_MEDIA_OUT}/include/rkaiq/uAPI2
@@ -56,6 +61,9 @@ target_include_directories(ipc_app PRIVATE
 )
 
 target_compile_options(ipc_app PRIVATE -Wall -Wextra -Werror)
+# NanoJPEG / stb_image_write are third-party; silence their warnings.
+set_source_files_properties(src/common/jpeg_reader.c PROPERTIES COMPILE_FLAGS "-w")
+set_source_files_properties(src/common/jpeg_write_rgb.c PROPERTIES COMPILE_FLAGS "-w")
 target_compile_definitions(ipc_app PRIVATE
   _GNU_SOURCE
   RKAIQ
@@ -77,6 +85,7 @@ target_link_libraries(ipc_app PRIVATE
   rga
   rkaiq
   rkmuxer
+  rknnmrt
   freetype
   pthread
   m
@@ -84,3 +93,17 @@ target_link_libraries(ipc_app PRIVATE
 )
 
 install(TARGETS ipc_app RUNTIME DESTINATION bin)
+
+# F0: RKNN smoke (YuNet / any .rknn)
+add_executable(face_rknn_smoke
+  tools/face_rknn_smoke.c
+)
+target_include_directories(face_rknn_smoke PRIVATE
+  ${CMAKE_CURRENT_SOURCE_DIR}/third_party/rknn
+)
+target_link_directories(face_rknn_smoke PRIVATE ${RK_MEDIA_OUT}/lib)
+target_link_options(face_rknn_smoke PRIVATE
+  "-Wl,-rpath-link,${RK_MEDIA_OUT}/lib"
+)
+target_link_libraries(face_rknn_smoke PRIVATE rknnmrt pthread m)
+target_compile_options(face_rknn_smoke PRIVATE -Wall -Wextra)

@@ -1,6 +1,7 @@
 #ifndef IPC_MEDIA_MEDIA_SERVICE_H
 #define IPC_MEDIA_MEDIA_SERVICE_H
 
+#include <stddef.h>
 #include <stdint.h>
 
 #include "media/media_osd.h"
@@ -88,6 +89,32 @@ int media_osd_set(const MediaOsdConfig *in, int apply);
 
 /* One-shot hardware JPEG via VENC combo (master = sub H.264). Requires stream up. */
 int media_snapshot_jpeg(const char *path);
+/* Same as media_snapshot_jpeg but returns malloc'd buffer (caller free). */
+int media_snapshot_jpeg_mem(uint8_t **out, size_t *out_len);
+
+/* Grab one NV12 frame from VI1 (sub, depth>=2). Caller must media_release_*_nv12.
+ * Buffer is RGA-copied into MMZ (contiguous NV12, stride=width). priv = MediaNv12Owned*. */
+typedef struct {
+  const uint8_t *y;
+  const uint8_t *uv;
+  int width;
+  int height;
+  int vir_width;
+  int vir_height;
+  int y_stride;
+  int uv_stride;
+  size_t nv12_size;
+  void *priv; /* MediaNv12Owned* — MmzFree on release */
+  int vi_chn; /* 1=sub, 2=detect */
+} MediaNv12Frame;
+
+int media_grab_sub_nv12(MediaNv12Frame *out, int timeout_ms);
+void media_release_sub_nv12(MediaNv12Frame *frame);
+/* Grab from VI2 (detect/IVS path). Prefer this for face — does not starve preview sub. */
+int media_grab_detect_nv12(MediaNv12Frame *out, int timeout_ms);
+void media_release_detect_nv12(MediaNv12Frame *frame);
+int media_stream_sub_width(void);
+int media_stream_sub_height(void);
 
 /* AOV: ISP single-frame (pause AIQ) / multi-frame (resume AIQ). */
 int media_isp_single_frame(void);

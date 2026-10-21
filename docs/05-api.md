@@ -100,6 +100,13 @@
 - 已实现：
   - `GET /api/v1/alarm/motion`：detect 配置 + `running/motion_count/last_event`
   - `POST /api/v1/alarm/motion`：保存配置（可选 `apply` 立即重启 runtime）
+  - `GET /api/v1/alarm/events`：告警事件（含 motion；face 也写入 alarms.log）
+  - `GET /api/v1/alarm/snapshot?file=`：全景抓图下载
+  - **人脸抓拍（F2）**
+    - `GET/POST /api/v1/alarm/face`：配置 + `running/snap_count/infer_count/last_event`；POST 可 `apply`
+    - `GET /api/v1/alarm/face/events?date=&limit=&offset=`：按日列出 `faces/` 文件
+    - `GET /api/v1/alarm/face/image?file=YYYYMMDD/...jpg`：人脸图下载（白名单路径）
+    - `DELETE /api/v1/alarm/face/events`：body `{files:[...]}` 或 `{date:"YYYYMMDD"}`
   - `GET /api/v1/alarm/events?limit<=200`：读取 `/alarms/alarms.log` 最近 N 条（JSONL，含 `snapshot`）
   - `GET /api/v1/alarm/snapshot?file=YYYYMMDD_HHMMSS.jpg`：下载告警抓图（鉴权，白名单文件名）
 - **侦测 runtime**：`detect.enabled` 且媒体已起时，**continuous / schedule / motion** 策略下都会跑 IVS（VI2）。`link.record` 仅在录像策略为 `motion` 时触发 `record_on_motion`（不会把连续录像切成事件模式）。

@@ -26,6 +26,10 @@ size_t jpeg_write_nv12_planes(const uint8_t *y, const uint8_t *uv, int width, in
                               int y_stride, int uv_stride, uint8_t *out, size_t out_cap,
                               int quality /*1-100*/);
 
+/* Encode packed RGB24 (R,G,B per pixel) as baseline YCbCr 4:2:0 JPEG. */
+size_t jpeg_write_rgb(const uint8_t *rgb, int width, int height, int stride, uint8_t *out,
+                      size_t out_cap, int quality /*1-100*/);
+
 #ifdef __cplusplus
 }
 #endif

@@ -100,7 +100,8 @@ async function refresh() {
     if (m.code !== 0) throw new Error(m.msg || '读取告警配置失败')
     if (evs.code !== 0) throw new Error(evs.msg || '读取告警事件失败')
     motion.value = ensureDefaults(m.data)
-    events.value = evs.data.events
+    events.value = (evs.data.events || []).filter((e) => e && typeof e.square === 'number')
+    page.value = 1
   } catch (e) {
     ElMessage.error(String(e))
   } finally {
@@ -153,7 +154,9 @@ onMounted(() => {
   refreshTimer = window.setInterval(() => {
     getAlarmEvents(eventsLimit.value)
       .then((evs) => {
-        if (evs.code === 0) events.value = evs.data.events
+        if (evs.code === 0) {
+          events.value = (evs.data.events || []).filter((e) => e && typeof e.square === 'number')
+        }
       })
       .catch(() => {})
     getAlarmMotion()
