@@ -755,6 +755,14 @@ int storage_format_card(void)
     return -2;
   }
 
+  /* The NPU models (face detect) live on the card and must survive mkfs:
+   * stash them on tmpfs and copy back after the remount. */
+  snprintf(cmd, sizeof(cmd),
+           "rm -rf /tmp/ipc_models && mkdir -p /tmp/ipc_models && "
+           "cp -a %s/models/. /tmp/ipc_models/ 2>/dev/null",
+           g_mount);
+  (void)system(cmd);
+
   /* Quiesce writers: clean umount first, lazy only if the card is still busy. */
   snprintf(cmd, sizeof(cmd), "umount %s 2>/dev/null", g_mount);
   if (system(cmd) != 0) {
@@ -786,6 +794,13 @@ int storage_format_card(void)
       g_suspend_active = 0;
       storage_ensure_dirs();
       ensure_dir(g_mount);
+      snprintf(cmd, sizeof(cmd),
+               "mkdir -p %s/models && cp -a /tmp/ipc_models/. %s/models/ 2>/dev/null && "
+               "rm -rf /tmp/ipc_models",
+               g_mount, g_mount);
+      if (system(cmd) == 0) {
+        log_info("storage", "format: models restored to %s/models", g_mount);
+      }
       log_info("storage", "format: remount %s ok", g_mount);
       return rc;
     }
