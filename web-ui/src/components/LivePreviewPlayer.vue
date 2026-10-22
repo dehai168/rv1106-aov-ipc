@@ -265,14 +265,40 @@ function reconnectNow() {
     window.clearTimeout(reconnectTimer)
     reconnectTimer = undefined
   }
-  if (ws) {
-    ws.onclose = null
-    ws.close()
-    ws = null
-  }
+  stopSocket()
   resetPlayer()
   resetZoom()
   connect()
+}
+
+/**
+ * Ask the server to stop pushing frames, then close. Sending data on a socket
+ * that is already closing makes Chrome log
+ * "Data frame received after close" during main/sub switches.
+ */
+function stopSocket() {
+  const sock = ws
+  ws = null
+  if (!sock) return
+  sock.onmessage = null
+  sock.onerror = null
+  sock.onclose = null
+  try {
+    if (sock.readyState === WebSocket.OPEN) {
+      sock.send('stop')
+      window.setTimeout(() => {
+        try {
+          sock.close()
+        } catch {
+          /* ignore */
+        }
+      }, 120)
+      return
+    }
+    sock.close()
+  } catch {
+    /* ignore */
+  }
 }
 
 function toggleStream() {
@@ -313,7 +339,8 @@ async function onSnapshot() {
   if (snapping.value) return
   snapping.value = true
   try {
-    const r = await previewSnapshot()
+    /* Snapshot must match the stream currently on screen (main => main size). */
+    const r = await previewSnapshot(stream.value)
     if (r.code !== 0 || !r.data?.file) {
       ElMessage.error(r.msg || '抓图失败')
       return
@@ -387,11 +414,8 @@ onMounted(() => {
 onUnmounted(() => {
   closed = true
   if (reconnectTimer) window.clearTimeout(reconnectTimer)
-  if (ws) {
-    ws.onclose = null
-    ws.close()
-    ws = null
-  }
+  if (chaseTimer) window.clearInterval(chaseTimer)
+  stopSocket()
   resetPlayer()
 })
 

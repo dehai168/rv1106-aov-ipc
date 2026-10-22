@@ -46,6 +46,7 @@ typedef struct {
   int mux_writing;
   int seg_active;
   int flushing_prerecord;
+  int seg_kind; /* RECORD_KIND_* of the segment currently open */
   RecordConfig cfg;
   char cur_path[512];   /* final destination on TF */
   char stage_path[512]; /* /tmp staging file while muxing */
@@ -88,6 +89,30 @@ static int ensure_day_dir(char *day_dir, size_t n, const struct tm *tm)
   snprintf(day_dir, n, "%s/%04d%02d%02d", storage_records_path(), tm->tm_year + 1900,
            tm->tm_mon + 1, tm->tm_mday);
   struct stat st;
+  if (stat(day_dir, &st) == 0) {
+    return S_ISDIR(st.st_mode) ? 0 : -1;
+  }
+  if (mkdir(day_dir, 0755) != 0) {
+    log_error("record", "mkdir %s failed", day_dir);
+    return -1;
+  }
+  return 0;
+}
+
+/* Event (motion-linked) clips live under records/events/YYYYMMDD and carry an
+ * EVT_ prefix so the play list can tell them from normal continuous segments. */
+static int ensure_event_dir(char *day_dir, size_t n, const struct tm *tm)
+{
+  char ev_root[192];
+  struct stat st;
+
+  snprintf(ev_root, sizeof(ev_root), "%s/events", storage_records_path());
+  if (stat(ev_root, &st) != 0 && mkdir(ev_root, 0755) != 0) {
+    log_error("record", "mkdir %s failed", ev_root);
+    return -1;
+  }
+  snprintf(day_dir, n, "%s/%04d%02d%02d", ev_root, tm->tm_year + 1900, tm->tm_mon + 1,
+           tm->tm_mday);
   if (stat(day_dir, &st) == 0) {
     return S_ISDIR(st.st_mode) ? 0 : -1;
   }
@@ -329,13 +354,23 @@ static int open_segment_locked(void)
   char day_dir[256];
   VideoParam vp;
   int ret;
+  int kind = (g_rec.mode == RECORD_MODE_MOTION) ? RECORD_KIND_EVENT : RECORD_KIND_NORMAL;
 
-  if (ensure_day_dir(day_dir, sizeof(day_dir), &tm) != 0) {
-    return -1;
+  if (kind == RECORD_KIND_EVENT) {
+    if (ensure_event_dir(day_dir, sizeof(day_dir), &tm) != 0) {
+      return -1;
+    }
+    snprintf(g_rec.cur_path, sizeof(g_rec.cur_path), "%s/EVT_%04d%02d%02d_%02d%02d%02d.mp4",
+             day_dir, tm.tm_year + 1900, tm.tm_mon + 1, tm.tm_mday, tm.tm_hour, tm.tm_min,
+             tm.tm_sec);
+  } else {
+    if (ensure_day_dir(day_dir, sizeof(day_dir), &tm) != 0) {
+      return -1;
+    }
+    snprintf(g_rec.cur_path, sizeof(g_rec.cur_path), "%s/%04d%02d%02d_%02d%02d%02d.mp4", day_dir,
+             tm.tm_year + 1900, tm.tm_mon + 1, tm.tm_mday, tm.tm_hour, tm.tm_min, tm.tm_sec);
   }
-
-  snprintf(g_rec.cur_path, sizeof(g_rec.cur_path), "%s/%04d%02d%02d_%02d%02d%02d.mp4", day_dir,
-           tm.tm_year + 1900, tm.tm_mon + 1, tm.tm_mday, tm.tm_hour, tm.tm_min, tm.tm_sec);
+  g_rec.seg_kind = kind;
   /*
    * Stage on TF card, not /tmp. tmpfs is ~90MB on this board; a 300s 2Mbps
    * segment needs ~75MB+ and truncates before rkmuxer writes moov → unplayable.

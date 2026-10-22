@@ -934,6 +934,7 @@ typedef struct {
   time_t mtime;
   uint64_t size;
   char name[256];
+  int event; /* 1 = motion event clip under records/events/ */
 } StorageRecord;
 
 static int is_digits_str(const char *s)
@@ -1035,6 +1036,7 @@ static int storage_collect_mp4_in_dir(const char *dir, const char *day,
     snprintf((*out)[*count].name, sizeof((*out)[*count].name), "%s", de->d_name);
     (*out)[*count].mtime = st.st_mtime;
     (*out)[*count].size = (uint64_t)st.st_size;
+    (*out)[*count].event = (strncmp(day, "events/", 7) == 0) ? 1 : 0;
     (*count)++;
   }
   closedir(dp);
@@ -1065,6 +1067,10 @@ static void handle_storage_status(struct mg_connection *c, struct mg_http_messag
   cJSON_AddStringToObject(data, "mount_path", st.mount_path);
   cJSON_AddStringToObject(data, "fstype", st.fstype);
   cJSON_AddBoolToObject(data, "mounted", st.mounted ? 1 : 0);
+  cJSON_AddBoolToObject(data, "present", st.present ? 1 : 0);
+  cJSON_AddBoolToObject(data, "formatted", st.formatted ? 1 : 0);
+  cJSON_AddStringToObject(data, "state", st.state);
+  cJSON_AddStringToObject(data, "device", storage_sd_device());
   json_reply(c, 0, "ok", data);
 }
 
@@ -1116,8 +1122,14 @@ static void handle_storage_records(struct mg_connection *c, struct mg_http_messa
 
   if (have_date) {
     char day_dir[512];
+    char ev_dir[512];
+    char ev_tag[64];
     snprintf(day_dir, sizeof(day_dir), "%s/%s", base, date);
     storage_collect_mp4_in_dir(day_dir, date, &arr, &n, &cap);
+    /* Motion-linked event clips: records/events/YYYYMMDD/EVT_*.mp4 */
+    snprintf(ev_dir, sizeof(ev_dir), "%s/events/%s", base, date);
+    snprintf(ev_tag, sizeof(ev_tag), "events/%s", date);
+    storage_collect_mp4_in_dir(ev_dir, ev_tag, &arr, &n, &cap);
   } else {
     DIR *dp = opendir(base);
     struct dirent *de;
@@ -1140,10 +1152,62 @@ static void handle_storage_records(struct mg_connection *c, struct mg_http_messa
       }
       closedir(dp);
     }
+    {
+      DIR *edp;
+      char ev_root[448];
+      snprintf(ev_root, sizeof(ev_root), "%s/events", base);
+      edp = opendir(ev_root);
+      if (edp) {
+        struct dirent *ede;
+        while ((ede = readdir(edp)) != NULL) {
+          char day_dir[512];
+          char ev_tag[64];
+          struct stat st;
+          size_t dn = strlen(ede->d_name);
+          if (ede->d_name[0] == '.' || dn != 8 || !is_date8(ede->d_name)) {
+            continue;
+          }
+          snprintf(day_dir, sizeof(day_dir), "%s/%.8s", ev_root, ede->d_name);
+          if (stat(day_dir, &st) != 0 || !S_ISDIR(st.st_mode)) {
+            continue;
+          }
+          snprintf(ev_tag, sizeof(ev_tag), "events/%.8s", ede->d_name);
+          storage_collect_mp4_in_dir(day_dir, ev_tag, &arr, &n, &cap);
+        }
+        closedir(edp);
+      }
+    }
   }
 
   if (arr && n > 0) {
     storage_rec_sort_mtime_desc(arr, n);
+  }
+
+  /* Optional kind filter: normal (30min-style) vs event (motion-linked). */
+  {
+    char kind_s[16];
+    int kind_filter = -1;
+    memset(kind_s, 0, sizeof(kind_s));
+    if (mg_http_get_var(&hm->query, "kind", kind_s, sizeof(kind_s)) > 0) {
+      if (strcmp(kind_s, "event") == 0) {
+        kind_filter = 1;
+      } else if (strcmp(kind_s, "normal") == 0) {
+        kind_filter = 0;
+      }
+    }
+    if (kind_filter >= 0 && arr && n > 0) {
+      int w = 0;
+      int r;
+      for (r = 0; r < n; r++) {
+        if ((arr[r].event ? 1 : 0) == kind_filter) {
+          if (w != r) {
+            arr[w] = arr[r];
+          }
+          w++;
+        }
+      }
+      n = w;
+    }
   }
 
   {
@@ -1176,6 +1240,7 @@ static void handle_storage_records(struct mg_connection *c, struct mg_http_messa
       cJSON_AddStringToObject(it, "name", arr[start + i].name);
       cJSON_AddNumberToObject(it, "mtime", (double)arr[start + i].mtime);
       cJSON_AddNumberToObject(it, "size", (double)arr[start + i].size);
+      cJSON_AddStringToObject(it, "kind", arr[start + i].event ? "event" : "normal");
       cJSON_AddItemToArray(records, it);
     }
     cJSON_AddItemToObject(data, "records", records);
@@ -1209,15 +1274,24 @@ static void handle_storage_download(struct mg_connection *c, struct mg_http_mess
   }
 
   {
+    const char *rel_day = rel;
     char day[9];
-    char *slash = strchr(rel, '/');
-    if (!slash || (slash - rel) != 8) {
+    char *slash;
+    if (strncmp(rel_day, "events/", 7) == 0) {
+      rel_day += 7;
+    }
+    slash = strchr(rel_day, '/');
+    if (!slash || (slash - rel_day) != 8) {
       json_reply(c, 1002, "bad path", NULL);
       return;
     }
-    memcpy(day, rel, 8);
+    memcpy(day, rel_day, 8);
     day[8] = '\0';
     if (!is_date8(day)) {
+      json_reply(c, 1002, "bad path", NULL);
+      return;
+    }
+    if (strchr(slash + 1, '/') != NULL) {
       json_reply(c, 1002, "bad path", NULL);
       return;
     }
@@ -1244,7 +1318,9 @@ static void handle_storage_format(struct mg_connection *c, struct mg_http_messag
   cJSON *root;
   cJSON *item;
   int confirm = 0;
+  int mkfs = 0;
   int deleted;
+  int rc;
   cJSON *data;
 
   if (!auth_ok(hm)) {
@@ -1263,6 +1339,12 @@ static void handle_storage_format(struct mg_connection *c, struct mg_http_messag
   } else if (cJSON_IsNumber(item)) {
     confirm = item->valueint ? 1 : 0;
   }
+  item = cJSON_GetObjectItem(root, "mkfs");
+  if (cJSON_IsBool(item)) {
+    mkfs = cJSON_IsTrue(item) ? 1 : 0;
+  } else if (cJSON_IsNumber(item)) {
+    mkfs = item->valueint ? 1 : 0;
+  }
   cJSON_Delete(root);
 
   if (!confirm) {
@@ -1275,6 +1357,23 @@ static void handle_storage_format(struct mg_connection *c, struct mg_http_messag
   web_stop_motion_automation();
   g_schedule_poll_on = 0;
   record_deinit();
+
+  if (mkfs) {
+    rc = storage_format_card();
+    if (rc != 0) {
+      json_reply(c, 2404,
+                 rc == -2 ? "no sdcard" : (rc == -3 ? "sdcard busy" : "mkfs failed"), NULL);
+      return;
+    }
+    data = cJSON_CreateObject();
+    cJSON_AddNumberToObject(data, "deleted", 0);
+    cJSON_AddStringToObject(data, "state", "mounted");
+    cJSON_AddStringToObject(data, "note", "mkfs.vfat done, card remounted");
+    (void)web_apply_record_policy();
+    json_reply(c, 0, "ok", data);
+    return;
+  }
+
   deleted = storage_format_clear();
   if (deleted < 0) {
     json_reply(c, 2403, "format failed", NULL);
@@ -1283,7 +1382,9 @@ static void handle_storage_format(struct mg_connection *c, struct mg_http_messag
 
   data = cJSON_CreateObject();
   cJSON_AddNumberToObject(data, "deleted", (double)deleted);
+  cJSON_AddStringToObject(data, "state", "mounted");
   cJSON_AddStringToObject(data, "note", "soft clear records/snapshots/alarms (not mkfs)");
+  (void)web_apply_record_policy();
   json_reply(c, 0, "ok", data);
 }
 
@@ -1789,6 +1890,28 @@ static void alarm_read_region_obj(cJSON *obj, DetectRegion *r)
   if (cJSON_IsNumber(item)) {
     r->h = item->valueint;
   }
+  /* Accept explicit permille from newer clients; otherwise derive from the
+   * 640x360 drawing frame so ROI matching is resolution independent. */
+  item = cJSON_GetObjectItem(obj, "w_pct");
+  if (cJSON_IsNumber(item)) {
+    r->pct_x = 0;
+    r->pct_y = 0;
+    r->pct_w = 0;
+    r->pct_h = 0;
+    (void)json_read_bool(cJSON_GetObjectItem(obj, "enabled"), &r->enabled);
+    if (cJSON_IsNumber(cJSON_GetObjectItem(obj, "x_pct"))) {
+      r->pct_x = cJSON_GetObjectItem(obj, "x_pct")->valueint;
+    }
+    if (cJSON_IsNumber(cJSON_GetObjectItem(obj, "y_pct"))) {
+      r->pct_y = cJSON_GetObjectItem(obj, "y_pct")->valueint;
+    }
+    r->pct_w = item->valueint;
+    if (cJSON_IsNumber(cJSON_GetObjectItem(obj, "h_pct"))) {
+      r->pct_h = cJSON_GetObjectItem(obj, "h_pct")->valueint;
+    }
+  } else {
+    detect_region_from_xywh(r);
+  }
 }
 
 static void handle_alarm_motion_get(struct mg_connection *c, struct mg_http_message *hm)
@@ -1927,6 +2050,20 @@ static void handle_alarm_motion_set(struct mg_connection *c, struct mg_http_mess
     if (cfg.regions[i].h < 0) {
       cfg.regions[i].h = 0;
     }
+    if (cfg.regions[i].x > 639) {
+      cfg.regions[i].x = 639;
+    }
+    if (cfg.regions[i].y > 359) {
+      cfg.regions[i].y = 359;
+    }
+    if (cfg.regions[i].w > 640 - cfg.regions[i].x) {
+      cfg.regions[i].w = 640 - cfg.regions[i].x;
+    }
+    if (cfg.regions[i].h > 360 - cfg.regions[i].y) {
+      cfg.regions[i].h = 360 - cfg.regions[i].y;
+    }
+    /* x/y/w/h are authoritative from the UI: resync permille from them. */
+    detect_region_from_xywh(&cfg.regions[i]);
     cfg.regions[i].enabled = cfg.regions[i].enabled ? 1 : 0;
   }
   cfg.link_record = cfg.link_record ? 1 : 0;
@@ -3045,6 +3182,9 @@ static void preview_enqueue_locked(int stream, const uint8_t *data, uint32_t len
     if (!pc->used || !pc->c || pc->stream != stream) {
       continue;
     }
+    if (pc->c->is_closing || pc->c->is_draining || !pc->c->is_websocket) {
+      continue;
+    }
     if (pc->wait_key) {
       if (!key) {
         continue;
@@ -3378,11 +3518,45 @@ static void preview_remove_client(struct mg_connection *c)
   }
 }
 
+/* Client asked to stop (main/sub switch): stop pushing frames at once but keep
+ * the socket open so the browser can finish the closing handshake cleanly. */
+static void preview_detach_client(struct mg_connection *c)
+{
+  int i;
+  int empty;
+
+  pthread_mutex_lock(&g_prev.lock);
+  for (i = 0; i < PREVIEW_MAX_CLIENTS; i++) {
+    if (g_prev.clients[i].used && g_prev.clients[i].c == c) {
+      preview_client_clear_q(&g_prev.clients[i]);
+      g_prev.clients[i].used = 0;
+      g_prev.clients[i].c = NULL;
+      if (g_prev.nclients > 0) {
+        g_prev.nclients--;
+      }
+      break;
+    }
+  }
+  empty = (g_prev.nclients == 0);
+  c->data[0] = 0;
+  pthread_mutex_unlock(&g_prev.lock);
+  preview_sync_main_encode();
+  if (empty) {
+    g_preview_idle_deadline_ms = web_now_ms() + 2000;
+  }
+  log_info("web", "preview client stop-request n=%d", g_prev.nclients);
+}
+
 static void preview_poll_client(PreviewClient *pc)
 {
   char meta[80];
   PreviewTrack *tr;
   if (!pc->used || !pc->c || !pc->c->is_websocket) {
+    return;
+  }
+  /* Never queue into a connection that is already going away: the browser
+   * reports "Data frame received after close" on stream switch otherwise. */
+  if (pc->c->is_closing || pc->c->is_draining) {
     return;
   }
   tr = &g_prev.track[pc->stream == 1 ? 1 : 0];
@@ -3464,11 +3638,16 @@ static void handle_preview_ws(struct mg_connection *c, struct mg_http_message *h
   }
 }
 
-/* T7.2.2: manual JPEG snapshot (VENC JPEG combo) while preview pipeline is up. */
+/* T7.2.2: manual JPEG snapshot (VENC JPEG combo) while preview pipeline is up.
+ * ?stream=main returns the record-main resolution (main_w x main_h); default
+ * stays sub so the preview button matches the visible stream. */
 static void handle_preview_snapshot_post(struct mg_connection *c, struct mg_http_message *hm)
 {
-  char name[64];
+  char name[80];
   char path[320];
+  char stream_s[16];
+  int stream = 0;
+  int shot_stream;
   time_t now;
   struct tm tm_now;
   cJSON *data;
@@ -3481,29 +3660,56 @@ static void handle_preview_snapshot_post(struct mg_connection *c, struct mg_http
     json_reply(c, 2601, "aov mode: preview unavailable", NULL);
     return;
   }
+  memset(stream_s, 0, sizeof(stream_s));
+  if (mg_http_get_var(&hm->query, "stream", stream_s, sizeof(stream_s)) > 0) {
+    if (strcmp(stream_s, "main") == 0) {
+      stream = 1;
+    }
+  }
   if (preview_ensure_pipeline() != 0) {
     json_reply(c, 2102, "preview media not ready", NULL);
     return;
   }
   now = time(NULL);
   localtime_r(&now, &tm_now);
-  strftime(name, sizeof(name), "%Y%m%d_%H%M%S.jpg", &tm_now);
   if (storage_ensure_dirs() != 0) {
     json_reply(c, 2201, "storage not ready", NULL);
     return;
   }
-  snprintf(path, sizeof(path), "%s/%s", storage_snapshots_path(), name);
-  if (media_snapshot_jpeg(path) != 0) {
-    json_reply(c, 2102, "snapshot failed", NULL);
-    return;
+  shot_stream = stream;
+  strftime(name, sizeof(name), "%Y%m%d_%H%M%S", &tm_now);
+  snprintf(path, sizeof(path), "%s/%s_%s.jpg", storage_snapshots_path(), name,
+           shot_stream ? "main" : "sub");
+  if (media_snapshot_jpeg_stream(path, shot_stream) != 0) {
+    if (shot_stream == 1) {
+      /* Main JPEG combo missing: report instead of silently shipping sub size. */
+      log_warn("web", "main snapshot failed, retrying sub");
+      shot_stream = 0;
+      snprintf(path, sizeof(path), "%s/%s_%s.jpg", storage_snapshots_path(), name, "sub");
+      if (media_snapshot_jpeg_stream(path, 0) != 0) {
+        json_reply(c, 2102, "snapshot failed", NULL);
+        return;
+      }
+    } else {
+      json_reply(c, 2102, "snapshot failed", NULL);
+      return;
+    }
   }
   data = cJSON_CreateObject();
   if (!data) {
     json_reply(c, 2102, "oom", NULL);
     return;
   }
-  cJSON_AddStringToObject(data, "file", name);
+  {
+    const char *base = strrchr(path, '/');
+    cJSON_AddStringToObject(data, "file", base ? base + 1 : path);
+  }
   cJSON_AddStringToObject(data, "url", "/api/v1/alarm/snapshot");
+  cJSON_AddStringToObject(data, "stream", shot_stream ? "main" : "sub");
+  cJSON_AddNumberToObject(data, "w", shot_stream ? media_stream_main_width()
+                                                 : media_stream_sub_width());
+  cJSON_AddNumberToObject(data, "h", shot_stream ? media_stream_main_height()
+                                                 : media_stream_sub_height());
   json_reply(c, 0, "ok", data);
 }
 
@@ -3513,6 +3719,14 @@ static void ev_handler(struct mg_connection *c, int ev, void *ev_data)
     if (c->data[0] == PREVIEW_MARK) {
       preview_remove_client(c);
       c->data[0] = 0;
+    }
+    return;
+  }
+  if (ev == MG_EV_WS_MSG) {
+    struct mg_ws_message *wm = (struct mg_ws_message *)ev_data;
+    if (c->data[0] == PREVIEW_MARK && wm && wm->data.len >= 4 &&
+        memcmp(wm->data.buf, "stop", 4) == 0) {
+      preview_detach_client(c);
     }
     return;
   }
@@ -3757,6 +3971,14 @@ static void ev_handler(struct mg_connection *c, int ev, void *ev_data)
     struct mg_http_serve_opts opts;
     memset(&opts, 0, sizeof(opts));
     opts.root_dir = g_web.www_root;
+    /* Vite emits content-hashed files under /assets, safe to cache forever.
+     * index.html must be revalidated, otherwise a UI upgrade keeps loading
+     * the previous bundle from the browser cache. */
+    if (mg_match(hm->uri, mg_str("/assets/#"), NULL)) {
+      opts.extra_headers = "Cache-Control: public, max-age=31536000, immutable\r\n";
+    } else {
+      opts.extra_headers = "Cache-Control: no-cache, must-revalidate\r\n";
+    }
     mg_http_serve_dir(c, hm, &opts);
   }
 }

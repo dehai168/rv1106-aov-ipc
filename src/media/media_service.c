@@ -12,6 +12,10 @@
 
 #define MEDIA_JPEG_VENC_CHN 2
 #define MEDIA_JPEG_MASTER_CHN 1
+/* Second JPEG slave sharing frames with the record main encoder (VENC0),
+ * so a main-stream snapshot really is main_w x main_h. */
+#define MEDIA_JPEG_MAIN_VENC_CHN 4
+#define MEDIA_JPEG_MAIN_MASTER_CHN 0
 #define MEDIA_PREVIEW_MAIN_CHN 3
 #define MEDIA_ALIGN2(x) (((x) + 1) & ~1)
 
@@ -51,6 +55,7 @@ typedef struct {
   int pipeline_up;
   int vi2_up;
   int jpeg_up;
+  int jpeg_main_up;
   int threads_running;
   MediaEncodeConfig cfg;
   char iq_dir[256];
@@ -61,6 +66,7 @@ typedef struct {
   int got_preview_main;
   int preview_main_w;
   int preview_main_h;
+  int preview_main_vi; /* VI channel feeding preview-main (0=main, 2=fallback) */
   int preview_main_thread;
   int preview_main_active;
   FILE *fp_main;
@@ -199,12 +205,10 @@ static int media_vi_chn_init(int chn, int width, int height, int depth, int dst_
 {
   VI_CHN_ATTR_S attr;
   memset(&attr, 0, sizeof(attr));
-  /* VI1: VENC1 (+JPEG combo). VI2: IVS + optional preview-main VENC3. */
-  if (chn == 1 || chn == 2) {
-    attr.stIspOpt.u32BufCount = 6;
-  } else {
-    attr.stIspOpt.u32BufCount = 3;
-  }
+  /* VI0 feeds the record encoder plus preview-main; VI1/VI2 feed VENC+JPEG
+   * combo+face grab. All three need a deeper buffer pool than a single
+   * consumer would, otherwise a 1080p VI can starve and stop delivering. */
+  attr.stIspOpt.u32BufCount = 6;
   attr.stIspOpt.enMemoryType = VI_V4L2_MEMORY_TYPE_DMABUF;
   attr.stSize.u32Width = (RK_U32)width;
   attr.stSize.u32Height = (RK_U32)height;
@@ -311,6 +315,8 @@ static void media_preview_main_size(const MediaEncodeConfig *cfg, int *w, int *h
 {
   int mw = cfg && cfg->main_w > 0 ? cfg->main_w : 1920;
   int mh = cfg && cfg->main_h > 0 ? cfg->main_h : 1080;
+  /* VI2 is shared with IVS/face grab: keep it at ≤1280x720, which is what
+   * the ISP third path reliably sustains on RV1106. */
   if (mw > 1280) {
     mh = mh * 1280 / mw;
     mw = 1280;
@@ -336,11 +342,26 @@ static int media_preview_main_init(const MediaEncodeConfig *cfg)
   int br;
   int gop;
   int fps;
-  media_preview_main_size(cfg, &w, &h);
-  /* Cap preview-main cost: live view does not need full record bitrate/fps. */
+  int vi_chn;
+  /* Preferred: hang preview-main off VI0 so the live view has exactly the
+   * recorded main geometry (H.264 because browsers cannot decode HEVC).
+   * A second encoder only fits within the VEPU/MMZ budget up to ~1.4MP, so
+   * larger mains fall back to VI2 at the capped 720p-class size.
+   * VI2 is shared with IVS/face grab, hence not the default. */
+  w = cfg && cfg->main_w > 0 ? cfg->main_w : 1920;
+  h = cfg && cfg->main_h > 0 ? cfg->main_h : 1080;
+  w = MEDIA_ALIGN2(w);
+  h = MEDIA_ALIGN2(h);
+  vi_chn = 0;
+  if (w <= 0 || h <= 0 || w > 1920 || w * h > 1920 * 1080) {
+    media_preview_main_size(cfg, &w, &h);
+    vi_chn = 2;
+  }
+  /* Live view does not need the record bitrate, but at main resolution a
+   * 720p-sized budget would look mushy; keep it within 800..1536 kbps. */
   br = 800;
-  if (cfg && cfg->main_bitrate_kbps > 0 && cfg->main_bitrate_kbps < br) {
-    br = cfg->main_bitrate_kbps;
+  if (cfg && cfg->main_bitrate_kbps > br) {
+    br = cfg->main_bitrate_kbps > 1536 ? 1536 : cfg->main_bitrate_kbps;
   }
   gop = cfg && cfg->main_gop > 0 ? cfg->main_gop : 20;
   fps = 10;
@@ -351,22 +372,42 @@ static int media_preview_main_init(const MediaEncodeConfig *cfg)
     log_warn("media", "preview-main needs VI2");
     return -1;
   }
-  /* RV1106 ISP has 3 paths (VI0/1/2). Preview-main + IVS share VI2. */
   if (media_venc_init(MEDIA_PREVIEW_MAIN_CHN, w, h, RK_VIDEO_ID_AVC, br, gop, fps) != 0) {
     return -2;
   }
-  if (media_bind_vi_venc(2, MEDIA_PREVIEW_MAIN_CHN) != 0) {
-    RK_MPI_VENC_StopRecvFrame(MEDIA_PREVIEW_MAIN_CHN);
-    RK_MPI_VENC_DestroyChn(MEDIA_PREVIEW_MAIN_CHN);
-    return -3;
+  if (media_bind_vi_venc(vi_chn, MEDIA_PREVIEW_MAIN_CHN) != 0) {
+    if (vi_chn == 0) {
+      /* Some MPI builds refuse a second VENC on VI0; fall back to VI2. */
+      log_warn("media", "preview-main VI0 bind failed, falling back to VI2");
+      RK_MPI_VENC_StopRecvFrame(MEDIA_PREVIEW_MAIN_CHN);
+      RK_MPI_VENC_DestroyChn(MEDIA_PREVIEW_MAIN_CHN);
+      media_preview_main_size(cfg, &w, &h);
+      vi_chn = 2;
+      if (media_venc_init(MEDIA_PREVIEW_MAIN_CHN, w, h, RK_VIDEO_ID_AVC, br, gop, fps) != 0) {
+        return -2;
+      }
+      if (media_bind_vi_venc(vi_chn, MEDIA_PREVIEW_MAIN_CHN) != 0) {
+        RK_MPI_VENC_StopRecvFrame(MEDIA_PREVIEW_MAIN_CHN);
+        RK_MPI_VENC_DestroyChn(MEDIA_PREVIEW_MAIN_CHN);
+        return -3;
+      }
+    } else {
+      RK_MPI_VENC_StopRecvFrame(MEDIA_PREVIEW_MAIN_CHN);
+      RK_MPI_VENC_DestroyChn(MEDIA_PREVIEW_MAIN_CHN);
+      return -3;
+    }
   }
-  /* Idle until a main-preview client asks for it (saves encode + ISP consumer). */
-  RK_MPI_VENC_StopRecvFrame(MEDIA_PREVIEW_MAIN_CHN);
+  /* VI0 path stays receiving: stopping a VENC bound to VI0 starves the VI
+   * channel and kills the record stream too. The VI2 fallback is gated. */
+  if (vi_chn == 2) {
+    RK_MPI_VENC_StopRecvFrame(MEDIA_PREVIEW_MAIN_CHN);
+  }
   g_stream.preview_main_active = 0;
+  g_stream.preview_main_vi = vi_chn;
   g_stream.preview_main_w = w;
   g_stream.preview_main_h = h;
-  log_info("media", "preview-main VI2->venc%d %dx%d %dkbps@%dfps (idle)", MEDIA_PREVIEW_MAIN_CHN, w,
-           h, br, fps);
+  log_info("media", "preview-main VI%d->venc%d %dx%d %dkbps@%dfps (%s)", vi_chn,
+           MEDIA_PREVIEW_MAIN_CHN, w, h, br, fps, vi_chn == 0 ? "drain" : "idle");
   return 0;
 }
 
@@ -375,16 +416,18 @@ static void media_preview_main_destroy(void)
   if (g_stream.preview_main_w <= 0) {
     return;
   }
-  media_unbind_vi_venc(2, MEDIA_PREVIEW_MAIN_CHN);
+  media_unbind_vi_venc(g_stream.preview_main_vi, MEDIA_PREVIEW_MAIN_CHN);
   RK_MPI_VENC_StopRecvFrame(MEDIA_PREVIEW_MAIN_CHN);
   RK_MPI_VENC_DestroyChn(MEDIA_PREVIEW_MAIN_CHN);
   g_stream.preview_main_w = 0;
   g_stream.preview_main_h = 0;
   g_stream.preview_main_active = 0;
+  g_stream.preview_main_vi = 0;
 }
 
-/* RV1106 combo JPEG: slave VENC shares frames with master H.264 (no VI GetChnFrame). */
-static int media_jpeg_venc_init(int width, int height)
+/* RV1106 combo JPEG: slave VENC shares frames with a master H.264/H.265 chn
+ * (no VI GetChnFrame needed). master=1 -> sub size, master=0 -> main size. */
+static int jpeg_combo_create(int chn, int master, int width, int height)
 {
   VENC_CHN_ATTR_S attr;
   VENC_RECV_PIC_PARAM_S recv;
@@ -392,9 +435,6 @@ static int media_jpeg_venc_init(int width, int height)
   VENC_JPEG_PARAM_S jpeg;
   int ret;
 
-  if (g_stream.jpeg_up) {
-    return 0;
-  }
   if (width <= 0 || height <= 0) {
     return -1;
   }
@@ -415,15 +455,15 @@ static int media_jpeg_venc_init(int width, int height)
   attr.stVencAttr.stAttrJpege.enReceiveMode = VENC_PIC_RECEIVE_SINGLE;
   attr.stGopAttr.enGopMode = VENC_GOPMODE_INIT;
 
-  ret = RK_MPI_VENC_CreateChn(MEDIA_JPEG_VENC_CHN, &attr);
+  ret = RK_MPI_VENC_CreateChn(chn, &attr);
   if (ret != RK_SUCCESS) {
-    log_error("media", "JPEG VENC CreateChn fail %x", ret);
+    log_error("media", "JPEG VENC CreateChn chn=%d fail %x", chn, ret);
     return ret;
   }
 
   memset(&jpeg, 0, sizeof(jpeg));
   jpeg.u32Qfactor = 90;
-  ret = RK_MPI_VENC_SetJpegParam(MEDIA_JPEG_VENC_CHN, &jpeg);
+  ret = RK_MPI_VENC_SetJpegParam(chn, &jpeg);
   if (ret != RK_SUCCESS) {
     log_warn("media", "SetJpegParam fail %x", ret);
   }
@@ -431,39 +471,41 @@ static int media_jpeg_venc_init(int width, int height)
   /* Match SDK sample order: StartRecvFrame then SetComboAttr, then idle. */
   memset(&recv, 0, sizeof(recv));
   recv.s32RecvPicNum = 1;
-  ret = RK_MPI_VENC_StartRecvFrame(MEDIA_JPEG_VENC_CHN, &recv);
+  ret = RK_MPI_VENC_StartRecvFrame(chn, &recv);
   if (ret != RK_SUCCESS) {
-    log_error("media", "JPEG StartRecvFrame fail %x", ret);
-    RK_MPI_VENC_DestroyChn(MEDIA_JPEG_VENC_CHN);
+    log_error("media", "JPEG StartRecvFrame chn=%d fail %x", chn, ret);
+    RK_MPI_VENC_DestroyChn(chn);
     return ret;
   }
 
   memset(&combo, 0, sizeof(combo));
   combo.bEnable = RK_TRUE;
-  combo.s32ChnId = MEDIA_JPEG_MASTER_CHN;
-  ret = RK_MPI_VENC_SetComboAttr(MEDIA_JPEG_VENC_CHN, &combo);
+  combo.s32ChnId = master;
+  ret = RK_MPI_VENC_SetComboAttr(chn, &combo);
   if (ret != RK_SUCCESS) {
-    log_error("media", "JPEG SetComboAttr fail %x", ret);
-    RK_MPI_VENC_StopRecvFrame(MEDIA_JPEG_VENC_CHN);
-    RK_MPI_VENC_DestroyChn(MEDIA_JPEG_VENC_CHN);
+    log_error("media", "JPEG SetComboAttr chn=%d master=%d fail %x", chn, master, ret);
+    RK_MPI_VENC_StopRecvFrame(chn);
+    RK_MPI_VENC_DestroyChn(chn);
     return ret;
   }
 
-  RK_MPI_VENC_StopRecvFrame(MEDIA_JPEG_VENC_CHN);
-  g_stream.jpeg_up = 1;
-  log_info("media", "JPEG combo venc%d master=venc%d %dx%d", MEDIA_JPEG_VENC_CHN,
-           MEDIA_JPEG_MASTER_CHN, width, height);
+  RK_MPI_VENC_StopRecvFrame(chn);
+  log_info("media", "JPEG combo venc%d master=venc%d %dx%d", chn, master, width, height);
   return 0;
 }
 
 static void media_jpeg_venc_destroy(void)
 {
-  if (!g_stream.jpeg_up) {
-    return;
+  if (g_stream.jpeg_main_up) {
+    RK_MPI_VENC_StopRecvFrame(MEDIA_JPEG_MAIN_VENC_CHN);
+    RK_MPI_VENC_DestroyChn(MEDIA_JPEG_MAIN_VENC_CHN);
+    g_stream.jpeg_main_up = 0;
   }
-  RK_MPI_VENC_StopRecvFrame(MEDIA_JPEG_VENC_CHN);
-  RK_MPI_VENC_DestroyChn(MEDIA_JPEG_VENC_CHN);
-  g_stream.jpeg_up = 0;
+  if (g_stream.jpeg_up) {
+    RK_MPI_VENC_StopRecvFrame(MEDIA_JPEG_VENC_CHN);
+    RK_MPI_VENC_DestroyChn(MEDIA_JPEG_VENC_CHN);
+    g_stream.jpeg_up = 0;
+  }
 }
 
 static int pack_is_key(const VENC_PACK_S *pack, int is_h265)
@@ -551,7 +593,7 @@ static int stream_create_pipeline(const MediaEncodeConfig *cfg)
   if (media_preview_main_init(cfg) != 0) {
     log_warn("media", "preview-main venc init failed (sub preview only)");
   }
-  if (media_jpeg_venc_init(cfg->sub_w, cfg->sub_h) != 0) {
+  if (jpeg_combo_create(MEDIA_JPEG_VENC_CHN, MEDIA_JPEG_MASTER_CHN, cfg->sub_w, cfg->sub_h) != 0) {
     media_preview_main_destroy();
     media_unbind_vi_venc(0, 0);
     media_unbind_vi_venc(1, 1);
@@ -566,6 +608,13 @@ static int stream_create_pipeline(const MediaEncodeConfig *cfg)
     RK_MPI_VI_DisableChn(0, 0);
     RK_MPI_VI_DisableChn(0, 1);
     return -4;
+  }
+  g_stream.jpeg_up = 1;
+  if (jpeg_combo_create(MEDIA_JPEG_MAIN_VENC_CHN, MEDIA_JPEG_MAIN_MASTER_CHN, cfg->main_w,
+                        cfg->main_h) == 0) {
+    g_stream.jpeg_main_up = 1;
+  } else {
+    log_warn("media", "main JPEG combo unavailable (main snapshot falls back to sub)");
   }
   g_stream.pipeline_up = 1;
   return 0;
@@ -900,6 +949,22 @@ int media_stream_preview_main_set_active(int on)
   if (!g_stream.up || g_stream.preview_main_w <= 0) {
     return -1;
   }
+  if (g_stream.preview_main_vi == 0) {
+    /* Bound to VI0: StopRecvFrame starves the VI channel, which also starves
+     * the record encoder, so the channel keeps draining and only the IDR and
+     * the active flag are toggled here. */
+    if (!on) {
+      if (g_stream.preview_main_active) {
+        log_info("media", "preview-main idle (VI0 keeps draining)");
+      }
+      g_stream.preview_main_active = 0;
+      return 0;
+    }
+    RK_MPI_VENC_RequestIDR(MEDIA_PREVIEW_MAIN_CHN, RK_TRUE);
+    g_stream.preview_main_active = 1;
+    log_info("media", "preview-main encode ON");
+    return 0;
+  }
   if (g_stream.preview_main_active == on) {
     return 0;
   }
@@ -1149,8 +1214,14 @@ int media_stream_apply(const MediaEncodeConfig *cfg)
   if (media_preview_main_init(&g_stream.cfg) != 0) {
     log_warn("media", "preview-main venc init failed on apply");
   }
-  if (media_jpeg_venc_init(g_stream.cfg.sub_w, g_stream.cfg.sub_h) != 0) {
+  if (jpeg_combo_create(MEDIA_JPEG_VENC_CHN, MEDIA_JPEG_MASTER_CHN, g_stream.cfg.sub_w,
+                        g_stream.cfg.sub_h) != 0) {
     return -4;
+  }
+  g_stream.jpeg_up = 1;
+  if (jpeg_combo_create(MEDIA_JPEG_MAIN_VENC_CHN, MEDIA_JPEG_MAIN_MASTER_CHN,
+                        g_stream.cfg.main_w, g_stream.cfg.main_h) == 0) {
+    g_stream.jpeg_main_up = 1;
   }
   g_stream.pipeline_up = 1;
 
@@ -1407,7 +1478,7 @@ int media_osd_set(const MediaOsdConfig *in, int apply)
   return 0;
 }
 
-int media_snapshot_jpeg_mem(uint8_t **out, size_t *out_len)
+static int jpeg_combo_capture(int chn, uint8_t **out, size_t *out_len)
 {
   VENC_RECV_PIC_PARAM_S recv;
   VENC_STREAM_S stream;
@@ -1417,7 +1488,9 @@ int media_snapshot_jpeg_mem(uint8_t **out, size_t *out_len)
   uint8_t *copy;
   int ret;
 
-  if (!out || !out_len || !g_stream.up || !g_stream.jpeg_up) return -1;
+  if (!out || !out_len) {
+    return -1;
+  }
   *out = NULL;
   *out_len = 0;
 
@@ -1425,13 +1498,13 @@ int media_snapshot_jpeg_mem(uint8_t **out, size_t *out_len)
   memset(&stream, 0, sizeof(stream));
   memset(&pack, 0, sizeof(pack));
   stream.pstPack = &pack;
-  while (RK_MPI_VENC_GetStream(MEDIA_JPEG_VENC_CHN, &stream, 0) == RK_SUCCESS) {
-    RK_MPI_VENC_ReleaseStream(MEDIA_JPEG_VENC_CHN, &stream);
+  while (RK_MPI_VENC_GetStream(chn, &stream, 0) == RK_SUCCESS) {
+    RK_MPI_VENC_ReleaseStream(chn, &stream);
   }
-  RK_MPI_VENC_StopRecvFrame(MEDIA_JPEG_VENC_CHN);
+  RK_MPI_VENC_StopRecvFrame(chn);
   memset(&recv, 0, sizeof(recv));
   recv.s32RecvPicNum = 1;
-  ret = RK_MPI_VENC_StartRecvFrame(MEDIA_JPEG_VENC_CHN, &recv);
+  ret = RK_MPI_VENC_StartRecvFrame(chn, &recv);
   if (ret != RK_SUCCESS) {
     pthread_mutex_unlock(&g_snap_lock);
     return -2;
@@ -1439,37 +1512,65 @@ int media_snapshot_jpeg_mem(uint8_t **out, size_t *out_len)
   memset(&stream, 0, sizeof(stream));
   memset(&pack, 0, sizeof(pack));
   stream.pstPack = &pack;
-  ret = RK_MPI_VENC_GetStream(MEDIA_JPEG_VENC_CHN, &stream, 3000);
+  ret = RK_MPI_VENC_GetStream(chn, &stream, 3000);
   if (ret != RK_SUCCESS) {
-    RK_MPI_VENC_StopRecvFrame(MEDIA_JPEG_VENC_CHN);
+    RK_MPI_VENC_StopRecvFrame(chn);
     pthread_mutex_unlock(&g_snap_lock);
     return -3;
   }
   data = RK_MPI_MB_Handle2VirAddr(pack.pMbBlk);
   len = (size_t)pack.u32Len;
   if (!data || len == 0) {
-    RK_MPI_VENC_ReleaseStream(MEDIA_JPEG_VENC_CHN, &stream);
-    RK_MPI_VENC_StopRecvFrame(MEDIA_JPEG_VENC_CHN);
+    RK_MPI_VENC_ReleaseStream(chn, &stream);
+    RK_MPI_VENC_StopRecvFrame(chn);
     pthread_mutex_unlock(&g_snap_lock);
     return -4;
   }
   copy = (uint8_t *)malloc(len);
   if (!copy) {
-    RK_MPI_VENC_ReleaseStream(MEDIA_JPEG_VENC_CHN, &stream);
-    RK_MPI_VENC_StopRecvFrame(MEDIA_JPEG_VENC_CHN);
+    RK_MPI_VENC_ReleaseStream(chn, &stream);
+    RK_MPI_VENC_StopRecvFrame(chn);
     pthread_mutex_unlock(&g_snap_lock);
     return -5;
   }
   memcpy(copy, data, len);
-  RK_MPI_VENC_ReleaseStream(MEDIA_JPEG_VENC_CHN, &stream);
-  RK_MPI_VENC_StopRecvFrame(MEDIA_JPEG_VENC_CHN);
+  RK_MPI_VENC_ReleaseStream(chn, &stream);
+  RK_MPI_VENC_StopRecvFrame(chn);
   pthread_mutex_unlock(&g_snap_lock);
   *out = copy;
   *out_len = len;
   return 0;
 }
 
+/* stream: 0 = sub (704x576), 1 = main (video.encode.main_w x main_h). */
+int media_snapshot_jpeg_stream_mem(int stream, uint8_t **out, size_t *out_len)
+{
+  if (!out || !out_len || !g_stream.up) {
+    return -1;
+  }
+  if (stream == 1) {
+    if (!g_stream.jpeg_main_up) {
+      return -1;
+    }
+    return jpeg_combo_capture(MEDIA_JPEG_MAIN_VENC_CHN, out, out_len);
+  }
+  if (!g_stream.jpeg_up) {
+    return -1;
+  }
+  return jpeg_combo_capture(MEDIA_JPEG_VENC_CHN, out, out_len);
+}
+
+int media_snapshot_jpeg_mem(uint8_t **out, size_t *out_len)
+{
+  return media_snapshot_jpeg_stream_mem(0, out, out_len);
+}
+
 int media_snapshot_jpeg(const char *path)
+{
+  return media_snapshot_jpeg_stream(path, 0);
+}
+
+int media_snapshot_jpeg_stream(const char *path, int stream)
 {
   uint8_t *buf = NULL;
   size_t len = 0;
@@ -1477,7 +1578,7 @@ int media_snapshot_jpeg(const char *path)
   int rc;
 
   if (!path || !path[0]) return -1;
-  rc = media_snapshot_jpeg_mem(&buf, &len);
+  rc = media_snapshot_jpeg_stream_mem(stream, &buf, &len);
   if (rc != 0) return rc;
   fp = fopen(path, "wb");
   if (!fp) {
@@ -1492,14 +1593,29 @@ int media_snapshot_jpeg(const char *path)
   }
   fclose(fp);
   free(buf);
-  log_info("media", "snapshot %s (%zu bytes jpeg-hw %dx%d)", path, len, g_stream.cfg.sub_w,
-           g_stream.cfg.sub_h);
+  if (stream == 1) {
+    log_info("media", "snapshot %s (%zu bytes jpeg-hw %dx%d main)", path, len, g_stream.cfg.main_w,
+             g_stream.cfg.main_h);
+  } else {
+    log_info("media", "snapshot %s (%zu bytes jpeg-hw %dx%d)", path, len, g_stream.cfg.sub_w,
+             g_stream.cfg.sub_h);
+  }
   return 0;
 }
 
 int media_stream_sub_width(void)
 {
   return g_stream.up ? g_stream.cfg.sub_w : 0;
+}
+
+int media_stream_main_width(void)
+{
+  return g_stream.up ? g_stream.cfg.main_w : 0;
+}
+
+int media_stream_main_height(void)
+{
+  return g_stream.up ? g_stream.cfg.main_h : 0;
 }
 
 int media_stream_sub_height(void)

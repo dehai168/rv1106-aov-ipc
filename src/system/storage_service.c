@@ -78,6 +78,57 @@ const char *storage_faces_path(void)
   return g_faces;
 }
 
+static int sd_partition_present(void)
+{
+  return access("/dev/mmcblk1p1", F_OK) == 0 || access("/dev/mmcblk0p1", F_OK) == 0;
+}
+
+static const char *sd_partition_path(void)
+{
+  if (access("/dev/mmcblk1p1", F_OK) == 0) {
+    return "/dev/mmcblk1p1";
+  }
+  if (access("/dev/mmcblk0p1", F_OK) == 0) {
+    return "/dev/mmcblk0p1";
+  }
+  return "";
+}
+
+/* Superblock sniff so we can say 未格式化 instead of silently writing to a
+ * raw partition (mkfs'd cards have no /proc/mounts entry until mounted). */
+static int sd_partition_formatted(void)
+{
+  const char *dev = sd_partition_path();
+  unsigned char buf[512];
+  FILE *fp;
+  size_t n;
+
+  if (!dev[0]) {
+    return 0;
+  }
+  fp = fopen(dev, "rb");
+  if (!fp) {
+    return 0;
+  }
+  n = fread(buf, 1, sizeof(buf), fp);
+  fclose(fp);
+  if (n < sizeof(buf)) {
+    return 0;
+  }
+  if (buf[510] != 0x55 || buf[511] != 0xAA) {
+    return 0;
+  }
+  /* FAT32/FAT16/FAT12 (offset 54) or FAT32 type at offset 82. */
+  if (memcmp(buf + 54, "FAT", 3) == 0 || memcmp(buf + 82, "FAT32", 5) == 0) {
+    return 1;
+  }
+  /* exFAT: "EXFAT   " at offset 3, 0x55AA at 510. */
+  if (memcmp(buf + 3, "EXFAT   ", 8) == 0) {
+    return 1;
+  }
+  return 0;
+}
+
 int storage_get_status(StorageStatus *st)
 {
   FILE *fp;
@@ -105,6 +156,18 @@ int storage_get_status(StorageStatus *st)
     fclose(fp);
   }
 
+  st->present = sd_partition_present() ? 1 : 0;
+  st->formatted = st->mounted ? 1 : (st->present && sd_partition_formatted());
+  if (st->mounted) {
+    snprintf(st->state, sizeof(st->state), "mounted");
+  } else if (!st->present) {
+    snprintf(st->state, sizeof(st->state), "nocard");
+  } else if (st->formatted) {
+    snprintf(st->state, sizeof(st->state), "unmounted");
+  } else {
+    snprintf(st->state, sizeof(st->state), "unformatted");
+  }
+
   if (!st->mounted) {
     return 0;
   }
@@ -115,6 +178,11 @@ int storage_get_status(StorageStatus *st)
   st->total_bytes = (uint64_t)vfs.f_blocks * (uint64_t)vfs.f_frsize;
   st->free_bytes = (uint64_t)vfs.f_bavail * (uint64_t)vfs.f_frsize;
   return 0;
+}
+
+const char *storage_sd_device(void)
+{
+  return sd_partition_path();
 }
 
 int storage_ensure_dirs(void)
@@ -668,4 +736,77 @@ int storage_format_clear(void)
   ensure_dir(alarms);
   log_warn("storage", "format_clear deleted %d files", deleted);
   return deleted;
+}
+
+int storage_format_card(void)
+{
+  char cmd[512];
+  const char *dev;
+  StorageStatus st;
+  int i;
+  int rc = 0;
+
+  if (!g_ready) {
+    return -1;
+  }
+  dev = sd_partition_path();
+  if (!dev[0]) {
+    log_error("storage", "format: no SD partition found");
+    return -2;
+  }
+
+  /* The NPU models (face detect) live on the card and must survive mkfs:
+   * stash them on tmpfs and copy back after the remount. */
+  snprintf(cmd, sizeof(cmd),
+           "rm -rf /tmp/ipc_models && mkdir -p /tmp/ipc_models && "
+           "cp -a %s/models/. /tmp/ipc_models/ 2>/dev/null",
+           g_mount);
+  (void)system(cmd);
+
+  /* Quiesce writers: clean umount first, lazy only if the card is still busy. */
+  snprintf(cmd, sizeof(cmd), "umount %s 2>/dev/null", g_mount);
+  if (system(cmd) != 0) {
+    snprintf(cmd, sizeof(cmd), "umount -l %s 2>/dev/null", g_mount);
+    if (system(cmd) != 0) {
+      log_error("storage", "format: umount %s failed", g_mount);
+      return -3;
+    }
+    log_warn("storage", "format: lazy umount %s (was busy)", g_mount);
+  }
+
+  /* vfat/FAT32 is the only filesystem the board mounts by default and
+   * mkfs.vfat is present in the OEM rootfs. */
+  snprintf(cmd, sizeof(cmd), "mkfs.vfat -F 32 -n IPC %s", dev);
+  if (system(cmd) != 0) {
+    log_error("storage", "format: mkfs.vfat %s failed", dev);
+    rc = -4;
+  } else {
+    log_warn("storage", "format: mkfs.vfat %s ok", dev);
+  }
+
+  for (i = 0; i < 15; i++) {
+    snprintf(cmd, sizeof(cmd), "mount -t vfat -o rw,umask=000 %s %s 2>/dev/null", dev, g_mount);
+    if (system(cmd) != 0) {
+      snprintf(cmd, sizeof(cmd), "mount %s %s 2>/dev/null", dev, g_mount);
+      system(cmd);
+    }
+    if (storage_get_status(&st) == 0 && st.mounted) {
+      g_suspend_active = 0;
+      storage_ensure_dirs();
+      ensure_dir(g_mount);
+      snprintf(cmd, sizeof(cmd),
+               "mkdir -p %s/models && cp -a /tmp/ipc_models/. %s/models/ 2>/dev/null && "
+               "rm -rf /tmp/ipc_models",
+               g_mount, g_mount);
+      if (system(cmd) == 0) {
+        log_info("storage", "format: models restored to %s/models", g_mount);
+      }
+      log_info("storage", "format: remount %s ok", g_mount);
+      return rc;
+    }
+    usleep(200 * 1000);
+  }
+
+  log_error("storage", "format: remount %s failed", g_mount);
+  return rc != 0 ? rc : -5;
 }

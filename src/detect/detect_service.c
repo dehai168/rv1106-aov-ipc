@@ -22,6 +22,11 @@
 #define IVS_CHN 0
 #define VI_DETECT_CHN 2 /* ISP third path; shared with preview-main VENC3 */
 
+static int clamp_int(int v, int lo, int hi)
+{
+  return v < lo ? lo : (v > hi ? hi : v);
+}
+
 typedef struct {
   int inited;
   int running;
@@ -163,27 +168,60 @@ static int schedule_allows_now(const DetectConfig *cfg)
   return min >= cfg->schedule_start_min || min < cfg->schedule_end_min;
 }
 
-static int region_allows(const DetectConfig *cfg, const DetectEvent *ev)
+static int region_allows(const DetectConfig *cfg, const DetectEvent *ev, const int *rects, int rect_n,
+                         int fw, int fh)
 {
   int i;
   int any = 0;
+
   for (i = 0; i < DETECT_MAX_REGIONS; i++) {
     const DetectRegion *r = &cfg->regions[i];
-    if (!r->enabled || r->w <= 0 || r->h <= 0) {
+    if (!r->enabled || r->pct_w <= 0 || r->pct_h <= 0) {
       continue;
     }
     any = 1;
-    if (ev->rect_w <= 0 || ev->rect_h <= 0) {
-      /* no bbox from IVS: allow (area-based hit already passed) */
-      return 1;
-    }
-    if (rect_intersect(ev->rect_x, ev->rect_y, ev->rect_w, ev->rect_h, r->x, r->y, r->w,
-                       r->h)) {
-      return 1;
-    }
+    break;
   }
   if (!any) {
     return 1; /* no active ROI => full frame */
+  }
+  if (fw <= 0 || fh <= 0) {
+    return 1;
+  }
+  /* IVS reports bboxes; without one we cannot localise the motion, so keep
+   * the area-threshold hit rather than dropping a real alarm. */
+  if (rect_n <= 0 || !rects) {
+    if (ev && ev->rect_w > 0 && ev->rect_h > 0) {
+      rects = &ev->rect_x;
+      rect_n = 1;
+    } else {
+      return 1;
+    }
+  }
+  for (i = 0; i < DETECT_MAX_REGIONS; i++) {
+    const DetectRegion *r = &cfg->regions[i];
+    int rx, ry, rw, rh;
+    int k;
+    if (!r->enabled || r->pct_w <= 0 || r->pct_h <= 0) {
+      continue;
+    }
+    /* ROI stored as permille of the frame: scale to the live detect VI size. */
+    rx = r->pct_x * fw / 1000;
+    ry = r->pct_y * fh / 1000;
+    rw = r->pct_w * fw / 1000;
+    rh = r->pct_h * fh / 1000;
+    if (rw < 1) {
+      rw = 1;
+    }
+    if (rh < 1) {
+      rh = 1;
+    }
+    for (k = 0; k < rect_n; k++) {
+      const int *rc = rects + k * 4;
+      if (rect_intersect(rc[0], rc[1], rc[2], rc[3], rx, ry, rw, rh)) {
+        return 1;
+      }
+    }
   }
   return 0;
 }
@@ -381,18 +419,30 @@ static void *detect_thread(void *arg)
       }
       if (hit && g_det.hit_streak >= g_det.cfg.hit_frames) {
         DetectEvent ev;
+        int rects[8 * 4];
+        int rect_n = 0;
+        unsigned ri;
         memset(&ev, 0, sizeof(ev));
         ev.ts = now;
         ev.square = (int)md->u32Square;
         ev.square_pct_x10 = pct;
-        if (md->u32RectNum > 0) {
-          ev.rect_x = md->stRect[0].s32X;
-          ev.rect_y = md->stRect[0].s32Y;
-          ev.rect_w = (int)md->stRect[0].u32Width;
-          ev.rect_h = (int)md->stRect[0].u32Height;
+        for (ri = 0; ri < md->u32RectNum && rect_n < 8; ri++) {
+          rects[rect_n * 4 + 0] = md->stRect[ri].s32X;
+          rects[rect_n * 4 + 1] = md->stRect[ri].s32Y;
+          rects[rect_n * 4 + 2] = (int)md->stRect[ri].u32Width;
+          rects[rect_n * 4 + 3] = (int)md->stRect[ri].u32Height;
+          rect_n++;
         }
-        if (region_allows(&g_det.cfg, &ev)) {
+        if (rect_n > 0) {
+          ev.rect_x = rects[0];
+          ev.rect_y = rects[1];
+          ev.rect_w = rects[2];
+          ev.rect_h = rects[3];
+        }
+        if (region_allows(&g_det.cfg, &ev, rects, rect_n, g_det.width, g_det.height)) {
           fire_motion(&ev);
+        } else if (result_n % 20 == 0) {
+          log_info("detect", "motion filtered by ROI pct_x10=%d rects=%d", pct, rect_n);
         }
         g_det.hit_streak = 0;
       }
@@ -429,19 +479,15 @@ int detect_init(const DetectConfig *cfg)
     int ri;
     for (ri = 0; ri < DETECT_MAX_REGIONS; ri++) {
       DetectRegion *r = &g_det.cfg.regions[ri];
-      if (r->x < 0) {
-        r->x = 0;
+      if (r->pct_w <= 0 || r->pct_h <= 0) {
+        detect_region_from_xywh(r);
       }
-      if (r->y < 0) {
-        r->y = 0;
-      }
-      if (r->w < 0) {
-        r->w = 0;
-      }
-      if (r->h < 0) {
-        r->h = 0;
-      }
+      r->pct_x = clamp_int(r->pct_x, 0, 1000);
+      r->pct_y = clamp_int(r->pct_y, 0, 1000);
+      r->pct_w = clamp_int(r->pct_w, 0, 1000 - r->pct_x);
+      r->pct_h = clamp_int(r->pct_h, 0, 1000 - r->pct_y);
       r->enabled = r->enabled ? 1 : 0;
+      detect_region_sync_xywh(r);
     }
   }
   g_det.cfg.link_record = g_det.cfg.link_record ? 1 : 0;
@@ -550,6 +596,31 @@ int detect_last_event(DetectEvent *out)
   return 0;
 }
 
+#define DETECT_REF_W 640 /* UI/logic frame for legacy x/y/w/h */
+#define DETECT_REF_H 360
+
+void detect_region_from_xywh(DetectRegion *r)
+{
+  if (!r) {
+    return;
+  }
+  r->pct_x = clamp_int(r->x * 1000 / DETECT_REF_W, 0, 1000);
+  r->pct_y = clamp_int(r->y * 1000 / DETECT_REF_H, 0, 1000);
+  r->pct_w = clamp_int(r->w * 1000 / DETECT_REF_W, 0, 1000 - r->pct_x);
+  r->pct_h = clamp_int(r->h * 1000 / DETECT_REF_H, 0, 1000 - r->pct_y);
+}
+
+void detect_region_sync_xywh(DetectRegion *r)
+{
+  if (!r) {
+    return;
+  }
+  r->x = r->pct_x * DETECT_REF_W / 1000;
+  r->y = r->pct_y * DETECT_REF_H / 1000;
+  r->w = r->pct_w * DETECT_REF_W / 1000;
+  r->h = r->pct_h * DETECT_REF_H / 1000;
+}
+
 static void load_region_slot(int idx, DetectRegion *r)
 {
   char path[64];
@@ -563,6 +634,26 @@ static void load_region_slot(int idx, DetectRegion *r)
   config_get_int(path, &r->w, 0);
   snprintf(path, sizeof(path), "detect.region%d.h", idx);
   config_get_int(path, &r->h, 0);
+  /* Resolution-independent permille (added when preview/detect sizes could
+   * differ from the 640x360 drawing canvas). Missing => migrate from pixels. */
+  r->pct_w = -1;
+  snprintf(path, sizeof(path), "detect.region%d.w_pct", idx);
+  config_get_int(path, &r->pct_w, -1);
+  if (r->pct_w >= 0) {
+    snprintf(path, sizeof(path), "detect.region%d.x_pct", idx);
+    config_get_int(path, &r->pct_x, 0);
+    snprintf(path, sizeof(path), "detect.region%d.y_pct", idx);
+    config_get_int(path, &r->pct_y, 0);
+    snprintf(path, sizeof(path), "detect.region%d.h_pct", idx);
+    config_get_int(path, &r->pct_h, 0);
+    r->pct_x = clamp_int(r->pct_x, 0, 1000);
+    r->pct_y = clamp_int(r->pct_y, 0, 1000);
+    r->pct_w = clamp_int(r->pct_w, 0, 1000 - r->pct_x);
+    r->pct_h = clamp_int(r->pct_h, 0, 1000 - r->pct_y);
+    detect_region_sync_xywh(r);
+  } else {
+    detect_region_from_xywh(r);
+  }
 }
 
 static int save_region_slot(int idx, const DetectRegion *r)
@@ -586,6 +677,22 @@ static int save_region_slot(int idx, const DetectRegion *r)
   }
   snprintf(path, sizeof(path), "detect.region%d.h", idx);
   if (config_set_int(path, r->h) != 0) {
+    return -1;
+  }
+  snprintf(path, sizeof(path), "detect.region%d.x_pct", idx);
+  if (config_set_int(path, r->pct_x) != 0) {
+    return -1;
+  }
+  snprintf(path, sizeof(path), "detect.region%d.y_pct", idx);
+  if (config_set_int(path, r->pct_y) != 0) {
+    return -1;
+  }
+  snprintf(path, sizeof(path), "detect.region%d.w_pct", idx);
+  if (config_set_int(path, r->pct_w) != 0) {
+    return -1;
+  }
+  snprintf(path, sizeof(path), "detect.region%d.h_pct", idx);
+  if (config_set_int(path, r->pct_h) != 0) {
     return -1;
   }
   return 0;
@@ -619,6 +726,7 @@ void detect_config_load(DetectConfig *out)
     config_get_int("detect.region.y", &out->regions[0].y, 0);
     config_get_int("detect.region.w", &out->regions[0].w, 0);
     config_get_int("detect.region.h", &out->regions[0].h, 0);
+    detect_region_from_xywh(&out->regions[0]);
   }
 
   config_get_bool("detect.schedule.enabled", &out->schedule_enabled, 0);
@@ -653,6 +761,17 @@ int detect_config_save(const DetectConfig *cfg)
   tmp = *cfg;
   if (schedule_grid_valid(tmp.schedule_grid)) {
     detect_schedule_sync_days_from_grid(&tmp);
+  }
+  for (i = 0; i < DETECT_MAX_REGIONS; i++) {
+    DetectRegion *r = &tmp.regions[i];
+    if (r->pct_w <= 0 || r->pct_h <= 0) {
+      detect_region_from_xywh(r);
+    }
+    r->pct_x = clamp_int(r->pct_x, 0, 1000);
+    r->pct_y = clamp_int(r->pct_y, 0, 1000);
+    r->pct_w = clamp_int(r->pct_w, 0, 1000 - r->pct_x);
+    r->pct_h = clamp_int(r->pct_h, 0, 1000 - r->pct_y);
+    detect_region_sync_xywh(r);
   }
 
   if (config_set_bool("detect.enabled", tmp.enabled) != 0 ||

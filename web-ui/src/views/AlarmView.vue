@@ -38,6 +38,29 @@ const pagedEvents = computed(() => {
   return events.value.slice(start, start + pageSize.value)
 })
 
+/* 灵敏度 0..4 is the low-level IVS knob; the UI exposes 低/中/高 = 0/2/4. */
+const sensitivityOptions = [
+  { label: '低（少误报）', value: 0 },
+  { label: '中（推荐）', value: 2 },
+  { label: '高（更灵敏）', value: 4 },
+]
+
+/* square_pct is stored in permille (0.1% units). */
+const areaPct = computed({
+  get: () => {
+    const v = motion.value?.square_pct ?? 8
+    return Math.round(v) / 10
+  },
+  set: (v: number) => {
+    if (!motion.value) return
+    motion.value.square_pct = Math.max(1, Math.round(Number(v || 0) * 10))
+  },
+})
+
+function areaText(pctX10: number | undefined) {
+  return `${((pctX10 || 0) / 10).toFixed(1)}%`
+}
+
 function emptyRegions(): AlarmRegion[] {
   return Array.from({ length: 4 }, () => ({ enabled: false, x: 0, y: 0, w: 0, h: 0 }))
 }
@@ -69,6 +92,15 @@ function ensureDefaults(m: AlarmMotion): AlarmMotion {
     m.schedule.grid = emptyGrid()
   }
   if (!m.link) m.link = { record: true, snapshot: true }
+  /* Old firmware stored 0..4; snap to the nearest 低/中/高 gear. */
+  {
+    const gears = sensitivityOptions.map((o) => o.value)
+    if (!gears.includes(m.sensitivity)) {
+      m.sensitivity = gears.reduce((best, cur) =>
+        Math.abs(cur - m.sensitivity) < Math.abs(best - m.sensitivity) ? cur : best,
+      )
+    }
+  }
   return m
 }
 
@@ -195,14 +227,25 @@ onUnmounted(() => {
                   <el-switch v-model="motion.enabled" />
                 </el-form-item>
                 <el-form-item label="灵敏度">
-                  <div class="slider-row">
-                    <el-slider v-model="motion.sensitivity" :min="0" :max="4" show-stops style="width: 250px; max-width: 250px" />
-                    <span class="val">{{ motion.sensitivity }}</span>
-                  </div>
+                  <el-select v-model="motion.sensitivity" style="width: 220px">
+                    <el-option
+                      v-for="o in sensitivityOptions"
+                      :key="o.value"
+                      :label="o.label"
+                      :value="o.value"
+                    />
+                  </el-select>
                 </el-form-item>
                 <el-form-item label="面积阈值">
-                  <el-input-number v-model="motion.square_pct" :min="1" />
-                  <span class="unit">运动区域占比阈值</span>
+                  <el-input-number
+                    v-model="areaPct"
+                    :min="0.1"
+                    :max="100"
+                    :step="0.1"
+                    :precision="1"
+                    style="width: 140px"
+                  />
+                  <span class="unit">% 画面占比超过该值才触发</span>
                 </el-form-item>
                 <el-form-item label="连续帧数">
                   <el-input-number v-model="motion.hit_frames" :min="1" />
@@ -224,7 +267,7 @@ onUnmounted(() => {
                 </el-button>
                 <el-button size="small" :loading="bgLoading" @click="refreshBg(false)">刷新底图</el-button>
               </div>
-              <p class="hint">未画区域 = 全画面侦测；坐标 640×360。</p>
+              <p class="hint">未画区域 = 全画面侦测；区域按画面百分比匹配，与分辨率无关。</p>
               <RegionDrawCanvas
                 v-model="motion.regions"
                 :image-url="bgUrl"
@@ -274,7 +317,9 @@ onUnmounted(() => {
               {{ new Date(row.ts * 1000).toLocaleString() }}
             </template>
           </el-table-column>
-          <el-table-column label="面积" prop="square" width="72" />
+          <el-table-column label="面积占比" width="96">
+            <template #default="{ row }">{{ areaText(row.pct_x10) }}</template>
+          </el-table-column>
           <el-table-column label="抓图" min-width="100">
             <template #default="{ row }">
               <a v-if="row.snapshot" href="#" @click.prevent="openPreview(row.snapshot)">

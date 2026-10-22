@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { onMounted, ref } from 'vue'
+import { computed, onMounted, ref } from 'vue'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import {
   formatStorage,
@@ -25,6 +25,50 @@ const pageSize = ref(20)
 const playOpen = ref(false)
 const playing = ref<StorageRecord | null>(null)
 const recyclePct = ref(10)
+const kindFilter = ref<'' | 'event' | 'normal'>('')
+
+const stateLabel = computed(() => {
+  switch (status.value?.state) {
+    case 'mounted':
+      return '已挂载'
+    case 'unmounted':
+      return '未挂载（已格式化）'
+    case 'unformatted':
+      return '未格式化'
+    case 'nocard':
+      return '未检测到 SD 卡'
+    default:
+      return status.value?.mounted ? '已挂载' : '未挂载'
+  }
+})
+
+const stateTagType = computed(() => {
+  switch (status.value?.state) {
+    case 'mounted':
+      return 'success'
+    case 'unformatted':
+      return 'warning'
+    case 'nocard':
+      return 'danger'
+    default:
+      return 'info'
+  }
+})
+
+const stateHint = computed(() => {
+  switch (status.value?.state) {
+    case 'mounted':
+      return ''
+    case 'unformatted':
+      return 'SD 卡没有可识别的文件系统，请执行「格式化 SD 卡」。'
+    case 'unmounted':
+      return 'SD 卡已格式化但未挂载，可重新插拔或格式化。'
+    case 'nocard':
+      return '请插入 SD 卡。'
+    default:
+      return ''
+  }
+})
 
 function downloadUrl(relPath: string) {
   return `/api/v1/storage/download?path=${encodeURIComponent(relPath)}`
@@ -58,6 +102,7 @@ async function refreshRecords() {
     date: formatDateQuery(date.value) || undefined,
     limit: pageSize.value,
     offset,
+    kind: kindFilter.value || undefined,
   })
   if (rs.code !== 0) throw new Error(rs.msg || '读取录像列表失败')
   records.value = rs.data.records
@@ -130,10 +175,36 @@ function onDownload(row: StorageRecord) {
   a.remove()
 }
 
-async function onFormat() {
+async function onFormatCard() {
   try {
     await ElMessageBox.confirm(
-      '确认清空 TF 卡上的录像、抓图与告警记录？（软格式化，不重新分区）',
+      '确认格式化 SD 卡？所有录像、抓图、告警记录都会被永久删除，并重新创建 FAT32 文件系统。',
+      '格式化 SD 卡',
+      { type: 'warning', confirmButtonText: '格式化', cancelButtonText: '取消' },
+    )
+  } catch {
+    return
+  }
+  formatting.value = true
+  try {
+    const r = await formatStorage({ mkfs: true })
+    if (r.code !== 0) {
+      ElMessage.error(r.msg || '格式化失败')
+      return
+    }
+    ElMessage.success('SD 卡已格式化并挂载')
+    await refresh()
+  } catch (e) {
+    ElMessage.error(String(e))
+  } finally {
+    formatting.value = false
+  }
+}
+
+async function onClearRecords() {
+  try {
+    await ElMessageBox.confirm(
+      '确认清空 TF 卡上的录像、抓图与告警记录？（软清空，不重新分区）',
       '清空存储',
       { type: 'warning', confirmButtonText: '清空', cancelButtonText: '取消' },
     )
@@ -142,9 +213,9 @@ async function onFormat() {
   }
   formatting.value = true
   try {
-    const r = await formatStorage()
+    const r = await formatStorage({ mkfs: false })
     if (r.code !== 0) {
-      ElMessage.error(r.msg || '格式化失败')
+      ElMessage.error(r.msg || '清空失败')
       return
     }
     ElMessage.success(`已清空，删除 ${r.data.deleted} 个文件`)
@@ -165,11 +236,15 @@ onMounted(refresh)
       <el-tabs v-model="activeTab">
         <el-tab-pane label="存储状态" name="status">
           <el-descriptions class="ipc-desc" :column="1" border>
-            <el-descriptions-item label="挂载">
-              {{ status?.mounted ? '已挂载' : '未挂载' }}
+            <el-descriptions-item label="SD 卡状态">
+              <el-tag :type="stateTagType" size="small">{{ stateLabel }}</el-tag>
+              <span v-if="stateHint" class="hint state-hint">{{ stateHint }}</span>
             </el-descriptions-item>
             <el-descriptions-item label="挂载路径">
               {{ status?.mount_path || '-' }}
+            </el-descriptions-item>
+            <el-descriptions-item label="设备节点">
+              {{ status?.device || '-' }}
             </el-descriptions-item>
             <el-descriptions-item label="文件系统">
               {{ status?.fstype || '-' }}
@@ -194,10 +269,15 @@ onMounted(refresh)
             </el-descriptions-item>
           </el-descriptions>
           <div class="mt">
-            <el-button type="danger" plain :loading="formatting" @click="onFormat">
+            <el-button type="danger" :loading="formatting" @click="onFormatCard">
+              格式化 SD 卡
+            </el-button>
+            <el-button type="danger" plain :loading="formatting" @click="onClearRecords">
               清空录像/抓图/告警
             </el-button>
-            <p class="hint">软格式化：删除文件，不执行 mkfs。</p>
+            <p class="hint">
+              格式化会执行 mkfs.vfat 并重新挂载（录像会短暂中断）；清空仅删除文件。
+            </p>
           </div>
         </el-tab-pane>
 
@@ -211,6 +291,12 @@ onMounted(refresh)
               placeholder="yyyy-MM-dd"
               clearable
             />
+            <span class="lab">类型</span>
+            <el-select v-model="kindFilter" style="width: 130px" @change="onQuery">
+              <el-option label="全部" value="" />
+              <el-option label="常规录像" value="normal" />
+              <el-option label="事件录像" value="event" />
+            </el-select>
             <el-button type="primary" @click="onQuery">查询</el-button>
           </div>
           <el-table
@@ -220,6 +306,13 @@ onMounted(refresh)
             max-height="560"
           >
             <el-table-column prop="name" label="文件名" min-width="200" show-overflow-tooltip />
+            <el-table-column label="类型" width="100">
+              <template #default="{ row }">
+                <el-tag :type="row.kind === 'event' ? 'warning' : 'info'" size="small">
+                  {{ row.kind === 'event' ? '事件' : '常规' }}
+                </el-tag>
+              </template>
+            </el-table-column>
             <el-table-column label="时间" min-width="150">
               <template #default="{ row }">
                 {{ new Date((row.mtime ?? 0) * 1000).toLocaleString() }}
@@ -283,6 +376,7 @@ onMounted(refresh)
 .lab { color: var(--ipc-muted); font-size: 0.9rem; }
 .unit { color: var(--ipc-muted); }
 .hint { color: var(--ipc-muted); font-size: 0.8rem; margin: 0.35rem 0 0; }
+.state-hint { margin-left: 0.5rem; }
 .mt { margin-top: 1rem; }
 .pager {
   display: flex;

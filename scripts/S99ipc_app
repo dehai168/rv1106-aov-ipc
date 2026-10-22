@@ -39,7 +39,7 @@ start() {
   if [ -x "$WATCHDOG" ]; then
     nohup "$WATCHDOG" >/dev/null 2>&1 &
   elif [ -x "$DAEMON" ]; then
-    nohup "$DAEMON" --web >>"$LOG" 2>>/userdata/log/ipc_stderr.log &
+    nohup "$DAEMON" --web >/dev/null 2>&1 &
   else
     echo "missing $DAEMON"
     return 1

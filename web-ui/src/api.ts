@@ -125,6 +125,11 @@ export function setVideoOsd(body: Partial<VideoOsdConfig> & { apply?: boolean })
 
 export type StorageStatus = {
   mounted: boolean
+  present: boolean
+  formatted: boolean
+  /** mounted | unmounted | unformatted | nocard */
+  state: string
+  device: string
   mount_path: string
   fstype: string
   total_bytes: number
@@ -137,6 +142,7 @@ export type StorageRecord = {
   name: string
   mtime: number
   size: number
+  kind?: 'event' | 'normal'
 }
 
 export function getStorageStatus() {
@@ -147,11 +153,13 @@ export function getStorageRecords(params?: {
   date?: string
   limit?: number
   offset?: number
+  kind?: 'event' | 'normal'
 }) {
   const q: string[] = []
   if (params?.date) q.push(`date=${encodeURIComponent(params.date)}`)
   if (params?.limit) q.push(`limit=${encodeURIComponent(String(params.limit))}`)
   if (params?.offset != null) q.push(`offset=${encodeURIComponent(String(params.offset))}`)
+  if (params?.kind) q.push(`kind=${encodeURIComponent(params.kind)}`)
   const qs = q.length ? `?${q.join('&')}` : ''
   return request<{
     records: StorageRecord[]
@@ -162,10 +170,11 @@ export function getStorageRecords(params?: {
   }>(`/api/v1/storage/records${qs}`)
 }
 
-export function formatStorage() {
-  return request<{ deleted: number; note: string }>('/api/v1/storage/format', {
+/** mkfs=true re-formats the SD card (mkfs.vfat); false only wipes record dirs. */
+export function formatStorage(opts: { mkfs?: boolean } = {}) {
+  return request<{ deleted: number; note: string; state?: string }>('/api/v1/storage/format', {
     method: 'POST',
-    body: JSON.stringify({ confirm: true }),
+    body: JSON.stringify({ confirm: true, mkfs: !!opts.mkfs }),
   })
 }
 
@@ -297,6 +306,9 @@ export type FaceConfig = {
   score_thr_x100: number
   margin_x100: number
   save_scene: boolean
+  /* Legacy flat flags kept for older firmware payloads. */
+  link_record?: boolean
+  link_alarm?: boolean
   regions: FaceRegion[]
   schedule: { enabled: boolean; grid: string }
   link: { record: boolean; snapshot: boolean; alarm: boolean }
@@ -376,11 +388,14 @@ export function deleteFaceEvents(body: { files?: string[]; date?: string }) {
   })
 }
 
-export function previewSnapshot() {
-  return request<{ file: string; url: string }>('/api/v1/preview/snapshot', {
-    method: 'POST',
-    body: '{}',
-  })
+export function previewSnapshot(stream: 'main' | 'sub' = 'sub') {
+  return request<{ file: string; url: string; stream?: string; w?: number; h?: number }>(
+    `/api/v1/preview/snapshot?stream=${stream}`,
+    {
+      method: 'POST',
+      body: '{}',
+    },
+  )
 }
 
 export type SystemInfo = {

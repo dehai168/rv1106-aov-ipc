@@ -90,7 +90,15 @@ function ensureDefaults(cfg: FaceConfig): FaceConfig {
   if (!cfg.schedule.grid || cfg.schedule.grid.length !== 168) {
     cfg.schedule.grid = emptyGrid()
   }
-  if (!cfg.link) cfg.link = { record: true, snapshot: true, alarm: true }
+  if (!cfg.link) {
+    /* Older firmware only had save_scene / link_record / link_alarm. */
+    cfg.link = {
+      record: cfg.link_record ?? true,
+      snapshot: cfg.save_scene ?? true,
+      alarm: cfg.link_alarm ?? true,
+    }
+  }
+  if (typeof cfg.link.snapshot !== 'boolean') cfg.link.snapshot = !!cfg.save_scene
   if (!cfg.sensitivity) cfg.sensitivity = 'normal'
   if (![1000, 3000, 5000, 10000].includes(cfg.interval_ms)) {
     const nearest = intervalOptions.reduce((best, cur) =>
@@ -164,7 +172,8 @@ async function onSave() {
       sensitivity: face.value.sensitivity,
       interval_ms: face.value.interval_ms,
       max_snap_per_frame: face.value.max_snap_per_frame,
-      save_scene: face.value.save_scene,
+      /* 联动抓图 is the old 保存全景 switch, kept under link.snapshot. */
+      save_scene: face.value.link.snapshot,
       regions: face.value.regions,
       schedule: face.value.schedule,
       link: face.value.link,
@@ -277,7 +286,7 @@ onUnmounted(() => {
 </script>
 
 <template>
-  <PageShell title="人脸抓拍" subtitle="运动门控触发 YuNet 检测；抓拍记录在本页第三 Tab。">
+  <PageShell title="人脸抓拍" subtitle="运动门控触发 YuNet 检测；布防区域/布防时间/联动可分别配置。">
     <div v-loading="loading" class="face-page">
       <template v-if="face">
         <div class="runtime">
@@ -316,19 +325,6 @@ onUnmounted(() => {
               <el-form-item label="单帧最多抓拍">
                 <el-input-number v-model="face.max_snap_per_frame" :min="1" :max="4" />
               </el-form-item>
-              <el-form-item label="保存全景">
-                <el-switch v-model="face.save_scene" />
-              </el-form-item>
-              <el-form-item label="联动录像">
-                <el-switch v-model="face.link.record" />
-              </el-form-item>
-              <el-form-item label="日抓拍上限">
-                <el-input-number v-model="face.daily_limit" :min="10" :max="20000" :step="100" />
-              </el-form-item>
-              <el-form-item label="存储配额">
-                <el-input-number v-model="face.quota_percent" :min="1" :max="50" />
-                <span class="unit">% TF 容量（超限删最旧）</span>
-              </el-form-item>
               <el-alert
                 type="info"
                 :closable="false"
@@ -342,7 +338,7 @@ onUnmounted(() => {
             </div>
           </el-tab-pane>
 
-          <el-tab-pane label="区域与布防" name="region">
+          <el-tab-pane label="布防区域" name="region">
             <div class="region-btns">
               <el-button
                 v-for="i in 4"
@@ -355,15 +351,22 @@ onUnmounted(() => {
               </el-button>
               <el-button size="small" :loading="bgLoading" @click="refreshBg(false)">刷新底图</el-button>
             </div>
-            <p class="hint">未画区域 = 全画面；坐标 640×360。</p>
+            <p class="hint">未画区域 = 全画面；区域按画面百分比匹配，与分辨率无关。</p>
             <RegionDrawCanvas
               v-model="face.regions"
               :image-url="bgUrl"
               :logic-w="640"
               :logic-h="360"
+              :max-width="420"
               :active-index="regionIdx"
             />
-            <el-form label-width="100px" class="sched-form">
+            <div class="actions">
+              <el-button type="primary" :loading="saving" @click="onSave">保存并应用</el-button>
+            </div>
+          </el-tab-pane>
+
+          <el-tab-pane label="布防时间" name="schedule">
+            <el-form label-width="100px">
               <el-form-item label="启用时间表">
                 <el-switch v-model="face.schedule.enabled" active-text="关闭=全天" />
               </el-form-item>
@@ -373,6 +376,29 @@ onUnmounted(() => {
               class="full"
               :disabled="!face.schedule.enabled"
             />
+            <div class="actions">
+              <el-button type="primary" :loading="saving" @click="onSave">保存并应用</el-button>
+            </div>
+          </el-tab-pane>
+
+          <el-tab-pane label="联动" name="link">
+            <el-form label-width="120px" class="detect-form">
+              <el-form-item label="联动抓图">
+                <el-switch v-model="face.link.snapshot" />
+                <span class="unit">抓拍时同时保存一张全景图</span>
+              </el-form-item>
+              <el-form-item label="联动录像">
+                <el-switch v-model="face.link.record" />
+                <span class="unit">抓拍时触发事件录像</span>
+              </el-form-item>
+              <el-form-item label="日抓拍上限">
+                <el-input-number v-model="face.daily_limit" :min="10" :max="20000" :step="100" />
+              </el-form-item>
+              <el-form-item label="存储配额">
+                <el-input-number v-model="face.quota_percent" :min="1" :max="50" />
+                <span class="unit">% TF 容量（超限删最旧）</span>
+              </el-form-item>
+            </el-form>
             <div class="actions">
               <el-button type="primary" :loading="saving" @click="onSave">保存并应用</el-button>
             </div>
