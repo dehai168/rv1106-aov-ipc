@@ -11,12 +11,15 @@ const props = withDefaults(
     max?: number
     /** When >= 0, only edit this region index. */
     activeIndex?: number
+    /** Cap the canvas width (px). 0 = fill the container. */
+    maxWidth?: number
   }>(),
   {
     logicW: 640,
     logicH: 360,
     max: 4,
     activeIndex: -1,
+    maxWidth: 0,
   },
 )
 
@@ -332,7 +335,10 @@ defineExpose({ clearSelected, clearAll, selected })
 </script>
 
 <template>
-  <div class="region-draw">
+  <div
+    class="region-draw"
+    :style="maxWidth > 0 ? { maxWidth: `${maxWidth}px` } : undefined"
+  >
     <div ref="wrapEl" class="stage">
       <canvas
         ref="canvasEl"

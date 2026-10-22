@@ -13,19 +13,26 @@ extern "C" {
 
 typedef struct {
   int enabled;
+  /* Legacy absolute coords in the 640x360 UI reference frame (kept for API
+   * compatibility); pct_* below are the authoritative, resolution-free form. */
   int x;
   int y;
   int w;
   int h;
+  /* Permille of frame (0..1000) — survives preview/detect size changes. */
+  int pct_x;
+  int pct_y;
+  int pct_w;
+  int pct_h;
 } DetectRegion;
 
 typedef struct {
-  int sensitivity; /* 0..4, default 2 */
-  int square_pct;  /* motion if 1000*square/(w*h) > this; default 8 */
+  int sensitivity; /* 0..4 (UI exposes 低/中/高 = 0/2/4), default 2 */
+  int square_pct;  /* permille of frame: motion if 1000*square/(w*h) > this */
   int hit_frames;  /* consecutive hits to fire; default 2 */
   int enabled;     /* 1=on */
 
-  /* Soft ROI in detect VI pixels. No enabled region with w/h>0 => full frame. */
+  /* Soft ROI. No enabled region with w/h>0 => full frame. */
   DetectRegion regions[DETECT_MAX_REGIONS];
 
   /* Arm schedule: minutes from midnight; days bitmask bit0=Mon .. bit6=Sun. */
@@ -71,6 +78,11 @@ int detect_config_save(const DetectConfig *cfg);
 
 /* Sync schedule_days bitmask from grid (days that have any '1' hour). */
 void detect_schedule_sync_days_from_grid(DetectConfig *cfg);
+
+/* ROI helpers: pct_* (permille) is authoritative; x/y/w/h live in the
+ * 640x360 drawing frame used by the web UI. */
+void detect_region_from_xywh(DetectRegion *r);
+void detect_region_sync_xywh(DetectRegion *r);
 
 #ifdef __cplusplus
 }

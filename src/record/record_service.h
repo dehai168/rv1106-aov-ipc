@@ -30,6 +30,7 @@ typedef struct {
   char path[512];
   time_t start_ts;
   int64_t size_bytes;
+  int kind; /* RECORD_KIND_* */
 } RecordItem;
 
 typedef enum {
@@ -37,6 +38,11 @@ typedef enum {
   RECORD_MODE_CONTINUOUS,
   RECORD_MODE_MOTION
 } RecordMode;
+
+typedef enum {
+  RECORD_KIND_NORMAL = 0, /* continuous/schedule 30min-style segments */
+  RECORD_KIND_EVENT = 1   /* motion-linked event clips */
+} RecordKind;
 
 int record_init(const RecordConfig *cfg);
 void record_deinit(void);
@@ -61,7 +67,8 @@ RecordMode record_mode(void);
 /* Blocking helper for CLI: start, sleep seconds, stop. */
 int record_run_for(int seconds);
 
-/* Query mp4 under records/ with start_ts in [from, to]. to=0 means now. */
+/* Query mp4 under records/ with start_ts in [from, to]. to=0 means now.
+ * RecordItem.kind tells event clips (records/events/...) from normal ones. */
 int record_query(time_t from, time_t to, RecordItem *out, int max_items, int *out_count);
 
 void record_config_load(RecordConfig *out);

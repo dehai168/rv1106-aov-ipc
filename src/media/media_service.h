@@ -91,6 +91,12 @@ int media_osd_set(const MediaOsdConfig *in, int apply);
 int media_snapshot_jpeg(const char *path);
 /* Same as media_snapshot_jpeg but returns malloc'd buffer (caller free). */
 int media_snapshot_jpeg_mem(uint8_t **out, size_t *out_len);
+/* stream 0 = sub (sub_w x sub_h), 1 = main (main_w x main_h). */
+int media_snapshot_jpeg_stream(const char *path, int stream);
+int media_snapshot_jpeg_stream_mem(int stream, uint8_t **out, size_t *out_len);
+/* Configured main encode geometry (record main / main snapshot). */
+int media_stream_main_width(void);
+int media_stream_main_height(void);
 
 /* Grab one NV12 frame from VI1 (sub, depth>=2). Caller must media_release_*_nv12.
  * Buffer is RGA-copied into MMZ (contiguous NV12, stride=width). priv = MediaNv12Owned*. */

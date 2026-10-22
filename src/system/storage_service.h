@@ -9,6 +9,10 @@ extern "C" {
 
 typedef struct {
   int mounted;
+  int present;   /* SD block device exists */
+  int formatted; /* recognised FAT/exFAT superblock on the partition */
+  /* mounted | unmounted | unformatted | nocard */
+  char state[24];
   char mount_path[128];
   char fstype[64];
   uint64_t total_bytes;
@@ -38,6 +42,12 @@ int storage_delete_oldest(int count);
 
 /* Soft format: delete files under records/snapshots/alarms, recreate dirs. Not mkfs. */
 int storage_format_clear(void);
+
+/* Hard format: umount, mkfs.vfat -F 32 on the SD partition, remount, recreate
+ * dirs. Returns 0 on success. Refuses while the card is busy. */
+int storage_format_card(void);
+
+const char *storage_sd_device(void); /* e.g. /dev/mmcblk1p1, "" when absent */
 
 const char *storage_mount_path(void);
 const char *storage_records_path(void);

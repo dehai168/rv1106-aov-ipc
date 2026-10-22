@@ -15,7 +15,9 @@ typedef enum {
 /* Console-only init (backward compatible). */
 void log_init(LogLevel level);
 
-/* Also append to <log_dir>/ipc_app.log when log_dir is non-NULL. */
+/* Also append to <log_dir>/ipc_app.log when log_dir is non-NULL.
+ * Both ipc_app.log and stderr are size capped: log.max_kb (default 64) per
+ * file, log.keep (default 2) rotated generations. */
 int log_init_ex(LogLevel level, const char *log_dir);
 
 void log_set_level(LogLevel level);
