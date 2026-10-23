@@ -34,8 +34,15 @@ int storage_free_percent(void);
  */
 int storage_recycle_oldest(int target_free_percent);
 
-/* Keep faces/ total size <= quota_percent of TF capacity; delete oldest .jpg. */
+/* snapshots/ name suffixes: YYYYMMDD_HHMMSS_md.jpg (motion link) and
+ * YYYYMMDD_HHMMSS_mmm_face.jpg (face panorama). */
+#define STORAGE_MOTION_SNAP_SUFFIX "_md.jpg"
+#define STORAGE_FACE_SCENE_SUFFIX "_face.jpg"
+
+/* Keep faces/ + face panoramas <= quota_percent of TF capacity; delete oldest. */
 int storage_recycle_faces(int quota_percent);
+/* Keep motion-link snapshots <= quota_percent of TF capacity; delete oldest. */
+int storage_recycle_motion_snapshots(int quota_percent);
 
 /* Delete up to `count` oldest mp4 files (for tests / forced cleanup). */
 int storage_delete_oldest(int count);

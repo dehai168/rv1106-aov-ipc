@@ -47,6 +47,11 @@ typedef struct {
   int seg_active;
   int flushing_prerecord;
   int seg_kind; /* RECORD_KIND_* of the segment currently open */
+  int seg_src;       /* RECORD_SRC_* that fired during the open event clip */
+  int seg_src_named; /* RECORD_SRC_* encoded in cur_path */
+  int pending_src;   /* RECORD_SRC_* for the next event clip to open */
+  char seg_dir[256];
+  struct tm seg_tm;
   RecordConfig cfg;
   char cur_path[512];   /* final destination on TF */
   char stage_path[512]; /* /tmp staging file while muxing */
@@ -121,6 +126,18 @@ static int ensure_event_dir(char *day_dir, size_t n, const struct tm *tm)
     return -1;
   }
   return 0;
+}
+
+static void event_clip_path(char *out, size_t n, const char *day_dir, const struct tm *tm, int src)
+{
+  const char *tag = "MD_";
+  if ((src & RECORD_SRC_MOTION) && (src & RECORD_SRC_FACE)) {
+    tag = "MD_FACE_";
+  } else if (src & RECORD_SRC_FACE) {
+    tag = "FACE_";
+  }
+  snprintf(out, n, "%s/EVT_%s%04d%02d%02d_%02d%02d%02d.mp4", day_dir, tag, tm->tm_year + 1900,
+           tm->tm_mon + 1, tm->tm_mday, tm->tm_hour, tm->tm_min, tm->tm_sec);
 }
 
 static void ring_free_at(int idx)
@@ -360,9 +377,11 @@ static int open_segment_locked(void)
     if (ensure_event_dir(day_dir, sizeof(day_dir), &tm) != 0) {
       return -1;
     }
-    snprintf(g_rec.cur_path, sizeof(g_rec.cur_path), "%s/EVT_%04d%02d%02d_%02d%02d%02d.mp4",
-             day_dir, tm.tm_year + 1900, tm.tm_mon + 1, tm.tm_mday, tm.tm_hour, tm.tm_min,
-             tm.tm_sec);
+    g_rec.seg_src = g_rec.pending_src ? g_rec.pending_src : RECORD_SRC_MOTION;
+    g_rec.seg_src_named = g_rec.seg_src;
+    g_rec.seg_tm = tm;
+    snprintf(g_rec.seg_dir, sizeof(g_rec.seg_dir), "%s", day_dir);
+    event_clip_path(g_rec.cur_path, sizeof(g_rec.cur_path), day_dir, &tm, g_rec.seg_src);
   } else {
     if (ensure_day_dir(day_dir, sizeof(day_dir), &tm) != 0) {
       return -1;
@@ -444,6 +463,11 @@ static void close_segment_locked(void)
   }
   /* Stop enqueue from VENC callback, drain writer, then deinit muxer. */
   g_rec.muxer_open = 0;
+  if (g_rec.seg_kind == RECORD_KIND_EVENT && g_rec.seg_src != g_rec.seg_src_named) {
+    event_clip_path(g_rec.cur_path, sizeof(g_rec.cur_path), g_rec.seg_dir, &g_rec.seg_tm,
+                    g_rec.seg_src);
+    g_rec.seg_src_named = g_rec.seg_src;
+  }
   snprintf(final_path, sizeof(final_path), "%s", g_rec.cur_path);
   snprintf(stage_path, sizeof(stage_path), "%s", g_rec.stage_path);
   pthread_mutex_unlock(&g_rec.lock);
@@ -885,17 +909,30 @@ int record_arm_motion(void)
 
 int record_on_motion(void)
 {
+  return record_on_event(RECORD_SRC_MOTION);
+}
+
+int record_on_event(int src)
+{
   Event e;
   int started = 0;
   if (!g_rec.inited) {
     return -1;
+  }
+  if (!(src & (RECORD_SRC_MOTION | RECORD_SRC_FACE))) {
+    src = RECORD_SRC_MOTION;
   }
   pthread_mutex_lock(&g_rec.lock);
   if (g_rec.mode != RECORD_MODE_MOTION) {
     g_rec.mode = RECORD_MODE_MOTION;
   }
   g_rec.quiet_deadline = time(NULL) + g_rec.cfg.quiet_sec;
-  if (!g_rec.muxer_open) {
+  if (g_rec.muxer_open) {
+    /* Segment rollover inherits every source seen in this event. */
+    g_rec.seg_src |= src;
+    g_rec.pending_src = g_rec.seg_src;
+  } else {
+    g_rec.pending_src = src;
     if (open_segment_locked() != 0) {
       pthread_mutex_unlock(&g_rec.lock);
       return -2;

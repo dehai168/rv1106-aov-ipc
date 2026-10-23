@@ -246,28 +246,46 @@ void rknn_face_destroy(RknnFaceCtx *ctx)
   free(ctx);
 }
 
-/* Distance-based decode used by this board's YuNet RKNN export. */
+/* yunet_n_320_320 already ends in sigmoid; only squash if a tensor holds logits. */
+static int tensor_is_prob(const float *v, int n)
+{
+  int i;
+  for (i = 0; i < n; i++) {
+    if (v[i] < -0.01f || v[i] > 1.01f) return 0;
+  }
+  return 1;
+}
+
+static float to_prob(float v, int is_prob)
+{
+  return is_prob ? clampf(v, 0.f, 1.f) : sigmoidf_safe(v);
+}
+
+/* OpenCV FaceDetectorYN decode: bbox = (dx, dy, log w, log h) per grid cell. */
 static void decode_stride(const float *cls, const float *obj, const float *bbox, int rows, int cols,
                           int stride, float score_thr, RknnFaceBox *out, int *n, int max_n,
                           float *max_score_io)
 {
   int r, c;
+  int cls_prob = tensor_is_prob(cls, rows * cols);
+  int obj_prob = tensor_is_prob(obj, rows * cols);
   for (r = 0; r < rows && *n < max_n; r++) {
     for (c = 0; c < cols && *n < max_n; c++) {
       int idx = r * cols + c;
-      float cs, os, score, cx, cy, x1, y1, x2, y2;
-      /* Graph has no sigmoid — always map logits → probs. */
-      cs = sigmoidf_safe(cls[idx]);
-      os = sigmoidf_safe(obj[idx]);
+      float cs, os, score, cx, cy, bw, bh, x1, y1, x2, y2;
+      cs = to_prob(cls[idx], cls_prob);
+      os = to_prob(obj[idx], obj_prob);
       score = sqrtf(cs * os);
       if (max_score_io && score > *max_score_io) *max_score_io = score;
       if (score < score_thr) continue;
-      cx = ((float)c + 0.5f) * (float)stride;
-      cy = ((float)r + 0.5f) * (float)stride;
-      x1 = cx - bbox[idx * 4 + 0] * (float)stride;
-      y1 = cy - bbox[idx * 4 + 1] * (float)stride;
-      x2 = cx + bbox[idx * 4 + 2] * (float)stride;
-      y2 = cy + bbox[idx * 4 + 3] * (float)stride;
+      cx = ((float)c + bbox[idx * 4 + 0]) * (float)stride;
+      cy = ((float)r + bbox[idx * 4 + 1]) * (float)stride;
+      bw = expf(bbox[idx * 4 + 2]) * (float)stride;
+      bh = expf(bbox[idx * 4 + 3]) * (float)stride;
+      x1 = cx - bw * 0.5f;
+      y1 = cy - bh * 0.5f;
+      x2 = cx + bw * 0.5f;
+      y2 = cy + bh * 0.5f;
       x1 = clampf(x1, 0.f, (float)RKNN_FACE_INPUT - 1.f);
       y1 = clampf(y1, 0.f, (float)RKNN_FACE_INPUT - 1.f);
       x2 = clampf(x2, 0.f, (float)RKNN_FACE_INPUT - 1.f);

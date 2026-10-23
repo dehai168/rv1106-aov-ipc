@@ -1241,6 +1241,17 @@ static void handle_storage_records(struct mg_connection *c, struct mg_http_messa
       cJSON_AddNumberToObject(it, "mtime", (double)arr[start + i].mtime);
       cJSON_AddNumberToObject(it, "size", (double)arr[start + i].size);
       cJSON_AddStringToObject(it, "kind", arr[start + i].event ? "event" : "normal");
+      if (arr[start + i].event) {
+        /* EVT_MD_FACE_* / EVT_FACE_* / EVT_MD_*; legacy EVT_<date> were motion-only. */
+        const char *nm = arr[start + i].name;
+        const char *src = "motion";
+        if (strncmp(nm, "EVT_MD_FACE_", 12) == 0) {
+          src = "motion,face";
+        } else if (strncmp(nm, "EVT_FACE_", 9) == 0) {
+          src = "face";
+        }
+        cJSON_AddStringToObject(it, "event_src", src);
+      }
       cJSON_AddItemToArray(records, it);
     }
     cJSON_AddItemToObject(data, "records", records);
@@ -1826,6 +1837,8 @@ static void alarm_add_region_schedule(cJSON *data, const DetectConfig *cfg)
   link = cJSON_CreateObject();
   cJSON_AddBoolToObject(link, "record", cfg->link_record ? 1 : 0);
   cJSON_AddBoolToObject(link, "snapshot", cfg->link_snapshot ? 1 : 0);
+  cJSON_AddNumberToObject(link, "daily_limit", cfg->snap_daily_limit);
+  cJSON_AddNumberToObject(link, "quota_percent", cfg->snap_quota_percent);
   cJSON_AddItemToObject(data, "link", link);
 }
 
@@ -2017,6 +2030,14 @@ static void handle_alarm_motion_set(struct mg_connection *c, struct mg_http_mess
   if (cJSON_IsObject(link)) {
     (void)json_read_bool(cJSON_GetObjectItem(link, "record"), &cfg.link_record);
     (void)json_read_bool(cJSON_GetObjectItem(link, "snapshot"), &cfg.link_snapshot);
+    item = cJSON_GetObjectItem(link, "daily_limit");
+    if (cJSON_IsNumber(item)) {
+      cfg.snap_daily_limit = item->valueint;
+    }
+    item = cJSON_GetObjectItem(link, "quota_percent");
+    if (cJSON_IsNumber(item)) {
+      cfg.snap_quota_percent = item->valueint;
+    }
   }
 
   item = cJSON_GetObjectItem(root, "apply");
@@ -2068,6 +2089,18 @@ static void handle_alarm_motion_set(struct mg_connection *c, struct mg_http_mess
   }
   cfg.link_record = cfg.link_record ? 1 : 0;
   cfg.link_snapshot = cfg.link_snapshot ? 1 : 0;
+  if (cfg.snap_daily_limit < 10) {
+    cfg.snap_daily_limit = 10;
+  }
+  if (cfg.snap_daily_limit > 20000) {
+    cfg.snap_daily_limit = 20000;
+  }
+  if (cfg.snap_quota_percent < 1) {
+    cfg.snap_quota_percent = 1;
+  }
+  if (cfg.snap_quota_percent > 50) {
+    cfg.snap_quota_percent = 50;
+  }
   if (cfg.schedule_start_min < 0) {
     cfg.schedule_start_min = 0;
   }
@@ -2115,18 +2148,30 @@ static void handle_alarm_motion_set(struct mg_connection *c, struct mg_http_mess
 
 static int is_snapshot_name(const char *name)
 {
-  /* YYYYMMDD_HHMMSS.jpg */
+  /* YYYYMMDD_HHMMSS[_tag].jpg, tag = [a-z0-9_]{1,16}: _sub/_main (preview),
+   * _md (motion link), _mmm_face (face panorama). */
   size_t n;
   size_t i;
   if (!name) {
     return 0;
   }
   n = strlen(name);
-  if (n != 19) {
+  if (n < 19 || n > 36 || n == 20) {
     return 0;
   }
-  if (strcmp(name + 15, ".jpg") != 0) {
+  if (strcmp(name + n - 4, ".jpg") != 0) {
     return 0;
+  }
+  if (n > 19) {
+    if (name[15] != '_') {
+      return 0;
+    }
+    for (i = 16; i < n - 4; i++) {
+      if (!islower((unsigned char)name[i]) && !isdigit((unsigned char)name[i]) &&
+          name[i] != '_') {
+        return 0;
+      }
+    }
   }
   if (name[8] != '_') {
     return 0;
@@ -2507,6 +2552,87 @@ static int is_face_rel_path(const char *rel)
   return 1;
 }
 
+/* Crop <stamp>_<k>.jpg -> panorama <stamp>_face.jpg in snapshots/.
+ * legacy=1 also accepts the old shared YYYYMMDD_HHMMSS.jpg name. */
+static int face_scene_name(const char *face_base, int legacy, char *out, size_t n)
+{
+  const char *us = strrchr(face_base, '_');
+  char full[400];
+  struct stat st;
+
+  if (!us || us - face_base < 15) {
+    return -1;
+  }
+  snprintf(out, n, "%.*s%s", (int)(us - face_base), face_base, STORAGE_FACE_SCENE_SUFFIX);
+  snprintf(full, sizeof(full), "%s/%s", storage_snapshots_path(), out);
+  if (stat(full, &st) == 0 && S_ISREG(st.st_mode)) {
+    return 0;
+  }
+  if (legacy) {
+    snprintf(out, n, "%.15s.jpg", face_base);
+    snprintf(full, sizeof(full), "%s/%s", storage_snapshots_path(), out);
+    if (stat(full, &st) == 0 && S_ISREG(st.st_mode)) {
+      return 0;
+    }
+  }
+  out[0] = '\0';
+  return -1;
+}
+
+/* After deleting crop `rel` (YYYYMMDD/<stamp>_<k>.jpg), drop its panorama
+ * once no sibling crop of the same frame is left. */
+static void face_scene_release(const char *rel)
+{
+  char scene[96];
+  char dir[320];
+  char full[400];
+  const char *base = rel + 9;
+  const char *us = strrchr(base, '_');
+  size_t plen;
+  DIR *dp;
+  struct dirent *de;
+
+  if (!us || face_scene_name(base, 0, scene, sizeof(scene)) != 0) {
+    return;
+  }
+  plen = (size_t)(us - base) + 1;
+  snprintf(dir, sizeof(dir), "%s/%.8s", storage_faces_path(), rel);
+  dp = opendir(dir);
+  if (dp) {
+    while ((de = readdir(dp)) != NULL) {
+      if (strncmp(de->d_name, base, plen) == 0) {
+        closedir(dp);
+        return;
+      }
+    }
+    closedir(dp);
+  }
+  snprintf(full, sizeof(full), "%s/%s", storage_snapshots_path(), scene);
+  unlink(full);
+}
+
+static void face_scenes_delete_day(const char *date)
+{
+  DIR *dp = opendir(storage_snapshots_path());
+  struct dirent *de;
+  size_t sn = strlen(STORAGE_FACE_SCENE_SUFFIX);
+
+  if (!dp) {
+    return;
+  }
+  while ((de = readdir(dp)) != NULL) {
+    char full[400];
+    size_t dn = strlen(de->d_name);
+    if (dn <= sn || strncmp(de->d_name, date, 8) != 0 ||
+        strcmp(de->d_name + dn - sn, STORAGE_FACE_SCENE_SUFFIX) != 0) {
+      continue;
+    }
+    snprintf(full, sizeof(full), "%s/%s", storage_snapshots_path(), de->d_name);
+    unlink(full);
+  }
+  closedir(dp);
+}
+
 static void handle_alarm_face_events(struct mg_connection *c, struct mg_http_message *hm)
 {
   char date[16];
@@ -2587,6 +2713,12 @@ static void handle_alarm_face_events(struct mg_connection *c, struct mg_http_mes
     cJSON_AddStringToObject(ev, "type", "face");
     cJSON_AddStringToObject(ev, "face_file", rel);
     cJSON_AddStringToObject(ev, "file", names[i]);
+    {
+      char scene[96];
+      if (face_scene_name(names[i], 1, scene, sizeof(scene)) == 0) {
+        cJSON_AddStringToObject(ev, "scene_file", scene);
+      }
+    }
     cJSON_AddItemToArray(arr, ev);
     emitted++;
   }
@@ -2651,7 +2783,10 @@ static void handle_alarm_face_events_delete(struct mg_connection *c, struct mg_h
       char full[400];
       if (!cJSON_IsString(it) || !it->valuestring || !is_face_rel_path(it->valuestring)) continue;
       snprintf(full, sizeof(full), "%s/%s", storage_faces_path(), it->valuestring);
-      if (unlink(full) == 0) deleted++;
+      if (unlink(full) == 0) {
+        deleted++;
+        face_scene_release(it->valuestring);
+      }
     }
   } else if (cJSON_IsString(date_item) && date_item->valuestring && is_date8(date_item->valuestring)) {
     char dirpath[320];
@@ -2676,6 +2811,7 @@ static void handle_alarm_face_events_delete(struct mg_connection *c, struct mg_h
       closedir(dp);
       rmdir(dirpath);
     }
+    face_scenes_delete_day(date_item->valuestring);
   } else {
     cJSON_Delete(root);
     json_reply(c, 1002, "files or date required", NULL);

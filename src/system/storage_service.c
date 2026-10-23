@@ -315,8 +315,13 @@ static int collect_mp4(const char *dir, FileEntry **list, int *count, int *cap)
   return 0;
 }
 
-static int collect_jpg(const char *dir, FileEntry **list, int *count, int *cap)
+/* suffix: file name must end with it (e.g. "_md.jpg"); NULL = any .jpg. */
+static int collect_jpg(const char *dir, const char *suffix, FileEntry **list, int *count, int *cap)
 {
+  size_t sn = suffix ? strlen(suffix) : 4;
+  if (!suffix) {
+    suffix = ".jpg";
+  }
   DIR *dp = opendir(dir);
   struct dirent *de;
   if (!dp) {
@@ -329,16 +334,20 @@ static int collect_jpg(const char *dir, FileEntry **list, int *count, int *cap)
     if (strcmp(de->d_name, ".") == 0 || strcmp(de->d_name, "..") == 0) {
       continue;
     }
+    n = strlen(de->d_name);
+    /* stat() per entry is slow on TF; skip non-matching regular files by name. */
+    if (de->d_type == DT_REG && (n < sn || strcmp(de->d_name + n - sn, suffix) != 0)) {
+      continue;
+    }
     snprintf(path, sizeof(path), "%s/%s", dir, de->d_name);
     if (stat(path, &st) != 0) {
       continue;
     }
     if (S_ISDIR(st.st_mode)) {
-      collect_jpg(path, list, count, cap);
+      collect_jpg(path, suffix, list, count, cap);
       continue;
     }
-    n = strlen(de->d_name);
-    if (n < 4 || strcmp(de->d_name + n - 4, ".jpg") != 0) {
+    if (n < sn || strcmp(de->d_name + n - sn, suffix) != 0) {
       continue;
     }
     if (*count >= *cap) {
@@ -412,17 +421,14 @@ int storage_recycle_oldest(int target_free_percent)
   return deleted;
 }
 
-int storage_recycle_faces(int quota_percent)
+/* Delete oldest entries of `list` until their total size <= quota_percent of TF. */
+static int recycle_list_to_quota(FileEntry *list, int count, int quota_percent, const char *tag)
 {
   StorageStatus st;
-  FileEntry *list = NULL;
-  int count = 0, cap = 0, deleted = 0, i;
+  int deleted = 0, i;
   uint64_t used = 0;
   uint64_t limit;
 
-  if (!g_ready || quota_percent <= 0) {
-    return -1;
-  }
   if (quota_percent > 90) {
     quota_percent = 90;
   }
@@ -433,15 +439,10 @@ int storage_recycle_faces(int quota_percent)
   if (limit < (512ULL * 1024ULL)) {
     limit = 512ULL * 1024ULL;
   }
-  if (collect_jpg(g_faces, &list, &count, &cap) != 0 || count == 0) {
-    free(list);
-    return 0;
-  }
   for (i = 0; i < count; i++) {
     used += list[i].size;
   }
   if (used <= limit) {
-    free(list);
     return 0;
   }
   qsort(list, (size_t)count, sizeof(FileEntry), cmp_mtime);
@@ -449,7 +450,7 @@ int storage_recycle_faces(int quota_percent)
     if (unlink(list[i].path) == 0) {
       deleted++;
       used -= list[i].size;
-      log_warn("storage", "face recycle delete: %s", list[i].path);
+      log_warn("storage", "%s recycle delete: %s", tag, list[i].path);
       {
         char *slash = strrchr(list[i].path, '/');
         if (slash) {
@@ -459,9 +460,37 @@ int storage_recycle_faces(int quota_percent)
       }
     }
   }
-  free(list);
-  log_info("storage", "face recycle removed %d files, quota=%d%%", deleted, quota_percent);
+  log_info("storage", "%s recycle removed %d files, quota=%d%%", tag, deleted, quota_percent);
   return deleted;
+}
+
+int storage_recycle_faces(int quota_percent)
+{
+  FileEntry *list = NULL;
+  int count = 0, cap = 0, rc;
+
+  if (!g_ready || quota_percent <= 0) {
+    return -1;
+  }
+  (void)collect_jpg(g_faces, NULL, &list, &count, &cap);
+  (void)collect_jpg(g_snapshots, STORAGE_FACE_SCENE_SUFFIX, &list, &count, &cap);
+  rc = count > 0 ? recycle_list_to_quota(list, count, quota_percent, "face") : 0;
+  free(list);
+  return rc;
+}
+
+int storage_recycle_motion_snapshots(int quota_percent)
+{
+  FileEntry *list = NULL;
+  int count = 0, cap = 0, rc;
+
+  if (!g_ready || quota_percent <= 0) {
+    return -1;
+  }
+  (void)collect_jpg(g_snapshots, STORAGE_MOTION_SNAP_SUFFIX, &list, &count, &cap);
+  rc = count > 0 ? recycle_list_to_quota(list, count, quota_percent, "motion") : 0;
+  free(list);
+  return rc;
 }
 
 int storage_delete_oldest(int count)

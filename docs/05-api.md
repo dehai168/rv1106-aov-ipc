@@ -108,15 +108,18 @@
     - `GET /api/v1/alarm/face/image?file=YYYYMMDD/...jpg`：人脸图下载（白名单路径）
     - `DELETE /api/v1/alarm/face/events`：body `{files:[...]}` 或 `{date:"YYYYMMDD"}`
   - `GET /api/v1/alarm/events?limit<=200`：读取 `/alarms/alarms.log` 最近 N 条（JSONL，含 `snapshot`）
-  - `GET /api/v1/alarm/snapshot?file=YYYYMMDD_HHMMSS.jpg`：下载告警抓图（鉴权，白名单文件名）
+  - `GET /api/v1/alarm/snapshot?file=YYYYMMDD_HHMMSS[_tag].jpg`：下载 `snapshots/` 下抓图（鉴权，白名单文件名，`tag` 为 `[a-z0-9_]{1,16}`）
 - **侦测 runtime**：`detect.enabled` 且媒体已起时，**continuous / schedule / motion** 策略下都会跑 IVS（VI2）。`link.record` 仅在录像策略为 `motion` 时触发 `record_on_motion`（不会把连续录像切成事件模式）。
 - `regions`：最多 4 个 `{ enabled, x, y, w, h }`（侦测帧像素，当前与 VI2 一致，约 ≤1280×720）；任一启用且与事件框相交即通过；全部未启用 → 全画面
 - `region`：兼容字段，等于 `regions[0]`
 - `schedule`：`{ enabled, start_min, end_min, days, grid }`
   - `grid`：长度 168 的 `"0"|"1"` 字符串，行优先 周一..周日 × hour0..23；合法时优先于 start/end/days
   - `days` bit0=周一 … bit6=周日；`enabled=0` 表示全天
-- `link`：`{ record, snapshot }`，运动触发时是否联动录像/抓图（默认均 true）
+- `link`：`{ record, snapshot, daily_limit, quota_percent }`，运动触发时是否联动录像/抓图（默认均 true）；`daily_limit` 每日联动抓图上限（10..20000，默认 2000），`quota_percent` 移动侦测抓图占 TF 容量上限（1..50，默认 5，超限删最旧 `*_md.jpg`）
 - 抓图：硬件 JPEG 写入 `/mnt/sdcard/snapshots/`，事件字段 `snapshot` 为文件名
+- `snapshots/` 命名：`YYYYMMDD_HHMMSS_md.jpg`（移动侦测联动）、`YYYYMMDD_HHMMSS_mmm_face.jpg`（人脸全景）、`YYYYMMDD_HHMMSS_sub|main.jpg`（手动/底图）；`/alarm/snapshot` 均可下载
+- 人脸 `face/events` 每条带可选 `scene_file`（同帧全景图）；删除人脸图时同帧最后一张被删会连带删除全景
+- 事件录像命名：`records/events/YYYYMMDD/EVT_MD_*.mp4`（移动侦测）、`EVT_FACE_*.mp4`（人脸）、`EVT_MD_FACE_*.mp4`（同一段内两者都触发）；旧 `EVT_<时间>.mp4` 视为移动侦测。`/storage/records` 事件项带 `event_src`：`motion|face|motion,face`
 - 错误：`2401` 保存失败；`2402` apply/文件失败
 
 ### system（T4.8）

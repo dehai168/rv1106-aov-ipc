@@ -74,7 +74,7 @@ int face_config_defaults(FaceConfig *cfg)
   cfg->hold_ms = 2000;
   cfg->cooldown_ms = 3000;
   cfg->confirm_frames = 1; /* was 2; flaky dets rarely confirm twice */
-  cfg->score_thr = 0.55f;
+  cfg->score_thr = 0.45f;
   cfg->min_face_px = 32;
   cfg->max_faces = 8;
   cfg->max_snap_per_frame = 2;
@@ -92,17 +92,19 @@ int face_config_defaults(FaceConfig *cfg)
   return 0;
 }
 
+/* sqrt(cls*obj): the INT8 export clips obj at 0.5, so real faces score ~0.5-0.7
+ * and background / low-light clutter stays below ~0.4. */
 void face_apply_sensitivity(FaceConfig *cfg)
 {
   if (!cfg) return;
   if (strcmp(cfg->sensitivity, "high") == 0) {
-    cfg->score_thr = 0.45f;
+    cfg->score_thr = 0.40f;
     cfg->min_face_px = 32;
   } else if (strcmp(cfg->sensitivity, "low") == 0) {
-    cfg->score_thr = 0.65f;
+    cfg->score_thr = 0.50f;
     cfg->min_face_px = 56;
   } else {
-    cfg->score_thr = 0.55f;
+    cfg->score_thr = 0.45f;
     cfg->min_face_px = 40;
     snprintf(cfg->sensitivity, sizeof(cfg->sensitivity), "normal");
   }
@@ -409,6 +411,12 @@ static void *face_thread(void *arg)
     uint8_t *jpeg = NULL;
     uint8_t *rgb = NULL;
     size_t jlen = 0;
+    /* One timestamp per grabbed frame: names its crops and its panorama. */
+    struct timeval frame_tv;
+    struct tm frame_tm;
+    char frame_stamp[32];
+    char scenename[64];
+    int scene_tried = 0;
 
     pthread_mutex_lock(&g_lock);
     cfg = g_cfg;
@@ -462,6 +470,12 @@ static void *face_thread(void *arg)
     }
 
     /* VI GetChnFrame/RGA NV12 is unusable on this board — use HW JPEG (VENC combo). */
+    gettimeofday(&frame_tv, NULL);
+    localtime_r(&frame_tv.tv_sec, &frame_tm);
+    strftime(frame_stamp, sizeof(frame_stamp), "%Y%m%d_%H%M%S", &frame_tm);
+    snprintf(frame_stamp + 15, sizeof(frame_stamp) - 15, "_%03d",
+             (int)((frame_tv.tv_usec / 1000) % 1000));
+    scenename[0] = '\0';
     if (media_snapshot_jpeg_mem(&jpeg, &jlen) != 0 || !jpeg) {
       g_grab_fail++;
       if ((g_grab_fail % 20) == 1) {
@@ -511,11 +525,9 @@ static void *face_thread(void *arg)
       float face_px, face_py;
       int ti, best = -1;
       float best_iou = 0.f;
-      char daydir[256], facepath[320], scenename[64], scenepath[320];
-      time_t ts;
+      char daydir[256], facepath[320], scenepath[320];
       struct tm tm;
       FaceEvent ev;
-      struct tm *tmp;
 
       /* Box fully in letterbox pad → maps to empty/degenerate image ROI. */
       if (boxes[i].y2 <= pad_y + 1.f || boxes[i].x2 <= pad_x + 1.f ||
@@ -601,26 +613,22 @@ static void *face_thread(void *arg)
       }
       pthread_mutex_unlock(&g_lock);
 
-      ts = time(NULL);
-      tmp = localtime(&ts);
-      snprintf(daydir, sizeof(daydir), "%s/%04d%02d%02d", storage_faces_path(), tmp->tm_year + 1900,
-               tmp->tm_mon + 1, tmp->tm_mday);
+      snprintf(daydir, sizeof(daydir), "%s/%.8s", storage_faces_path(), frame_stamp);
       ensure_dir(storage_faces_path());
       ensure_dir(daydir);
       if (cfg.quota_percent > 0) {
         (void)storage_recycle_faces(cfg.quota_percent);
       }
-      scenename[0] = '\0';
-      if (cfg.save_scene) {
-        snprintf(scenename, sizeof(scenename), "%04d%02d%02d_%02d%02d%02d.jpg", tmp->tm_year + 1900,
-                 tmp->tm_mon + 1, tmp->tm_mday, tmp->tm_hour, tmp->tm_min, tmp->tm_sec);
+      /* Panorama is per frame (shared by its crops); the web layer finds it
+       * from the crop name: <stamp>_<k>.jpg -> <stamp>_face.jpg. */
+      if (cfg.save_scene && !scene_tried) {
+        scene_tried = 1;
+        snprintf(scenename, sizeof(scenename), "%s%s", frame_stamp, STORAGE_FACE_SCENE_SUFFIX);
         snprintf(scenepath, sizeof(scenepath), "%s/%s", storage_snapshots_path(), scenename);
         ensure_dir(storage_snapshots_path());
         if (write_buf_file(scenepath, jpeg, jlen) != 0) scenename[0] = '\0';
       }
-      snprintf(facepath, sizeof(facepath), "%s/%04d%02d%02d_%02d%02d%02d_%03d_%d.jpg", daydir,
-               tmp->tm_year + 1900, tmp->tm_mon + 1, tmp->tm_mday, tmp->tm_hour, tmp->tm_min,
-               tmp->tm_sec, (int)(now_ms() % 1000), snapped);
+      snprintf(facepath, sizeof(facepath), "%s/%s_%d.jpg", daydir, frame_stamp, snapped);
       if (save_face_crop_rgb(rgb, fw, fh, nx, ny, nw, nh, cfg.margin, cfg.face_jpeg_side,
                              facepath) != 0) {
         log_warn("face", "crop save failed score=%.2f box=%.3f,%.3f,%.3f,%.3f path=%s",
@@ -629,19 +637,20 @@ static void *face_thread(void *arg)
       }
 
       memset(&ev, 0, sizeof(ev));
-      ev.ts = ts;
+      ev.ts = frame_tv.tv_sec;
       ev.score = boxes[i].score;
       ev.x = nx;
       ev.y = ny;
       ev.w = nw;
       ev.h = nh;
-      snprintf(ev.face_file, sizeof(ev.face_file), "%04d%02d%02d/%04d%02d%02d_%02d%02d%02d_%03d_%d.jpg",
-               tmp->tm_year + 1900, tmp->tm_mon + 1, tmp->tm_mday, tmp->tm_year + 1900,
-               tmp->tm_mon + 1, tmp->tm_mday, tmp->tm_hour, tmp->tm_min, tmp->tm_sec,
-               (int)(now_ms() % 1000), snapped);
+      snprintf(ev.face_file, sizeof(ev.face_file), "%.8s/%s_%d.jpg", frame_stamp, frame_stamp,
+               snapped);
       snprintf(ev.scene_file, sizeof(ev.scene_file), "%s", scenename);
       if (cfg.link_alarm) append_face_alarm(&ev);
-      if (cfg.link_record) record_on_motion();
+      /* Continuous recording already covers the event; don't flip it to motion mode. */
+      if (cfg.link_record && record_mode() != RECORD_MODE_CONTINUOUS) {
+        record_on_event(RECORD_SRC_FACE);
+      }
 
       g_tracks[best].last_snap_ms = now_ms();
       pthread_mutex_lock(&g_lock);

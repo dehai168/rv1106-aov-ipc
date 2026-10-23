@@ -143,6 +143,8 @@ export type StorageRecord = {
   mtime: number
   size: number
   kind?: 'event' | 'normal'
+  /** Event trigger: motion | face | motion,face */
+  event_src?: string
 }
 
 export function getStorageStatus() {
@@ -241,6 +243,10 @@ export type AlarmSchedule = {
 export type AlarmLink = {
   record: boolean
   snapshot: boolean
+  /** Max motion-link snapshots per day. */
+  daily_limit?: number
+  /** Motion-link snapshots keep <= this % of TF capacity. */
+  quota_percent?: number
 }
 
 export type AlarmMotion = {
@@ -285,6 +291,26 @@ export function getAlarmEvents(limit: number = 50) {
 
 export function alarmSnapshotUrl(file: string) {
   return `/api/v1/alarm/snapshot?file=${encodeURIComponent(file)}`
+}
+
+/** Grab a fresh preview JPEG and return it as an object URL (caller revokes). */
+export async function previewSnapshotObjectUrl(): Promise<string> {
+  const r = await previewSnapshot()
+  if (r.code !== 0) throw new Error(r.msg || '抓图失败（请先打开实时预览或等待媒体起流）')
+  const res = await fetch(alarmSnapshotUrl(r.data.file), { credentials: 'same-origin' })
+  if (!res.ok) throw new Error('下载底图失败')
+  /* API errors come back as HTTP 200 JSON; don't hand those to <img>. */
+  if (!(res.headers.get('content-type') || '').startsWith('image/')) {
+    let msg = '底图格式错误'
+    try {
+      const j = (await res.json()) as ApiResp<unknown>
+      if (j?.msg) msg = `下载底图失败：${j.msg}`
+    } catch {
+      /* keep generic message */
+    }
+    throw new Error(msg)
+  }
+  return URL.createObjectURL(await res.blob())
 }
 
 export type FaceRegion = AlarmRegion
@@ -333,6 +359,8 @@ export type FaceEventItem = {
   type: string
   face_file: string
   file: string
+  /** Panorama under snapshots/ (联动抓图), absent when not saved. */
+  scene_file?: string
 }
 
 export function getFaceConfig() {

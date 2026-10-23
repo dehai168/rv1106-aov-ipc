@@ -5,7 +5,7 @@ import {
   alarmSnapshotUrl,
   getAlarmEvents,
   getAlarmMotion,
-  previewSnapshot,
+  previewSnapshotObjectUrl,
   setAlarmMotion,
   type AlarmEvent,
   type AlarmMotion,
@@ -92,6 +92,8 @@ function ensureDefaults(m: AlarmMotion): AlarmMotion {
     m.schedule.grid = emptyGrid()
   }
   if (!m.link) m.link = { record: true, snapshot: true }
+  if (typeof m.link.daily_limit !== 'number') m.link.daily_limit = 2000
+  if (typeof m.link.quota_percent !== 'number') m.link.quota_percent = 5
   /* Old firmware stored 0..4; snap to the nearest 低/中/高 gear. */
   {
     const gears = sensitivityOptions.map((o) => o.value)
@@ -107,16 +109,10 @@ function ensureDefaults(m: AlarmMotion): AlarmMotion {
 async function refreshBg(silent = false) {
   bgLoading.value = true
   try {
-    const r = await previewSnapshot()
-    if (r.code !== 0) throw new Error(r.msg || '抓图失败（请先打开实时预览或等待媒体起流）')
-    const file = r.data.file
-    const url = alarmSnapshotUrl(file)
-    const res = await fetch(url, { credentials: 'same-origin' })
-    if (!res.ok) throw new Error('下载底图失败')
-    const blob = await res.blob()
+    const url = await previewSnapshotObjectUrl()
     if (bgObjectUrl) URL.revokeObjectURL(bgObjectUrl)
-    bgObjectUrl = URL.createObjectURL(blob)
-    bgUrl.value = bgObjectUrl
+    bgObjectUrl = url
+    bgUrl.value = url
     if (!silent) ElMessage.success('底图已更新')
   } catch (e) {
     if (!silent) ElMessage.error(String(e))
@@ -291,12 +287,31 @@ onUnmounted(() => {
             </el-tab-pane>
 
             <el-tab-pane label="联动" name="link">
-              <el-form label-width="100px">
+              <el-form label-width="110px">
                 <el-form-item label="联动录像">
                   <el-switch v-model="motion.link.record" />
                 </el-form-item>
                 <el-form-item label="联动抓图">
                   <el-switch v-model="motion.link.snapshot" />
+                </el-form-item>
+                <el-form-item label="日抓拍上限">
+                  <el-input-number
+                    v-model="motion.link.daily_limit"
+                    :min="10"
+                    :max="20000"
+                    :step="100"
+                    :disabled="!motion.link.snapshot"
+                  />
+                  <span class="unit">张/天（超出后当天不再联动抓图）</span>
+                </el-form-item>
+                <el-form-item label="存储配额">
+                  <el-input-number
+                    v-model="motion.link.quota_percent"
+                    :min="1"
+                    :max="50"
+                    :disabled="!motion.link.snapshot"
+                  />
+                  <span class="unit">% TF 容量（超限删最旧）</span>
                 </el-form-item>
               </el-form>
             </el-tab-pane>
