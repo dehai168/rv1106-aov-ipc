@@ -409,11 +409,20 @@ onUnmounted(() => {
                   <span class="unit">抓拍时触发事件录像（文件名 EVT_FACE_*）</span>
                 </el-form-item>
                 <el-form-item label="日抓拍上限">
-                  <el-input-number v-model="face.daily_limit" :min="10" :max="20000" :step="100" />
+                  <el-input-number
+                    v-model="face.daily_limit"
+                    :min="10"
+                    :max="20000"
+                    :step="100"
+                    :disabled="!face.link.snapshot"
+                  />
                 </el-form-item>
                 <el-form-item label="存储配额">
-                  <el-input-number v-model="face.quota_percent" :min="1" :max="50" />
+                  <el-input-number v-model="face.quota_percent" :min="1" :max="50" :disabled="!face.link.snapshot" />
                   <span class="unit">% TF 容量（人脸图+全景图，超限删最旧）</span>
+                </el-form-item>
+                <el-form-item v-if="!face.link.snapshot" label=" ">
+                  <span class="unit">开启「联动抓图」后才可设置；关闭时不限每日张数，人脸图按默认 5% 配额循环覆盖</span>
                 </el-form-item>
               </el-form>
             </el-tab-pane>

@@ -5,8 +5,11 @@
 extern "C" {
 #endif
 
+/* Always served alongside cfg->port (scripts, adb forward, old bookmarks). */
+#define WEB_COMPAT_PORT 8080
+
 typedef struct {
-  int port;                 /* default 8080 */
+  int port;                 /* default 80 */
   const char *www_root;     /* default /userdata/www */
   int token_ttl_sec;        /* default 86400 */
 } WebConfig;

@@ -269,15 +269,20 @@ static int extract_token(struct mg_http_message *hm, char *out, size_t out_len)
     return 0;
   }
 
+  /* Cookies are "a=1; b=2" (not &-separated), and other apps on the same
+   * host/IP (any port) add their own, so parse it as a header var list. */
   hdr = mg_http_get_header(hm, "Cookie");
-  if (hdr && mg_http_get_var(hdr, "ipc_token", tmp, sizeof(tmp)) > 0) {
-    size_t n = strlen(tmp);
-    if (n >= out_len) {
-      n = out_len - 1;
+  if (hdr) {
+    struct mg_str v = mg_http_get_header_var(*hdr, mg_str("ipc_token"));
+    if (v.len > 0 && v.buf) {
+      size_t n = v.len;
+      if (n >= out_len) {
+        n = out_len - 1;
+      }
+      memcpy(out, v.buf, n);
+      out[n] = '\0';
+      return 0;
     }
-    memcpy(out, tmp, n);
-    out[n] = '\0';
-    return 0;
   }
 
   if (mg_http_get_var(&hm->query, "token", tmp, sizeof(tmp)) > 0) {
@@ -4138,7 +4143,7 @@ int web_init(const WebConfig *cfg)
     return 0;
   }
   memset(&g_web.mgr, 0, sizeof(g_web.mgr));
-  g_web.port = (cfg && cfg->port > 0) ? cfg->port : 8080;
+  g_web.port = (cfg && cfg->port > 0) ? cfg->port : 80;
   g_web.token_ttl = (cfg && cfg->token_ttl_sec > 0) ? cfg->token_ttl_sec : 86400;
   snprintf(g_web.www_root, sizeof(g_web.www_root), "%s",
            (cfg && cfg->www_root && cfg->www_root[0]) ? cfg->www_root : "/userdata/www");
@@ -4148,10 +4153,26 @@ int web_init(const WebConfig *cfg)
   auth_load_or_default();
 
   mg_mgr_init(&g_web.mgr);
-  if (mg_http_listen(&g_web.mgr, g_web.listen_url, ev_handler, NULL) == NULL) {
-    log_error("web", "listen failed %s", g_web.listen_url);
-    mg_mgr_free(&g_web.mgr);
-    return -1;
+  {
+    int listening = 0;
+    if (mg_http_listen(&g_web.mgr, g_web.listen_url, ev_handler, NULL) != NULL) {
+      listening++;
+    } else {
+      log_error("web", "listen failed %s", g_web.listen_url);
+    }
+    if (g_web.port != WEB_COMPAT_PORT) {
+      char compat_url[64];
+      snprintf(compat_url, sizeof(compat_url), "http://0.0.0.0:%d", WEB_COMPAT_PORT);
+      if (mg_http_listen(&g_web.mgr, compat_url, ev_handler, NULL) != NULL) {
+        listening++;
+      } else {
+        log_warn("web", "listen failed %s", compat_url);
+      }
+    }
+    if (listening == 0) {
+      mg_mgr_free(&g_web.mgr);
+      return -1;
+    }
   }
   g_web.inited = 1;
   return 0;

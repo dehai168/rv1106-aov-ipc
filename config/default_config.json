@@ -140,7 +140,7 @@
     }
   },
   "web": {
-    "port": 8080,
+    "port": 80,
     "www_root": "/userdata/www",
     "token_ttl_sec": 86400
   },

@@ -28,7 +28,23 @@ stop_oem_camera() {
   rm -f /tmp/aiq0.lock 2>/dev/null || true
 }
 
+# OEM nginx (+fcgiwrap) holds :80 with the stock rkipc web UI. ipc_app serves
+# its own UI on :80, so park the OEM rc scripts outside RkLunch's S??* glob
+# (undo: mv them back from $OEM_INITD/disabled/) and stop the running daemons.
+OEM_INITD=/oem/usr/etc/init.d
+stop_oem_web() {
+  for s in S50nginx S50fcgiwrap; do
+    if [ -f "$OEM_INITD/$s" ]; then
+      mkdir -p "$OEM_INITD/disabled" && mv -f "$OEM_INITD/$s" "$OEM_INITD/disabled/$s"
+    fi
+  done
+  killall nginx fcgiwrap 2>/dev/null || true
+  sleep 1
+  killall -9 nginx fcgiwrap 2>/dev/null || true
+}
+
 start() {
+  stop_oem_web
   stop_oem_camera
   mkdir -p /userdata/log /var/run
   if pidof ipc_app >/dev/null 2>&1; then
