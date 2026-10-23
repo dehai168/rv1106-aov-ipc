@@ -45,6 +45,8 @@ typedef struct {
 
   int link_record;   /* 1=record on motion */
   int link_snapshot; /* 1=JPEG on motion */
+  int snap_daily_limit;   /* max motion-link JPEGs per day, default 2000 */
+  int snap_quota_percent; /* motion-link JPEGs keep <= this % of TF, default 5 */
 } DetectConfig;
 
 typedef struct {

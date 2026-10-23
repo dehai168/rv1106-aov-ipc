@@ -85,6 +85,13 @@ function formatDateQuery(v: string | Date | null | undefined) {
   return `${y}${m}${d}`
 }
 
+function recordKindLabel(row: { kind?: string; event_src?: string }) {
+  if (row.kind !== 'event') return '常规'
+  if (row.event_src === 'face') return '事件·人脸'
+  if (row.event_src === 'motion,face') return '事件·移动+人脸'
+  return '事件·移动'
+}
+
 function formatSizeMb(size: number) {
   return `${((size || 0) / 1024 / 1024).toFixed(2)} MB`
 }
@@ -306,10 +313,10 @@ onMounted(refresh)
             max-height="560"
           >
             <el-table-column prop="name" label="文件名" min-width="200" show-overflow-tooltip />
-            <el-table-column label="类型" width="100">
+            <el-table-column label="类型" width="130">
               <template #default="{ row }">
                 <el-tag :type="row.kind === 'event' ? 'warning' : 'info'" size="small">
-                  {{ row.kind === 'event' ? '事件' : '常规' }}
+                  {{ recordKindLabel(row) }}
                 </el-tag>
               </template>
             </el-table-column>

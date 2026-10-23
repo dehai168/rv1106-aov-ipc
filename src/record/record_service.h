@@ -44,6 +44,11 @@ typedef enum {
   RECORD_KIND_EVENT = 1   /* motion-linked event clips */
 } RecordKind;
 
+/* Event clip trigger sources (bitmask). The clip name carries them:
+ * EVT_MD_*, EVT_FACE_*, or EVT_MD_FACE_* when both fired in one clip. */
+#define RECORD_SRC_MOTION 0x1
+#define RECORD_SRC_FACE 0x2
+
 int record_init(const RecordConfig *cfg);
 void record_deinit(void);
 
@@ -55,6 +60,8 @@ int record_is_running(void);
 /* Motion-linked mode: keep prerecord ring; record_on_motion() starts/extends. */
 int record_arm_motion(void);
 int record_on_motion(void);
+/* Same as record_on_motion() but tags the clip with RECORD_SRC_* bits. */
+int record_on_event(int src);
 /* Extend motion recording deadline (event_record_sec path). */
 int record_extend_recording(int sec);
 /* Close motion segment when quiet deadline passed (no new packets required). */

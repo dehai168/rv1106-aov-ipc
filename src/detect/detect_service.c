@@ -40,11 +40,14 @@ typedef struct {
   void *cb_user;
   int motion_count;
   int hit_streak;
+  int snap_today;
+  int snap_yday;
   DetectEvent last;
   pthread_mutex_t lock;
 } DetectCtx;
 
 static DetectCtx g_det = {
+    .snap_yday = -1,
     .lock = PTHREAD_MUTEX_INITIALIZER,
 };
 
@@ -226,19 +229,39 @@ static int region_allows(const DetectConfig *cfg, const DetectEvent *ev, const i
   return 0;
 }
 
-static void take_snapshot(DetectEvent *ev)
+static void take_snapshot(DetectEvent *ev, int quota_percent)
 {
   char path[256];
   char name[64];
   struct tm tm_now;
   localtime_r(&ev->ts, &tm_now);
-  strftime(name, sizeof(name), "%Y%m%d_%H%M%S.jpg", &tm_now);
+  strftime(name, sizeof(name), "%Y%m%d_%H%M%S" STORAGE_MOTION_SNAP_SUFFIX, &tm_now);
   (void)storage_ensure_dirs();
+  if (quota_percent > 0) {
+    (void)storage_recycle_motion_snapshots(quota_percent);
+  }
   snprintf(path, sizeof(path), "%s/%s", storage_snapshots_path(), name);
   ev->snapshot[0] = '\0';
   if (media_snapshot_jpeg(path) == 0) {
     snprintf(ev->snapshot, sizeof(ev->snapshot), "%s", name);
   }
+}
+
+/* 1 if today's motion-link snapshot budget still has room (and consumes one). */
+static int snap_budget_take_locked(void)
+{
+  time_t now = time(NULL);
+  struct tm tm_now;
+  localtime_r(&now, &tm_now);
+  if (tm_now.tm_yday != g_det.snap_yday) {
+    g_det.snap_yday = tm_now.tm_yday;
+    g_det.snap_today = 0;
+  }
+  if (g_det.cfg.snap_daily_limit > 0 && g_det.snap_today >= g_det.cfg.snap_daily_limit) {
+    return 0;
+  }
+  g_det.snap_today++;
+  return 1;
 }
 
 static void fire_motion(DetectEvent *ev)
@@ -247,12 +270,14 @@ static void fire_motion(DetectEvent *ev)
   void *user;
   Event e;
   int do_snap;
+  int quota;
 
   pthread_mutex_lock(&g_det.lock);
-  do_snap = g_det.cfg.link_snapshot ? 1 : 0;
+  do_snap = g_det.cfg.link_snapshot ? snap_budget_take_locked() : 0;
+  quota = g_det.cfg.snap_quota_percent;
   pthread_mutex_unlock(&g_det.lock);
   if (do_snap) {
-    take_snapshot(ev);
+    take_snapshot(ev, quota);
   } else {
     ev->snapshot[0] = '\0';
   }
@@ -492,6 +517,14 @@ int detect_init(const DetectConfig *cfg)
   }
   g_det.cfg.link_record = g_det.cfg.link_record ? 1 : 0;
   g_det.cfg.link_snapshot = g_det.cfg.link_snapshot ? 1 : 0;
+  if (g_det.cfg.snap_daily_limit <= 0) {
+    g_det.cfg.snap_daily_limit = 2000;
+  }
+  if (g_det.cfg.snap_quota_percent <= 0) {
+    g_det.cfg.snap_quota_percent = 5;
+  }
+  g_det.cfg.snap_daily_limit = clamp_int(g_det.cfg.snap_daily_limit, 10, 20000);
+  g_det.cfg.snap_quota_percent = clamp_int(g_det.cfg.snap_quota_percent, 1, 50);
   if (g_det.cfg.schedule_start_min < 0) {
     g_det.cfg.schedule_start_min = 0;
   }
@@ -748,6 +781,8 @@ void detect_config_load(DetectConfig *out)
 
   config_get_bool("detect.link.record", &out->link_record, 1);
   config_get_bool("detect.link.snapshot", &out->link_snapshot, 1);
+  config_get_int("detect.link.daily_limit", &out->snap_daily_limit, 2000);
+  config_get_int("detect.link.quota_percent", &out->snap_quota_percent, 5);
 }
 
 int detect_config_save(const DetectConfig *cfg)
@@ -799,6 +834,8 @@ int detect_config_save(const DetectConfig *cfg)
                         schedule_grid_valid(tmp.schedule_grid) ? tmp.schedule_grid : "") != 0 ||
       config_set_bool("detect.link.record", tmp.link_record) != 0 ||
       config_set_bool("detect.link.snapshot", tmp.link_snapshot) != 0 ||
+      config_set_int("detect.link.daily_limit", tmp.snap_daily_limit) != 0 ||
+      config_set_int("detect.link.quota_percent", tmp.snap_quota_percent) != 0 ||
       config_save() != 0) {
     return -1;
   }
