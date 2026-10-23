@@ -98,9 +98,11 @@ sudo apt-get install -y git ssh make gcc gcc-multilib g++-multilib module-assist
 
 | 脚本 | 作用 |
 |---|---|
-| `scripts/setup_t01.sh` | 校验工具链并编 hello |
-| `scripts/build_media_sample.sh` | lunch Pro_Max + `./build.sh media` |
-| `scripts/deploy_sample.sh` | 把 `simple_vi_get_frame` 拷到 `build/` |
+| `scripts/build.sh` | WSL 内交叉编译 `ipc_app`，注入版本号 `V1.0.YYYYMMDD.NNNNN` |
+| `scripts/pack_www.sh` | 编译 `web-ui` 并刷新 `www/` |
+| `scripts/install_init.sh` | 安装 `S99ipc_app` 开机自启 |
+| `scripts/test_*.sh` / `smoke_*.sh` | 板上接口回归 / 冒烟 |
+| `scripts/*aov*` / `*fephy*` | AOV 休眠唤醒探测与压测 |
 
 ## 已知注意点
 

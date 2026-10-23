@@ -494,16 +494,6 @@ static void *face_thread(void *arg)
       usleep(50 * 1000);
       continue;
     }
-    {
-      static int dbg_dumped;
-      if (!dbg_dumped) {
-        dbg_dumped = 1;
-        if (write_buf_file("/mnt/sdcard/faces/_dbg_scene.jpg", jpeg, jlen) == 0) {
-          log_info("face", "debug scene %dx%d (%zu bytes) -> _dbg_scene.jpg", fw, fh, jlen);
-        }
-      }
-    }
-
     letterbox_rgb_to_bgr320(rgb, fw, fh, bgr, &scale, &pad_x, &pad_y);
     g_infer_count++;
     if (rknn_face_infer(g_rknn, bgr, cfg.score_thr, 0.4f, boxes, cfg.max_faces, &n) != 0) {

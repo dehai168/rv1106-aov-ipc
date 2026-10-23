@@ -43,7 +43,19 @@ stop_oem_web() {
   killall -9 nginx fcgiwrap 2>/dev/null || true
 }
 
+# RkLunch.sh post_chk launches rkipc at every boot; killing it later (above,
+# and in the watchdog) leaks rockit CMA buffers, which then starves our
+# preview-main encoder. Comment the launch out once (backup: RkLunch.sh.orig).
+RKLUNCH=/oem/usr/bin/RkLunch.sh
+disable_oem_rkipc() {
+  if grep -qE '^[[:space:]]*rkipc( |&|$)' "$RKLUNCH" 2>/dev/null; then
+    [ -f "$RKLUNCH.orig" ] || cp -f "$RKLUNCH" "$RKLUNCH.orig"
+    sed -i -E 's/^([[:space:]]*)(rkipc( .*)?&)$/\1: # disabled by ipc_app: \2/' "$RKLUNCH"
+  fi
+}
+
 start() {
+  disable_oem_rkipc
   stop_oem_web
   stop_oem_camera
   mkdir -p /userdata/log /var/run
