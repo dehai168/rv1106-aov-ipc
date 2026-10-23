@@ -420,6 +420,33 @@ int network_apply(void)
   return apply_cfg(&cfg);
 }
 
+int network_ensure_boot(void)
+{
+  NetworkConfig cfg;
+  int dhcp_running;
+
+  if (network_get(&cfg) != 0 || validate(&cfg) != 0) {
+    return -1;
+  }
+  dhcp_running = system("pidof udhcpc >/dev/null 2>&1") == 0;
+  if (strcmp(cfg.mode, "static") == 0) {
+    /* OEM RkLunch.sh network_init runs a persistent `udhcpc -i eth0`, which
+     * deconfigs (flushes) the static address ifup set at S40. */
+    if (!dhcp_running && strcmp(cfg.current_ip, cfg.ip) == 0) {
+      return 0;
+    }
+    log_info("network", "boot: restoring static %s (udhcpc=%d current=%s)", cfg.ip,
+             dhcp_running, cfg.current_ip[0] ? cfg.current_ip : "-");
+    return apply_cfg(&cfg);
+  }
+  /* dhcp: keep the OEM udhcpc (it renews the lease); only step in if none. */
+  if (dhcp_running || cfg.current_ip[0]) {
+    return 0;
+  }
+  log_info("network", "boot: no udhcpc/address on %s, running dhcp", cfg.iface);
+  return apply_cfg(&cfg);
+}
+
 int network_set_link_down(const char *iface)
 {
   char cmd[128];

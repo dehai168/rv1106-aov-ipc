@@ -30,6 +30,10 @@ int network_set(const NetworkConfig *in, int apply);
 /* Apply currently saved config to iface (eth0). */
 int network_apply(void);
 
+/* Startup: re-apply saved config if the OEM boot scripts clobbered it
+ * (e.g. their udhcpc flushed a static address). No-op when already correct. */
+int network_ensure_boot(void);
+
 /* AOV: bring iface down without changing saved config. */
 int network_set_link_down(const char *iface);
 

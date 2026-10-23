@@ -6,6 +6,7 @@
 #include "media/media_service.h"
 #include "record/record_service.h"
 #include "system/config_service.h"
+#include "system/network_service.h"
 #include "system/storage_service.h"
 #include "system/system_service.h"
 #include "web/web_service.h"
@@ -833,6 +834,8 @@ static int run_web(int seconds)
     log_close();
     return 2;
   }
+
+  (void)network_ensure_boot();
 
   memset(&wcfg, 0, sizeof(wcfg));
   wcfg.port = port;
