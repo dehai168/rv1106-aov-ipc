@@ -22,6 +22,7 @@
 
 #define FACE_TRACK_MAX 16
 #define FACE_JPEG_BUF (256 * 1024)
+#define FACE_DEFAULT_QUOTA_PERCENT 5
 
 typedef struct {
   float x, y, w, h; /* normalized on grab frame */
@@ -83,7 +84,7 @@ int face_config_defaults(FaceConfig *cfg)
   cfg->save_scene = 1;
   cfg->link_record = 1;
   cfg->link_alarm = 1;
-  cfg->quota_percent = 5;
+  cfg->quota_percent = FACE_DEFAULT_QUOTA_PERCENT;
   cfg->daily_limit = 2000;
   snprintf(cfg->sensitivity, sizeof(cfg->sensitivity), "normal");
   for (i = 0; i < FACE_MAX_REGIONS; i++) cfg->regions[i].enabled = 0;
@@ -493,16 +494,6 @@ static void *face_thread(void *arg)
       usleep(50 * 1000);
       continue;
     }
-    {
-      static int dbg_dumped;
-      if (!dbg_dumped) {
-        dbg_dumped = 1;
-        if (write_buf_file("/mnt/sdcard/faces/_dbg_scene.jpg", jpeg, jlen) == 0) {
-          log_info("face", "debug scene %dx%d (%zu bytes) -> _dbg_scene.jpg", fw, fh, jlen);
-        }
-      }
-    }
-
     letterbox_rgb_to_bgr320(rgb, fw, fh, bgr, &scale, &pad_x, &pad_y);
     g_infer_count++;
     if (rknn_face_infer(g_rknn, bgr, cfg.score_thr, 0.4f, boxes, cfg.max_faces, &n) != 0) {
@@ -606,7 +597,7 @@ static void *face_thread(void *arg)
           g_daily_yday = tm.tm_yday;
           g_daily_count = 0;
         }
-        if (g_daily_count >= cfg.daily_limit) {
+        if (cfg.save_scene && g_daily_count >= cfg.daily_limit) {
           pthread_mutex_unlock(&g_lock);
           continue;
         }
@@ -616,8 +607,13 @@ static void *face_thread(void *arg)
       snprintf(daydir, sizeof(daydir), "%s/%.8s", storage_faces_path(), frame_stamp);
       ensure_dir(storage_faces_path());
       ensure_dir(daydir);
-      if (cfg.quota_percent > 0) {
-        (void)storage_recycle_faces(cfg.quota_percent);
+      /* daily_limit / quota_percent are 联动抓图 settings; without it the
+       * crops still need a cap so the TF card can't fill up. */
+      {
+        int quota = cfg.save_scene ? cfg.quota_percent : FACE_DEFAULT_QUOTA_PERCENT;
+        if (quota > 0) {
+          (void)storage_recycle_faces(quota);
+        }
       }
       /* Panorama is per frame (shared by its crops); the web layer finds it
        * from the crop name: <stamp>_<k>.jpg -> <stamp>_face.jpg. */

@@ -6,6 +6,7 @@
 #include "media/media_service.h"
 #include "record/record_service.h"
 #include "system/config_service.h"
+#include "system/network_service.h"
 #include "system/storage_service.h"
 #include "system/system_service.h"
 #include "web/web_service.h"
@@ -812,14 +813,17 @@ static int run_web(int seconds)
 
   char level_str[32];
   char www[256];
-  int port = 8080;
+  int port = 80;
   int ttl = 86400;
   char mount[128];
   WebConfig wcfg;
 
   config_get_string("log.level", level_str, (int)sizeof(level_str), "info");
   log_set_level(parse_level(level_str));
-  config_get_int("web.port", &port, 8080);
+  config_get_int("web.port", &port, 80);
+  if (port == WEB_COMPAT_PORT) {
+    port = 80; /* legacy default; the compat port is always served anyway */
+  }
   config_get_string("web.www_root", www, (int)sizeof(www), "/userdata/www");
   config_get_int("web.token_ttl_sec", &ttl, 86400);
   config_get_string("storage.mount", mount, (int)sizeof(mount), "/mnt/sdcard");
@@ -830,6 +834,8 @@ static int run_web(int seconds)
     log_close();
     return 2;
   }
+
+  (void)network_ensure_boot();
 
   memset(&wcfg, 0, sizeof(wcfg));
   wcfg.port = port;

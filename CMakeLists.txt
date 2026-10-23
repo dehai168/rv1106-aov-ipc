@@ -70,6 +70,11 @@ target_compile_definitions(ipc_app PRIVATE
   UAPI2
   RV1106_RV1103
 )
+# Set by scripts/build.sh (V1.0.YYYYMMDD.NNNNN).
+if(IPC_APP_VERSION)
+  set_source_files_properties(src/system/system_service.c PROPERTIES
+    COMPILE_DEFINITIONS "IPC_APP_VERSION=\"${IPC_APP_VERSION}\"")
+endif()
 
 target_link_directories(ipc_app PRIVATE
   ${RK_MEDIA_OUT}/lib

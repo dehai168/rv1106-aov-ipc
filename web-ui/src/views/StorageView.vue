@@ -332,8 +332,8 @@ onMounted(refresh)
             </el-table-column>
             <el-table-column label="操作" width="140" fixed="right">
               <template #default="{ row }">
-                <el-button link type="primary" @click="onPreview(row)">预览</el-button>
-                <el-button link type="primary" @click="onDownload(row)">下载</el-button>
+                <el-button link type="primary" @click="onPreview(row as StorageRecord)">预览</el-button>
+                <el-button link type="primary" @click="onDownload(row as StorageRecord)">下载</el-button>
               </template>
             </el-table-column>
           </el-table>

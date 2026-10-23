@@ -61,7 +61,7 @@ adb shell "export LD_LIBRARY_PATH=/oem/usr/lib:/usr/lib; nohup /userdata/ipc_app
 
 ## 使用
 
-1. 浏览器打开 `http://<板IP>:8080`
+1. 浏览器打开 `http://<板IP>`（80 端口；`:8080` 仍兼容）。`S99ipc_app start` 会停用 OEM 自带的 nginx 网页（rc 脚本移到 `/oem/usr/etc/init.d/disabled/`）
 2. 默认账号 **admin / admin**（首登强制改密）
 3. 预览：子码流 / 主预览切换；滚轮或滑条数字缩放；抓图
 4. 录像计划：事件 / 连续 / 定时；存储页回收水位
